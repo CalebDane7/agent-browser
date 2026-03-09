@@ -1,8 +1,18 @@
 # agent-browser
 
-### Stop paying the Playwright tax. Talk directly to Chrome.
+### Your AI and you, sharing the same browser. Like a remote control for Chrome.
 
-**agent-browser** is a lightweight CLI that lets AI agents control a real browser — without Playwright, without Puppeteer, without downloading bundled browser binaries, and without burning through your token budget.
+- **Real Chrome, real cookies** — log in once, stay logged in. Your AI uses your actual browser session with persistent cookies
+- **Invisible to bot detection** — no `navigator.webdriver` flag, no fingerprint mismatches. Sites see a real human, not a bot
+- **93% fewer tokens** than Playwright MCP — ~200 tokens per page vs ~13,700. Your AI does more with less
+- **5x faster** — direct WebSocket to Chrome, no middleware relay. Every call saves seconds
+- **Independent sessions** — run multiple AI agents simultaneously on the same machine. Zero conflicts, zero shared state
+- **Headed, not headless** — you see everything the AI does in real time. Watch it work, jump in anytime, take over when you want
+- **Claude Code skill included** — drop one file and Claude knows how to drive your browser. No setup, no configuration
+
+---
+
+**agent-browser** is a CLI that gives AI agents direct control of your real, visible Chrome browser — without Playwright, without Puppeteer, without downloading bundled browser binaries, and without burning through your token budget.
 
 It speaks raw [Chrome DevTools Protocol (CDP)](https://chromedevtools.github.io/devtools-protocol/) over a single WebSocket. That's it. No middleware. No relay servers. No 50MB dependency you never asked for.
 
@@ -48,11 +58,27 @@ Under the same token budget, agent-browser runs **5.7x more automation cycles** 
 
 ---
 
+## You and Your AI Share the Same Browser
+
+This isn't headless automation running invisibly in the background. **agent-browser is headed** — it controls your real, visible Chrome window. You can watch everything the AI does in real time.
+
+Think of it like handing someone a remote control to your computer:
+
+- **Watch the AI work** — see it click buttons, fill forms, navigate pages, all on your actual screen
+- **Jump in anytime** — navigate to a page manually, then tell the AI "now fill out this form" or "click that button"
+- **Hand control back and forth** — you browse to the right page, the AI handles the tedious parts, you verify the result
+- **Pair browse** — stream the viewport via WebSocket so you can watch from another machine or share with a teammate
+- **Debug in real time** — when something goes wrong, you see exactly what the AI sees. No guessing what happened in a headless void
+
+Other automation tools run in a hidden browser you can't see or interact with. agent-browser runs in **your** browser — the one you're already looking at.
+
+---
+
 ## What It Actually Does (Plain English)
 
 If you're new to browser automation, here's the simple version:
 
-**agent-browser lets an AI control a web browser the same way you do** — it can open websites, click buttons, fill out forms, read what's on the page, and take screenshots. But instead of moving a mouse and typing on a keyboard, it sends commands through a terminal.
+**agent-browser lets an AI control your Chrome browser the same way you do** — it can open websites, click buttons, fill out forms, read what's on the page, and take screenshots. You see everything it does because it's working in your real, visible browser — not some hidden process running in the background.
 
 Here's everything it automates:
 
@@ -108,7 +134,7 @@ Playwright and Puppeteer download their own Chromium binary — a stripped-down,
 
 **Manage any authenticated account.** Banking dashboards, social media, email, admin panels, SaaS tools — if you can access it in Chrome, your AI agent can too. Same cookies. Same session. No bot flags.
 
-**Get past Cloudflare, CAPTCHAs, and bot walls.** Sites that block automated browsers don't block yours — because yours isn't automated in the way they're detecting. There's no `navigator.webdriver` flag. No headless Chrome signature. No fingerprint inconsistencies. It's just Chrome.
+**Get past Cloudflare, CAPTCHAs, and bot walls.** Sites that block automated browsers don't block yours — because yours isn't automated in the way they're detecting. There's no `navigator.webdriver` flag. No stripped-down Chromium binary. No fingerprint inconsistencies. It's your real Chrome, headed and visible.
 
 ### Why this works
 
@@ -242,6 +268,7 @@ Claude Code  →  agent-browser CLI (Rust)  →  daemon (Node.js)  →  Chrome C
 | CLI-first design | Yes | No | No | Partial | No |
 | Persistent cookies | Yes (real Chrome profile) | No (fresh each run) | No (fresh each run) | No (fresh each run) | No (fresh each run) |
 | Invisible to bot detection | Yes (real browser) | No (`webdriver=true`) | No (`webdriver=true`) | No (`webdriver=true`) | No (`webdriver=true`) |
+| Visible browser (headed) | Yes — you watch it work | No (headless default) | No (headless default) | No (headless default) | No (headless default) |
 | Cross-browser | Chrome only | Chrome, Firefox, WebKit | Chrome only | Chrome only | All |
 
 **The trade-off is intentional**: agent-browser only supports Chrome because that's what AI agents need. Dropping Firefox and WebKit means zero bundled browsers, zero extra downloads, and a much simpler codebase.

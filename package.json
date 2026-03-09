@@ -1,7 +1,7 @@
 {
   "name": "agent-browser",
   "version": "0.13.0",
-  "description": "Headless browser automation CLI for AI agents — raw CDP, zero browser automation dependencies",
+  "description": "Browser automation CLI for AI agents — raw CDP, real Chrome, persistent cookies, zero heavy dependencies",
   "author": "Caleb Dane <calebdanemusic@gmail.com>",
   "type": "module",
   "main": "dist/daemon.js",
@@ -17,7 +17,7 @@
   "keywords": [
     "browser",
     "automation",
-    "headless",
+    "headed",
     "cdp",
     "cli",
     "agent"
