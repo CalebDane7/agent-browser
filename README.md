@@ -92,6 +92,36 @@ If you've ever had two Playwright scripts fight over the same browser instance, 
 
 ---
 
+## Real Chrome. Real Cookies. Invisible to Bot Detection.
+
+This is the part most automation tools get wrong.
+
+Playwright and Puppeteer download their own Chromium binary — a stripped-down, identifiable browser that websites can detect instantly. They set `navigator.webdriver = true`. They leave fingerprint mismatches in canvas rendering, WebGL, and device memory. Even with "stealth" plugins, [they fail advanced detection systems](https://blog.castle.io/how-to-detect-headless-chrome-bots-instrumented-with-playwright/) like Cloudflare and Pixelscan.
+
+**agent-browser doesn't have this problem.** It connects to your real Chrome — the same browser you use every day, with your real cookies, your real extensions, your real fingerprint. Websites can't tell the difference between you and your AI agent because there is no difference. It's the same browser.
+
+### What this means in practice
+
+**Log in once, stay logged in forever.** Sign into Amazon, Gmail, your bank — whatever. Those cookies persist in your Chrome profile. Next time your AI agent opens that site, it's already authenticated. No re-entering passwords. No 2FA loops. No expired sessions.
+
+**Shop on Amazon.** Your AI can browse products, compare prices, add items to your cart, and go through checkout — on your real account, with your saved payment methods, at your saved addresses. The same workflow that gets blocked instantly with Playwright just works here because Amazon sees a real Chrome browser with a real browsing history.
+
+**Manage any authenticated account.** Banking dashboards, social media, email, admin panels, SaaS tools — if you can access it in Chrome, your AI agent can too. Same cookies. Same session. No bot flags.
+
+**Get past Cloudflare, CAPTCHAs, and bot walls.** Sites that block automated browsers don't block yours — because yours isn't automated in the way they're detecting. There's no `navigator.webdriver` flag. No headless Chrome signature. No fingerprint inconsistencies. It's just Chrome.
+
+### Why this works
+
+| | agent-browser | Playwright / Puppeteer |
+|---|---|---|
+| Browser used | Your real Chrome | Downloaded Chromium binary |
+| `navigator.webdriver` | `false` (real browser) | `true` (automation flag) |
+| Cookies | Your real cookies, persistent | Fresh/empty every session |
+| Browser fingerprint | Genuine (canvas, WebGL, etc.) | Detectable mismatches |
+| Bot detection result | Passes as human | Detected and blocked |
+
+---
+
 ## Quick Start
 
 ### Install
@@ -194,6 +224,7 @@ Claude Code  →  agent-browser CLI (Rust)  →  daemon (Node.js)  →  Chrome C
 - **Claude Code users** who want their AI to test, verify, and automate browser tasks
 - **Teams running parallel AI agents** that need session isolation
 - **Anyone frustrated with Playwright/Puppeteer bloat** who just wants to talk to Chrome
+- **People who want AI to handle real-world tasks** — shopping on Amazon, managing accounts, interacting with sites that block bots
 - **New developers** who want a simple CLI instead of learning a complex automation framework
 
 ---
@@ -209,6 +240,8 @@ Claude Code  →  agent-browser CLI (Rust)  →  daemon (Node.js)  →  Chrome C
 | Downloads browsers | No | Yes | Yes | Yes | Yes |
 | AI-native refs (`@e1`) | Yes | No | No | Yes | No |
 | CLI-first design | Yes | No | No | Partial | No |
+| Persistent cookies | Yes (real Chrome profile) | No (fresh each run) | No (fresh each run) | No (fresh each run) | No (fresh each run) |
+| Invisible to bot detection | Yes (real browser) | No (`webdriver=true`) | No (`webdriver=true`) | No (`webdriver=true`) | No (`webdriver=true`) |
 | Cross-browser | Chrome only | Chrome, Firefox, WebKit | Chrome only | Chrome only | All |
 
 **The trade-off is intentional**: agent-browser only supports Chrome because that's what AI agents need. Dropping Firefox and WebKit means zero bundled browsers, zero extra downloads, and a much simpler codebase.
