@@ -257,3 +257,34 @@ Apache-2.0
 **Caleb Dane** ([@CalebDane7](https://github.com/CalebDane7))
 
 Originally forked from [vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser). CDP transport layer (`cdp.js`, `browser.js`) rewritten from scratch — zero Playwright code, zero Puppeteer code, zero browser automation library dependencies.
+
+---
+
+## Research & References
+
+The claims in this README are backed by real benchmarks, migration reports, and industry analysis:
+
+### Performance & Token Efficiency
+- [Closer to the Metal: Leaving Playwright for CDP](https://browser-use.com/posts/playwright-to-cdp) — browser-use's migration report documenting 5x faster element extraction after dropping Playwright
+- [Why Vercel's agent-browser Is Winning the Token Efficiency War](https://dev.to/chen_zhang_bac430bc7f6b95/why-vercels-agent-browser-is-winning-the-token-efficiency-war-for-ai-browser-automation-4p87) — 5.7x more test cycles under the same token budget
+- [Agent-Browser: AI-First Browser Automation That Saves 93% of Your Context Window](https://medium.com/@richardhightower/agent-browser-ai-first-browser-automation-that-saves-93-of-your-context-window-7a2c52562f8c) — Deep dive on token savings
+- [Playwright CLI: The Token-Efficient Alternative to Playwright MCP](https://testcollab.com/blog/playwright-cli) — Microsoft's own acknowledgment of the MCP token problem (~114K tokens vs ~27K with CLI)
+- [MCP vs Playwright CLI: Best Browser Control for Agents](https://supatest.ai/blog/playwright-mcp-vs-cli-ai-browser-automation) — Head-to-head comparison
+
+### CDP vs Playwright vs Puppeteer
+- [CDP vs Playwright vs Puppeteer: Is This the Wrong Question?](https://lightpanda.io/blog/posts/cdp-vs-playwright-vs-puppeteer-is-this-the-wrong-question) — Architectural analysis of the relay layer overhead
+- [Playwright vs Puppeteer: Which to Choose in 2026?](https://www.firecrawl.dev/blog/playwright-vs-puppeteer) — Puppeteer runs 15-20% faster than Playwright on identical Chromium tasks
+- [Stagehand vs Browser Use vs Playwright: AI Browser Automation Compared](https://www.nxcode.io/resources/news/stagehand-vs-browser-use-vs-playwright-ai-browser-automation-2026) — Industry comparison of AI browser approaches
+- [Top Playwright Alternatives in 2026](https://www.browserstack.com/guide/playwright-alternative) — BrowserStack's overview of the alternative landscape
+
+### Bot Detection & Real Chrome
+- [How to Detect Headless Chrome Bots Instrumented with Playwright](https://blog.castle.io/how-to-detect-headless-chrome-bots-instrumented-with-playwright/) — Why Playwright's `navigator.webdriver=true` is an instant detection signal
+- [From Puppeteer Stealth to Nodriver: How Anti-Detect Frameworks Evolved](https://securityboulevard.com/2025/06/from-puppeteer-stealth-to-nodriver-how-anti-detect-frameworks-evolved-to-evade-bot-detection/) — The industry shift toward CDP-minimal frameworks
+- [Stealth AI Browser Agents: Ultimate 2026 Guide](https://o-mega.ai/articles/stealth-for-ai-browser-agents-the-ultimate-2026-guide) — Comprehensive guide on browser fingerprinting and detection evasion
+- [The Best Headless Chrome Browser for Bypassing Anti-Bot Systems](https://kameleo.io/blog/the-best-headless-chrome-browser-for-bypassing-anti-bot-systems) — Testing results showing Playwright/Puppeteer fail advanced detection
+
+### AI Browser Agents Landscape
+- [11 Best AI Browser Agents in 2026](https://www.firecrawl.dev/blog/best-browser-agents) — Firecrawl's comprehensive review
+- [Top 10 Browser AI Agents 2026: Complete Review & Guide](https://o-mega.ai/articles/top-10-browser-use-agents-full-review-2026) — o-mega's agent comparison
+- [The Agentic Browser Landscape in 2026](https://www.nohackspod.com/blog/agentic-browser-landscape-2026) — Full landscape analysis
+- [Browser Agent Security Risks: CDP Automation Leaking Cookies](https://debugg.ai/resources/browser-agent-security-risks-cdp-automation-leaking-cookies-oauth-internal-data) — Security considerations for CDP-based agents
