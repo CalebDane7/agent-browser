@@ -1,0 +1,123 @@
+---
+name: agent-browser
+description: Use when needing to navigate websites, verify deployments, check dashboards (Google Ads, Stripe, Cloudflare), test features as a real user, or do any browser automation. Also use when user says "test" or "verify" a web feature.
+---
+
+# Agent Browser
+
+CLI browser automation via `agent-browser` (Rust binary, v0.13.0).
+
+## Step 0: Launch Chrome (MANDATORY — Run Before Anything Else)
+
+Before ANY agent-browser command, run:
+
+```bash
+start-chrome-debug
+```
+
+This detects the platform (WSL or native Linux), launches Chrome with a **persistent profile** (saved cookies — Google, Stripe, etc.), and connects `agent-browser` on port 9222. If Chrome is already running correctly, it reconnects instantly.
+
+- **WSL**: Launches Windows Chrome via PowerShell with the `ChromeCDP` profile
+- **Native Linux**: Launches `google-chrome`/`chromium` with `~/.config/agent-browser-chrome` profile
+
+**One-time sign-in**: ChromeCDP is a dedicated automation profile (required by Chrome 136+ security — the default profile cannot use CDP). Sign in to Google/Stripe/etc. **once** in the CDP Chrome window. Cookies persist across all future sessions.
+
+**CRITICAL RULES:**
+- **NEVER launch Chrome manually** (`google-chrome`, `chromium`, `chrome.exe`). Always use `start-chrome-debug`.
+- **NEVER launch a separate browser instance.** agent-browser manages its own CDP connection.
+- **NEVER run `agent-browser connect` manually** — `start-chrome-debug` handles this.
+- If `start-chrome-debug` reports an error, **STOP and tell the user**.
+
+## Environment (Pre-configured)
+
+Environment variables in `.bashrc` — do not modify:
+
+- `AGENT_BROWSER_HEADED=1` — visible Chrome window, user can interject anytime
+- `AGENT_BROWSER_AUTO_CONNECT=1` — auto-discovers running Chrome CDP
+- `AGENT_BROWSER_SESSION="claude-${PPID}"` — each Claude session gets its own isolated daemon/tab
+- `AGENT_BROWSER_ARGS` — anti-bot-detection flags
+
+The persistent Chrome profile has saved cookies. After running `start-chrome-debug`, no login needed.
+
+## Phase 0: Research the UI (Required for Third-Party Dashboards)
+
+Before automating ANY third-party dashboard (Google Ads, Stripe, Cloudflare, hosting panels, payment processors, etc.):
+
+1. **WebSearch the exact process** — search for "[platform] [task] steps [current year]"
+   - Example: "Google Ads create conversion action steps 2026"
+   - Example: "Stripe connect webhook endpoint setup 2026"
+2. **Document the expected navigation path** before opening the browser:
+   - Which menu/section to navigate to
+   - What buttons/links to click in order
+   - What form fields to fill and with what values
+   - What confirmation screens to expect
+3. **Then execute** using the Core Workflow below, following the researched path step-by-step
+
+This prevents blind clicking through unfamiliar UIs. Skip this phase ONLY for:
+- Verifying/testing our own websites
+- Simple page loads and screenshots
+- Sites where the navigation is already known from this session
+
+## Core Workflow
+
+```bash
+# Navigate + wait + get element refs
+agent-browser open URL && agent-browser wait --load networkidle && agent-browser snapshot -i --compact
+
+# Interact using @refs from snapshot
+agent-browser click @e5
+agent-browser fill @e3 "text"
+
+# Re-snapshot after DOM changes (refs become stale)
+agent-browser snapshot -i --compact
+```
+
+Chain commands with `&&` for speed. Use separate calls when you need to parse output before next step.
+
+## Parallel Verification
+
+```bash
+# Check multiple pages at once
+ab-parallel check https://site.com/page1 https://site.com/page2
+```
+
+## Testing / Verification Workflow
+
+When user says "test" or "verify" a feature:
+
+1. **Act as a real user** — click, type, fill forms (not programmatic tests)
+2. **Trigger the action** — submit form, click button, complete flow
+3. **Verify downstream effects:**
+   - Check the database (SSH + SQL query)
+   - Check other pages where the change should appear
+   - Use `ab-parallel` for multi-page checks
+4. **Take screenshots** as evidence at each step
+5. **Check console** — `agent-browser errors` must be clean
+
+Example: fill checkout email + submit -> verify Purchase row in DB -> verify success page -> verify admin dashboard updated.
+
+## Gate Requirements
+
+The hook system tracks agent-browser calls. Gate clears when ALL met:
+- Interacted (click/type/fill — not just navigate)
+- Visited 2+ pages
+- `agent-browser errors` returned clean
+- `agent-browser screenshot` taken
+
+## Key Commands
+
+| Command | Purpose |
+|---------|---------|
+| `open <url>` | Navigate |
+| `snapshot -i --compact` | Accessibility tree with @refs, compact (fewer tokens) |
+| `click @e1` | Click element |
+| `fill @e1 "text"` | Clear + type |
+| `type @e1 "text"` | Append text |
+| `screenshot --format jpeg --quality 80` | Capture page (JPEG = 3-5x smaller than PNG) |
+| `errors` | Check console errors |
+| `get text @e1` | Extract text |
+| `get url` | Current URL |
+| `eval <js>` | Run JavaScript |
+| `wait --load networkidle` | Wait for page load |
+
+## agent-browser connects directly to Chrome via CDP. No other browser engines.
