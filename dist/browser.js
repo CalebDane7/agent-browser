@@ -1648,73 +1648,25 @@ export class BrowserManager {
         const ctx = new CDPContext(client);
         this.contexts.push(ctx);
 
-        // Always create a fresh target — pre-existing targets may have stale CDP
-        // sessions from previous connections that cause commands like
-        // Page.captureScreenshot to hang indefinitely.
-        // We track existing targets for tab listing but use a fresh one as primary.
-        const targets = await client.send('Target.getTargets');
-        const existingPages = (targets.targetInfos ?? []).filter(t => t.type === 'page' && t.url);
-
-        // Attach to existing targets for awareness (tab list, URL tracking)
-        for (const target of existingPages) {
-            try {
-                const sessionId = await attachToTarget(client, target.targetId);
-                await enableDomains(client, sessionId);
-                // Quick responsiveness check (Runtime.evaluate is reliable)
-                await Promise.race([
-                    client.send('Runtime.evaluate', {
-                        expression: '1', returnByValue: true,
-                    }, sessionId),
-                    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2000)),
-                ]);
-                const page = new CDPPage(client, sessionId, target.targetId);
-                page._url = target.url;
-                page._contextRef = ctx;
-                ctx._pages.push(page);
-                this.pages.push(page);
-                this._targets.push({ targetId: target.targetId, sessionId, page });
-            } catch {
-                // Unresponsive — skip
-            }
-        }
-
-        // If we got existing pages, verify the first one can actually screenshot
-        // (the real litmus test for a usable session).
-        // If it can't, create a fresh target as the primary page.
-        let needsFreshTarget = this.pages.length === 0;
-        if (!needsFreshTarget) {
-            try {
-                const testPage = this.pages[0];
-                await Promise.race([
-                    screenshot(client, { sessionId: testPage._sessionId, format: 'jpeg' }),
-                    new Promise((_, rej) => setTimeout(() => rej(new Error('screenshot timeout')), 3000)),
-                ]);
-            } catch {
-                // Existing targets can't screenshot — create a fresh one
-                needsFreshTarget = true;
-            }
-        }
-
-        if (needsFreshTarget) {
-            const targetId = await createTarget(client);
-            const sessionId = await attachToTarget(client, targetId);
-            await enableDomains(client, sessionId);
-            const page = new CDPPage(client, sessionId, targetId);
-            page._contextRef = ctx;
-            ctx._pages.push(page);
-            // Put fresh target at front so it's the active page
-            this.pages.unshift(page);
-            this._targets.unshift({ targetId, sessionId, page });
-        }
+        // Session isolation: always create a fresh target (tab) for this daemon session.
+        // DO NOT attach to existing targets — they belong to other sessions or the user.
+        // This prevents the multi-session regression where Daemon A and Daemon B both
+        // attach to the same Chrome tab and fight over navigation.
+        // See: https://github.com/cyrus-and/chrome-remote-interface/issues/186
+        const targetId = await createTarget(client);
+        const sessionId = await attachToTarget(client, targetId);
+        await enableDomains(client, sessionId);
+        const page = new CDPPage(client, sessionId, targetId);
+        page._contextRef = ctx;
+        ctx._pages.push(page);
+        this.pages.push(page);
+        this._targets.push({ targetId, sessionId, page });
 
         this.activePageIndex = 0;
         this.browser = client;
 
-        // Set default viewport on all pages to avoid "0 width" screenshot errors.
-        // With raw CDP we must set viewport explicitly (no automatic context defaults).
-        for (const page of this.pages) {
-            await setViewport(client, 1280, 720, { sessionId: page._sessionId }).catch(() => {});
-        }
+        // Set default viewport to avoid "0 width" screenshot errors.
+        await setViewport(client, 1280, 720, { sessionId: page._sessionId }).catch(() => {});
     }
 
     // ── Launch ───────────────────────────────────────────────────────────────
@@ -2177,7 +2129,11 @@ export class BrowserManager {
         } else if (this.kernelSessionId && this.kernelApiKey) {
             await this.closeKernelSession(this.kernelSessionId, this.kernelApiKey).catch(e => console.error('Failed to close Kernel session:', e));
         } else if (this.cdpEndpoint !== null) {
-            // CDP mode: don't close external Chrome's pages
+            // CDP mode: close targets THIS session created (session isolation cleanup).
+            // Only closes our own tabs — other sessions' and user's tabs are untouched.
+            for (const target of this._targets) {
+                try { await closeTarget(this.client, target.targetId); } catch { /* ignore */ }
+            }
         } else {
             // Close pages we created
             for (const target of this._targets) {

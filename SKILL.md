@@ -74,12 +74,37 @@ agent-browser snapshot -i --compact
 
 Chain commands with `&&` for speed. Use separate calls when you need to parse output before next step.
 
-## Parallel Verification
+## Session Isolation (Automatic)
+
+Each Claude Code session gets its own isolated Chrome tab via `AGENT_BROWSER_SESSION="claude-${PPID}"`. Multiple sessions NEVER share tabs — each daemon creates a fresh target on connect. No configuration needed.
+
+## Parallel Verification (Multi-Tab)
+
+Use `tab new` to open multiple pages simultaneously within one session:
 
 ```bash
-# Check multiple pages at once
+# Open multiple tabs for parallel checks
+agent-browser tab new https://site.com/page1 && agent-browser tab new https://site.com/page2
+
+# List all tabs (shows index numbers)
+agent-browser tab list
+
+# Switch to tab by index, then screenshot/snapshot
+agent-browser tab 0 && agent-browser screenshot page1.png
+agent-browser tab 1 && agent-browser screenshot page2.png
+
+# Clean up when done
+agent-browser tab close 1 && agent-browser tab close 0
+```
+
+Or use `ab-parallel` for bulk checks:
+```bash
 ab-parallel check https://site.com/page1 https://site.com/page2
 ```
+
+**When to use tabs vs sequential `open`:**
+- **Sequential `open`**: Same tab, navigating through a flow (login → dashboard → settings)
+- **`tab new`**: Parallel verification — checking multiple independent pages without losing state
 
 ## Testing / Verification Workflow
 
@@ -119,5 +144,9 @@ The hook system tracks agent-browser calls. Gate clears when ALL met:
 | `get url` | Current URL |
 | `eval <js>` | Run JavaScript |
 | `wait --load networkidle` | Wait for page load |
+| `tab new [url]` | Open new tab (optionally navigate) |
+| `tab list` | List all tabs with index numbers |
+| `tab <n>` | Switch to tab by index |
+| `tab close [n]` | Close tab (current or by index) |
 
 ## agent-browser connects directly to Chrome via CDP. No other browser engines.
