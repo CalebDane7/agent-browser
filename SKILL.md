@@ -179,6 +179,23 @@ agent-browser close                                # Clean up own session
 
 Workers run in TRUE parallel — each has its own daemon, its own Chrome tab, zero interference.
 
+### Fast Execution: `ab-workers`
+
+For mechanical tasks (open URL, get data, report back), use `ab-workers` instead of AI agents — 3x faster, zero AI overhead:
+
+```bash
+# 1. Create tasks
+ab-tasks create "Get title from https://example.com/page1"
+ab-tasks create "Get title from https://example.com/page2"
+ab-tasks create "Get title from https://example.com/page3"
+
+# 2. Execute all in parallel (5 workers default)
+ab-workers           # Claims all pending tasks, runs in parallel bash workers
+ab-workers 10        # Use up to 10 parallel workers
+```
+
+`ab-workers` auto-claims tasks, opens each URL in its own session/tab, gets the title, completes the task, and shares results. Use AI agents only when the task needs reasoning (form filling, navigation decisions, data interpretation).
+
 ```bash
 # Coordinator checks progress and collects results
 ab-tasks list                                      # See all tasks + status
