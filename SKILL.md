@@ -154,18 +154,35 @@ The hook system tracks agent-browser calls. Gate clears when ALL met:
 Use `ab-tasks` for inter-session coordination (no daemon needed — pure file I/O):
 
 ### Coordinator + Workers Pattern
+
+**CRITICAL: Each worker MUST use its own session.** Without this, all workers fight over one tab.
+
 ```bash
 # Coordinator creates tasks
 ab-tasks create "Check Amazon seller rating for WidgetCo"
 ab-tasks create "Message Alibaba supplier about bulk pricing"
+ab-tasks create "Scrape competitor pricing on eBay"
+```
 
-# Worker sessions claim and execute
+Each worker agent must set a unique session before any browser commands:
+```bash
+# Worker sets unique session (gets its own independent Chrome tab)
+export AGENT_BROWSER_SESSION="worker-1"
 ab-tasks claim                                    # Claims next pending task
-# ... do the browser work ...
-ab-tasks complete 0 "5 stars, verified seller"    # Mark done with result
+agent-browser open <url-from-task>                # Own tab, no conflicts
+agent-browser snapshot -i --compact
+# ... do the work ...
+ab-tasks complete <id> "result data"              # Mark done with result
+ab-tasks share worker1_finding "key insight"       # Share with other workers
+agent-browser close                                # Clean up own session
+```
 
-# Coordinator checks progress
+Workers run in TRUE parallel — each has its own daemon, its own Chrome tab, zero interference.
+
+```bash
+# Coordinator checks progress and collects results
 ab-tasks list                                      # See all tasks + status
+ab-tasks shared                                    # Read results from all workers
 ```
 
 ### Shared State
