@@ -2,7 +2,9 @@
 
 ![Agent Browser](social-preview.png)
 
-### AI browser automation that bypasses Cloudflare, CAPTCHAs, and every bot wall — using 93% fewer tokens than Playwright. It shops on Amazon, navigates complex UIs, fills forms, and manages your accounts. Fast, cheap, and undetectable.
+### Breaking. Browser automation just got completely replaced.
+
+Completely undetectable. Your real Chrome as you. Playwright and PinchTab are old news. agent-browser replaces them. No screenshots. Reads page structure. 93% less context. Near-instant. 100s of parallel sessions working together agentically. "Find 5-star Amazon sellers and order from the best." "Message 20 Alibaba suppliers." Whatever you do in Chrome, it handles. Ships with a Claude Code skill that researches the UI, plans the smartest path, and verifies its own work. Open source.
 
 - **Real Chrome, real cookies** — log in once, stay logged in. Your AI uses your actual browser session with persistent cookies
 - **Invisible to bot detection** — no `navigator.webdriver` flag, no fingerprint mismatches. Sites see a real human, not a bot
