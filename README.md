@@ -34,6 +34,8 @@ And then there's the size. Playwright alone adds **~50MB** to your `node_modules
 
 **The industry is moving away from this.** [browser-use reported 5x faster element extraction](https://browser-use.com/posts/playwright-to-cdp) after dropping Playwright for raw CDP. Stagehand (Browserbase) is making the same move. Even Microsoft built [Playwright CLI](https://testcollab.com/blog/playwright-cli) to work around their own tool's token bloat.
 
+Newer tools like [PinchTab](https://github.com/pinchtab/pinchtab) still add an HTTP relay layer between your AI and Chrome. agent-browser skips that entirely.
+
 ---
 
 ## How agent-browser Is Different
@@ -257,21 +259,37 @@ Claude Code  →  agent-browser CLI (Rust)  →  daemon (Node.js)  →  Chrome C
 
 ## Compared to the Alternatives
 
-| Feature | agent-browser | Playwright | Puppeteer | Playwright MCP | Selenium |
-|---------|--------------|------------|-----------|---------------|----------|
-| Direct CDP (no relay) | Yes | No | No | No | No |
-| Token-efficient snapshots | ~200-400/page | N/A | N/A | ~13,700/step | N/A |
-| Session isolation | Built-in | Manual | Manual | Manual | Manual |
-| Install size | Lightweight | ~50MB | ~30MB | ~50MB | ~100MB+ |
-| Downloads browsers | No | Yes | Yes | Yes | Yes |
-| AI-native refs (`@e1`) | Yes | No | No | Yes | No |
-| CLI-first design | Yes | No | No | Partial | No |
-| Persistent cookies | Yes (real Chrome profile) | No (fresh each run) | No (fresh each run) | No (fresh each run) | No (fresh each run) |
-| Invisible to bot detection | Yes (real browser) | No (`webdriver=true`) | No (`webdriver=true`) | No (`webdriver=true`) | No (`webdriver=true`) |
-| Visible browser (headed) | Yes — you watch it work | No (headless default) | No (headless default) | No (headless default) | No (headless default) |
-| Cross-browser | Chrome only | Chrome, Firefox, WebKit | Chrome only | Chrome only | All |
+| Feature | agent-browser | PinchTab | Playwright | Puppeteer | Playwright MCP | Selenium |
+|---------|--------------|----------|------------|-----------|---------------|----------|
+| Direct CDP (no relay) | Yes | No (HTTP→CDP) | No | No | No | No |
+| Token-efficient snapshots | ~200-400/page | ~800/page | N/A | N/A | ~13,700/step | N/A |
+| Session isolation | Built-in | Per-instance | Manual | Manual | Manual | Manual |
+| Install size | Lightweight | 12MB Go binary | ~50MB | ~30MB | ~50MB | ~100MB+ |
+| Downloads browsers | No | Yes (its own Chrome) | Yes | Yes | Yes | Yes |
+| AI-native refs (`@e1`) | Yes | No | No | No | Yes | No |
+| CLI-first design | Yes | No (HTTP API) | No | No | Partial | No |
+| Persistent cookies | Yes (real Chrome profile) | No (fresh instances) | No (fresh each run) | No (fresh each run) | No (fresh each run) | No (fresh each run) |
+| Invisible to bot detection | Yes (real browser) | No (stealth injection) | No (`webdriver=true`) | No (`webdriver=true`) | No (`webdriver=true`) | No (`webdriver=true`) |
+| Visible browser (headed) | Yes — you watch it work | No (headless default) | No (headless default) | No (headless default) | No (headless default) | No (headless default) |
+| Cross-browser | Chrome only | Chrome only | Chrome, Firefox, WebKit | Chrome only | Chrome only | All |
 
 **The trade-off is intentional**: agent-browser only supports Chrome because that's what AI agents need. Dropping Firefox and WebKit means zero bundled browsers, zero extra downloads, and a much simpler codebase.
+
+---
+
+## agent-browser vs PinchTab
+
+[PinchTab](https://github.com/pinchtab/pinchtab) (7,300+ stars) markets itself as "5-13x cheaper than screenshots." That's true — but it's comparing against the worst-case baseline. When you compare PinchTab against agent-browser, the picture flips:
+
+- **2-4x fewer tokens** — agent-browser uses ~200-400 tokens per page. PinchTab uses ~800. PinchTab compares itself against screenshots (~3,600+ tokens), not against snapshot-based tools like agent-browser
+- **One fewer network hop** — agent-browser talks directly to Chrome over WebSocket. PinchTab adds an HTTP server between your AI and Chrome (HTTP→CDP), doubling the round trips
+- **Real Chrome, real cookies** — PinchTab launches its own Chrome instances with fresh sessions. agent-browser uses your actual browser with your actual cookies. Log in once, stay logged in
+- **No HTTP server to manage** — agent-browser is a CLI. Call it directly. PinchTab runs a localhost daemon that your AI talks to through HTTP — an extra process to start, monitor, and kill
+- **50+ commands vs a basic set** — agent-browser includes video recording, network interception, device emulation, frame support, semantic locators, and profiling. PinchTab covers navigate, click, type, and extract
+- **Headed by default** — you watch agent-browser work in your real browser. PinchTab is headless-first — your AI works in a browser you can't see
+- **No bot detection flags** — agent-browser is invisible because it's your real Chrome. PinchTab uses stealth injection, which advanced detection systems can still catch
+
+If you're searching for a PinchTab alternative, browser control for AI agents, or the most token-efficient way to automate Chrome — agent-browser does more with less.
 
 ---
 
@@ -309,6 +327,9 @@ The claims in this README are backed by real benchmarks, migration reports, and 
 - [From Puppeteer Stealth to Nodriver: How Anti-Detect Frameworks Evolved](https://securityboulevard.com/2025/06/from-puppeteer-stealth-to-nodriver-how-anti-detect-frameworks-evolved-to-evade-bot-detection/) — The industry shift toward CDP-minimal frameworks
 - [Stealth AI Browser Agents: Ultimate 2026 Guide](https://o-mega.ai/articles/stealth-for-ai-browser-agents-the-ultimate-2026-guide) — Comprehensive guide on browser fingerprinting and detection evasion
 - [The Best Headless Chrome Browser for Bypassing Anti-Bot Systems](https://kameleo.io/blog/the-best-headless-chrome-browser-for-bypassing-anti-bot-systems) — Testing results showing Playwright/Puppeteer fail advanced detection
+
+### PinchTab Comparison
+- [PinchTab](https://github.com/pinchtab/pinchtab) — Popular HTTP-based alternative (7,300+ stars). Comparison: agent-browser uses 2-4x fewer tokens (~200-400 vs ~800 per page) and connects directly to Chrome without an HTTP relay
 
 ### AI Browser Agents Landscape
 - [11 Best AI Browser Agents in 2026](https://www.firecrawl.dev/blog/best-browser-agents) — Firecrawl's comprehensive review
