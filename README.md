@@ -1,5 +1,7 @@
 # agent-browser
 
+![Agent Browser](social-preview.png)
+
 ### AI browser automation that bypasses Cloudflare, CAPTCHAs, and every bot wall — using 93% fewer tokens than Playwright. It shops on Amazon, navigates complex UIs, fills forms, and manages your accounts. Fast, cheap, and undetectable.
 
 - **Real Chrome, real cookies** — log in once, stay logged in. Your AI uses your actual browser session with persistent cookies
