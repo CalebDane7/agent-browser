@@ -1,6 +1,6 @@
 # agent-browser
 
-### Your AI and you, sharing the same browser. Like a remote control for Chrome.
+### AI browser automation that bypasses Cloudflare, CAPTCHAs, and every bot wall — using 93% fewer tokens than Playwright. It shops on Amazon, navigates complex UIs, fills forms, and manages your accounts. Fast, cheap, and undetectable.
 
 - **Real Chrome, real cookies** — log in once, stay logged in. Your AI uses your actual browser session with persistent cookies
 - **Invisible to bot detection** — no `navigator.webdriver` flag, no fingerprint mismatches. Sites see a real human, not a bot
