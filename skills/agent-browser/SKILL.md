@@ -6,6 +6,16 @@ allowed-tools: Bash(npx agent-browser:*), Bash(agent-browser:*)
 
 # Browser Automation with agent-browser
 
+## Phase 0: Research the UI (MANDATORY — No Exceptions)
+
+Before opening ANY website with `agent-browser open`, you MUST research the current UI first. Your training data is stale. UIs change constantly. Research first, click second.
+
+1. **WebSearch the current UI flow** — search for "[site name] [task] steps [current year]" or "[site name] UI layout [current year]"
+2. **Document the expected navigation path** — where buttons/links/forms are in the CURRENT UI, any recent redesigns
+3. **Then execute** using the Core Workflow below
+
+**NO EXCEPTIONS.** Not for "simple" sites. Not for "your own" sites. Not for sites you "already know." Your knowledge is stale. Skip this and you WILL waste tokens brute-forcing wrong clicks.
+
 ## Core Workflow
 
 Every browser automation follows this pattern:
@@ -385,6 +395,31 @@ Create `agent-browser.json` in the project root for persistent settings:
 ```
 
 Priority (lowest to highest): `~/.agent-browser/config.json` < `./agent-browser.json` < env vars < CLI flags. Use `--config <path>` or `AGENT_BROWSER_CONFIG` env var for a custom config file (exits with error if missing/invalid). All CLI options map to camelCase keys (e.g., `--executable-path` -> `"executablePath"`). Boolean flags accept `true`/`false` values (e.g., `--headed false` overrides config). Extensions from user and project configs are merged, not replaced.
+
+## Multi-Agent Coordination
+
+Use `ab-tasks` for inter-session coordination (no daemon needed — pure file I/O):
+
+### Coordinator + Workers Pattern
+```bash
+# Coordinator creates tasks
+ab-tasks create "Check Amazon seller rating for WidgetCo"
+ab-tasks create "Message Alibaba supplier about bulk pricing"
+
+# Worker sessions claim and execute
+ab-tasks claim                                    # Claims next pending task
+# ... do the browser work ...
+ab-tasks complete 0 "5 stars, verified seller"    # Mark done with result
+
+# Coordinator checks progress
+ab-tasks list                                      # See all tasks + status
+```
+
+### Shared State
+```bash
+ab-tasks share <key> <value>    # Write (scoped to AGENT_BROWSER_SESSION)
+ab-tasks shared [key]           # Read across all sessions
+```
 
 ## Deep-Dive Documentation
 

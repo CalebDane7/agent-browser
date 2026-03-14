@@ -722,6 +722,31 @@ const windowNewSchema = baseCommandSchema.extend({
         .nullable()
         .optional(),
 });
+// Multi-agent coordination schemas
+const shareSchema = baseCommandSchema.extend({
+    action: z.literal('share'),
+    key: z.string().min(1),
+    value: z.string().min(1),
+});
+const sharedSchema = baseCommandSchema.extend({
+    action: z.literal('shared'),
+    key: z.string().optional(),
+});
+const tasksCreateSchema = baseCommandSchema.extend({
+    action: z.literal('tasks_create'),
+    description: z.string().min(1),
+});
+const tasksListSchema = baseCommandSchema.extend({
+    action: z.literal('tasks_list'),
+});
+const tasksClaimSchema = baseCommandSchema.extend({
+    action: z.literal('tasks_claim'),
+});
+const tasksCompleteSchema = baseCommandSchema.extend({
+    action: z.literal('tasks_complete'),
+    taskId: z.number().nonnegative(),
+    result: z.string().optional(),
+});
 // Union schema for all commands
 const commandSchema = z.discriminatedUnion('action', [
     launchSchema,
@@ -859,6 +884,12 @@ const commandSchema = z.discriminatedUnion('action', [
     diffSnapshotSchema,
     diffScreenshotSchema,
     diffUrlSchema,
+    shareSchema,
+    sharedSchema,
+    tasksCreateSchema,
+    tasksListSchema,
+    tasksClaimSchema,
+    tasksCompleteSchema,
 ]);
 /**
  * Parse a JSON string into a validated command

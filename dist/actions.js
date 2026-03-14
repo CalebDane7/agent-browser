@@ -357,6 +357,18 @@ export async function executeCommand(command, browser) {
                 return await handleDiffScreenshot(command, browser);
             case 'diff_url':
                 return await handleDiffUrl(command, browser);
+            case 'share':
+                return await handleShare(command);
+            case 'shared':
+                return await handleShared(command);
+            case 'tasks_create':
+                return await handleTasksCreate(command);
+            case 'tasks_list':
+                return await handleTasksList(command);
+            case 'tasks_claim':
+                return await handleTasksClaim(command);
+            case 'tasks_complete':
+                return await handleTasksComplete(command);
             default: {
                 // TypeScript narrows to never here, but we handle it for safety
                 const unknownCommand = command;
@@ -1876,5 +1888,88 @@ async function handleDiffUrl(command, browser) {
         result.screenshot = await diffScreenshots(page.context(), screenshot1, screenshot2, {});
     }
     return successResponse(command.id, result);
+}
+// ── Multi-Agent Coordination Handlers ──────────────────────────────
+const SHARED_DIR = path.join(getAppDir(), 'shared');
+const TASKS_FILE = path.join(getAppDir(), 'tasks.jsonl');
+function getSessionName() {
+    return process.env.AGENT_BROWSER_SESSION || 'default';
+}
+async function handleShare(command) {
+    const sessionDir = path.join(SHARED_DIR, getSessionName());
+    mkdirSync(sessionDir, { recursive: true });
+    const filePath = path.join(sessionDir, `${command.key}.json`);
+    const tmpPath = filePath + '.tmp';
+    const data = JSON.stringify({ key: command.key, value: command.value, session: getSessionName(), timestamp: new Date().toISOString() });
+    fs.writeFileSync(tmpPath, data);
+    fs.renameSync(tmpPath, filePath);
+    return successResponse(command.id, { key: command.key, session: getSessionName(), shared: true });
+}
+async function handleShared(command) {
+    if (!fs.existsSync(SHARED_DIR)) {
+        return successResponse(command.id, { entries: [] });
+    }
+    const entries = [];
+    const sessions = fs.readdirSync(SHARED_DIR).filter(f => fs.statSync(path.join(SHARED_DIR, f)).isDirectory());
+    for (const session of sessions) {
+        const sessionDir = path.join(SHARED_DIR, session);
+        const files = fs.readdirSync(sessionDir).filter(f => f.endsWith('.json'));
+        for (const file of files) {
+            const key = file.replace('.json', '');
+            if (command.key && command.key !== key) continue;
+            try {
+                const data = JSON.parse(fs.readFileSync(path.join(sessionDir, file), 'utf8'));
+                entries.push(data);
+            } catch { /* skip corrupt files */ }
+        }
+    }
+    return successResponse(command.id, { entries });
+}
+function readTasks() {
+    if (!fs.existsSync(TASKS_FILE)) return [];
+    return fs.readFileSync(TASKS_FILE, 'utf8').trim().split('\n').filter(Boolean).map(line => {
+        try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean);
+}
+function writeTasks(tasks) {
+    const tmpPath = TASKS_FILE + '.tmp';
+    fs.writeFileSync(tmpPath, tasks.map(t => JSON.stringify(t)).join('\n') + '\n');
+    fs.renameSync(tmpPath, TASKS_FILE);
+}
+async function handleTasksCreate(command) {
+    mkdirSync(path.dirname(TASKS_FILE), { recursive: true });
+    const tasks = readTasks();
+    const id = tasks.length;
+    const task = { id, description: command.description, status: 'pending', session: getSessionName(), created: new Date().toISOString() };
+    fs.appendFileSync(TASKS_FILE, JSON.stringify(task) + '\n');
+    return successResponse(command.id, task);
+}
+async function handleTasksList(command) {
+    return successResponse(command.id, { tasks: readTasks() });
+}
+async function handleTasksClaim(command) {
+    const tasks = readTasks();
+    const pending = tasks.find(t => t.status === 'pending');
+    if (!pending) {
+        return successResponse(command.id, { claimed: false, message: 'No pending tasks' });
+    }
+    pending.status = 'claimed';
+    pending.claimedBy = getSessionName();
+    pending.claimedAt = new Date().toISOString();
+    writeTasks(tasks);
+    return successResponse(command.id, { claimed: true, task: pending });
+}
+async function handleTasksComplete(command) {
+    const tasks = readTasks();
+    const task = tasks.find(t => t.id === command.taskId);
+    if (!task) {
+        return errorResponse(command.id, `Task ${command.taskId} not found`);
+    }
+    task.status = 'completed';
+    task.result = command.result || '';
+    task.completedBy = getSessionName();
+    task.completedAt = new Date().toISOString();
+    writeTasks(tasks);
+    return successResponse(command.id, { task });
 }
 //# sourceMappingURL=actions.js.map

@@ -39,24 +39,24 @@ Environment variables in `.bashrc` — do not modify:
 
 The persistent Chrome profile has saved cookies. After running `start-chrome-debug`, no login needed.
 
-## Phase 0: Research the UI (Required for Third-Party Dashboards)
+## Phase 0: Research the UI (MANDATORY — No Exceptions)
 
-Before automating ANY third-party dashboard (Google Ads, Stripe, Cloudflare, hosting panels, payment processors, etc.):
+Before opening ANY website with `agent-browser open`, you MUST research the current UI first. Your training data is stale. UIs change constantly. Research first, click second.
 
-1. **WebSearch the exact process** — search for "[platform] [task] steps [current year]"
+1. **WebSearch the current UI flow** — search for "[site name] [task] steps [current year]" or "[site name] UI layout [current year]"
    - Example: "Google Ads create conversion action steps 2026"
    - Example: "Stripe connect webhook endpoint setup 2026"
+   - Example: "Amazon order flow current layout 2026"
+   - Example: "threads.com compose new post UI 2026"
 2. **Document the expected navigation path** before opening the browser:
-   - Which menu/section to navigate to
-   - What buttons/links to click in order
+   - Where target buttons/links/forms are in the CURRENT UI
+   - What the current navigation path looks like
+   - Any recent UI redesigns or layout changes
    - What form fields to fill and with what values
    - What confirmation screens to expect
 3. **Then execute** using the Core Workflow below, following the researched path step-by-step
 
-This prevents blind clicking through unfamiliar UIs. Skip this phase ONLY for:
-- Verifying/testing our own websites
-- Simple page loads and screenshots
-- Sites where the navigation is already known from this session
+**NO EXCEPTIONS.** Not for "simple" sites. Not for "your own" sites. Not for sites you "already know." Your knowledge is stale. This is a hard gate — skip it and you WILL brute-force through wrong clicks and waste tokens.
 
 ## Core Workflow
 
@@ -148,5 +148,30 @@ The hook system tracks agent-browser calls. Gate clears when ALL met:
 | `tab list` | List all tabs with index numbers |
 | `tab <n>` | Switch to tab by index |
 | `tab close [n]` | Close tab (current or by index) |
+
+## Multi-Agent Coordination
+
+Use `ab-tasks` for inter-session coordination (no daemon needed — pure file I/O):
+
+### Coordinator + Workers Pattern
+```bash
+# Coordinator creates tasks
+ab-tasks create "Check Amazon seller rating for WidgetCo"
+ab-tasks create "Message Alibaba supplier about bulk pricing"
+
+# Worker sessions claim and execute
+ab-tasks claim                                    # Claims next pending task
+# ... do the browser work ...
+ab-tasks complete 0 "5 stars, verified seller"    # Mark done with result
+
+# Coordinator checks progress
+ab-tasks list                                      # See all tasks + status
+```
+
+### Shared State
+```bash
+ab-tasks share <key> <value>    # Write (scoped to AGENT_BROWSER_SESSION)
+ab-tasks shared [key]           # Read across all sessions
+```
 
 ## agent-browser connects directly to Chrome via CDP. No other browser engines.
