@@ -1,11 +1,17 @@
 ---
 name: agent-browser
-description: Use when needing to navigate websites, verify deployments, check dashboards (Google Ads, Stripe, Cloudflare), test features as a real user, or do any browser automation. Also use when user says "test" or "verify" a web feature.
+description: Use when needing to navigate websites, verify deployments, check dashboards (Google Ads, Stripe, Cloudflare), test features as a real user, inspect rendered pages, capture screenshots, prove visual state, handle login/account/admin-console workflows, or do any browser automation. Also use when the user says "use agent browser", "visual verification", "visual proof", "verify what renders", "check page in browser", "test", or "verify" a web feature.
 ---
 
 # Agent Browser
 
 CLI browser automation via `agent-browser` (Rust binary, v0.13.0).
+
+## Default Use Policy
+
+Use Agent Browser first when the request involves a rendered webpage, visual proof, screenshots, clicking, filling, login, account setup, OAuth/admin consoles, local web app previews, or any flow where cookies, JavaScript rendering, or browser identity matter.
+
+Use terminal/curl first only for pure API/status/header/DNS checks where rendered browser state is irrelevant. If the task has 3+ independent URLs/pages/sections, switch to browser-swarm or parallel Agent Browser sessions; for 1-2 pages, use named sessions directly.
 
 ## Step 0: Launch Chrome (MANDATORY — Run Before Anything Else)
 
@@ -25,8 +31,16 @@ This detects the platform (WSL or native Linux), launches Chrome with a **persis
 **CRITICAL RULES:**
 - **NEVER launch Chrome manually** (`google-chrome`, `chromium`, `chrome.exe`). Always use `start-chrome-debug`.
 - **NEVER launch a separate browser instance.** agent-browser manages its own CDP connection.
-- **NEVER run `agent-browser connect` manually** — `start-chrome-debug` handles this.
-- If `start-chrome-debug` reports an error, **STOP and tell the user**.
+- For account/admin work, connect each named work lane to the real Chrome CDP port before opening pages:
+  ```bash
+  start-chrome-debug 9222
+  agent-browser --session <name> connect 9222
+  agent-browser --session <name> open <url>
+  agent-browser --session <name> snapshot -i
+  ```
+- If `start-chrome-debug` reports an error, run `browser-runtime doctor` and fix the smallest clear runtime issue before falling back.
+
+Clean-profile exception: do not start with `AGENT_BROWSER_CONFIG=/tmp/agent-browser-clean.json` for account work, but switch to it after one real-CDP retry if page loads repeatedly abort, land on extension/offscreen pages, show the wrong browser identity, or fail before login UI appears. State clearly that the clean config will not have the user's cookies, extensions, saved passwords, or logged-in sessions.
 
 ## Environment (Pre-configured)
 
@@ -39,24 +53,17 @@ Environment variables in `.bashrc` — do not modify:
 
 The persistent Chrome profile has saved cookies. After running `start-chrome-debug`, no login needed.
 
-## Phase 0: Research the UI (MANDATORY — No Exceptions)
+## Phase 0: Inspect the Live UI First
 
-Before opening ANY website with `agent-browser open`, you MUST research the current UI first. Your training data is stale. UIs change constantly. Research first, click second.
+Do not default to external WebSearch before using the browser. Start with the live page unless the flow is high-risk, unfamiliar, or blocked.
 
-1. **WebSearch the current UI flow** — search for "[site name] [task] steps [current year]" or "[site name] UI layout [current year]"
-   - Example: "Google Ads create conversion action steps 2026"
-   - Example: "Stripe connect webhook endpoint setup 2026"
-   - Example: "Amazon order flow current layout 2026"
-   - Example: "threads.com compose new post UI 2026"
-2. **Document the expected navigation path** before opening the browser:
-   - Where target buttons/links/forms are in the CURRENT UI
-   - What the current navigation path looks like
-   - Any recent UI redesigns or layout changes
-   - What form fields to fill and with what values
-   - What confirmation screens to expect
-3. **Then execute** using the Core Workflow below, following the researched path step-by-step
+Default order:
+1. Open the page.
+2. Snapshot the real UI.
+3. Attempt the direct interaction path.
+4. Escalate to external research only if the flow is complex, changed, blocked, or high-risk.
 
-**NO EXCEPTIONS.** Not for "simple" sites. Not for "your own" sites. Not for sites you "already know." Your knowledge is stale. This is a hard gate — skip it and you WILL brute-force through wrong clicks and waste tokens.
+Good reasons to search first: OAuth/login/consent/admin flows, complex SPAs with unclear navigation, high-stakes forms where misclicking is risky, or repeated blockers after observing the live UI.
 
 ## Core Workflow
 
@@ -73,6 +80,8 @@ agent-browser snapshot -i --compact
 ```
 
 Chain commands with `&&` for speed. Use separate calls when you need to parse output before next step.
+
+Diagnostic budget: once a screenshot shows the expected page, stop probing. If browser evidence fails, run only the smallest focused set: `agent-browser get url`, `agent-browser errors`, one HTTP/status or `browser-runtime preflight` check, and one targeted DOM/canvas probe. Do not repeat diagnostics unless a recovery step changed the state.
 
 ## Session Isolation (Automatic)
 
