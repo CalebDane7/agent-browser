@@ -459,6 +459,7 @@ class CDPPage {
 
         // Set up URL tracking via navigation events
         client.on('Page.frameNavigated', (params) => {
+            if (params.sessionId && params.sessionId !== this._sessionId) return;
             if (!params.frame?.parentId) { // Main frame only
                 this._url = params.frame?.url ?? this._url;
             }
@@ -721,11 +722,11 @@ class CDPPage {
     async waitForLoadState(state, opts = {}) {
         const timeout = opts?.timeout ?? 30000;
         if (state === 'networkidle') {
-            await waitForNetworkIdle(this._client, { timeout });
+            await waitForNetworkIdle(this._client, { timeout, sessionId: this._sessionId });
         } else if (state === 'domcontentloaded') {
-            await this._client.waitForEvent('Page.domContentEventFired', { timeout });
+            await this._client.waitForEvent('Page.domContentEventFired', { timeout, sessionId: this._sessionId });
         } else {
-            await this._client.waitForEvent('Page.loadEventFired', { timeout });
+            await this._client.waitForEvent('Page.loadEventFired', { timeout, sessionId: this._sessionId });
         }
     }
 
@@ -745,12 +746,12 @@ class CDPPage {
         const timeout = opts.timeout ?? 30000;
         // Map standard event names to CDP equivalents
         if (eventName === 'download') {
-            return this._client.waitForEvent('Page.downloadWillBegin', { timeout });
+            return this._client.waitForEvent('Page.downloadWillBegin', { timeout, sessionId: this._sessionId });
         }
         if (eventName === 'response') {
-            return this._client.waitForEvent('Network.responseReceived', { timeout });
+            return this._client.waitForEvent('Network.responseReceived', { timeout, sessionId: this._sessionId });
         }
-        return this._client.waitForEvent(eventName, { timeout });
+        return this._client.waitForEvent(eventName, { timeout, sessionId: this._sessionId });
     }
 
     async waitForResponse(predicate, opts = {}) {
@@ -1648,6 +1649,26 @@ export class BrowserManager {
         const ctx = new CDPContext(client);
         this.contexts.push(ctx);
 
+        const existingTarget = await this.findExistingTargetForRequest(wsUrl);
+        if (existingTarget) {
+            try {
+                const sessionId = await attachToTarget(client, existingTarget.id);
+                await enableDomains(client, sessionId);
+                const page = new CDPPage(client, sessionId, existingTarget.id);
+                page._url = existingTarget.url || 'about:blank';
+                page._contextRef = ctx;
+                ctx._pages.push(page);
+                this.pages.push(page);
+                this._targets.push({ targetId: existingTarget.id, sessionId, page, owned: false });
+                this.activePageIndex = 0;
+                this.browser = client;
+                await setViewport(client, 1280, 720, { sessionId: page._sessionId }).catch(() => {});
+                return;
+            } catch {
+                // If the chosen existing tab is wedged, fall back to an isolated fresh target.
+            }
+        }
+
         // Session isolation: always create a fresh target (tab) for this daemon session.
         // DO NOT attach to existing targets — they belong to other sessions or the user.
         // This prevents the multi-session regression where Daemon A and Daemon B both
@@ -1660,13 +1681,70 @@ export class BrowserManager {
         page._contextRef = ctx;
         ctx._pages.push(page);
         this.pages.push(page);
-        this._targets.push({ targetId, sessionId, page });
+        this._targets.push({ targetId, sessionId, page, owned: true });
 
         this.activePageIndex = 0;
         this.browser = client;
 
         // Set default viewport to avoid "0 width" screenshot errors.
         await setViewport(client, 1280, 720, { sessionId: page._sessionId }).catch(() => {});
+    }
+
+    getHttpEndpointFromCdpUrl(cdpUrl) {
+        try {
+            const parsed = new URL(cdpUrl);
+            if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+                return `${parsed.protocol}//${parsed.host}`;
+            }
+            if (parsed.protocol === 'ws:' || parsed.protocol === 'wss:') {
+                return `${parsed.protocol === 'wss:' ? 'https:' : 'http:'}//${parsed.host}`;
+            }
+        } catch {
+            return null;
+        }
+        return null;
+    }
+
+    scoreExistingTarget(target, requestedUrl) {
+        if (!target?.url || target.url === 'about:blank') return -1;
+        if (target.url.startsWith('chrome://') || target.url.startsWith('chrome-extension://') || target.url.startsWith('devtools://')) return -1;
+        let targetUrl;
+        let requested;
+        try {
+            targetUrl = new URL(target.url);
+            requested = new URL(requestedUrl);
+        } catch {
+            return -1;
+        }
+        if (targetUrl.protocol !== 'http:' && targetUrl.protocol !== 'https:') return -1;
+        let score = 0;
+        if (targetUrl.origin === requested.origin) score += 80;
+        else if (targetUrl.hostname === requested.hostname) score += 50;
+        else return -1;
+        const requestedRoot = requested.pathname.split('/').filter(Boolean)[0];
+        const targetRoot = targetUrl.pathname.split('/').filter(Boolean)[0];
+        if (requestedRoot && requestedRoot === targetRoot) score += 30;
+        if (targetUrl.pathname === requested.pathname) score += 20;
+        if (/\/login\b/.test(targetUrl.pathname)) score -= 40;
+        if (target.attached === false) score += 2;
+        return score;
+    }
+
+    async findExistingTargetForRequest(cdpUrl) {
+        const requestedUrl = process.env.AGENT_BROWSER_ATTACH_EXISTING_URL;
+        if (!requestedUrl || process.env.AGENT_BROWSER_ATTACH_EXISTING === '0') return null;
+        const httpBase = this.getHttpEndpointFromCdpUrl(cdpUrl);
+        if (!httpBase) return null;
+        try {
+            const targets = await getTargets(httpBase);
+            const scored = targets
+                .map((target) => ({ target, score: this.scoreExistingTarget(target, requestedUrl) }))
+                .filter((entry) => entry.score >= 0)
+                .sort((a, b) => b.score - a.score);
+            return scored[0]?.target ?? null;
+        } catch {
+            return null;
+        }
     }
 
     // ── Launch ───────────────────────────────────────────────────────────────
@@ -1684,13 +1762,17 @@ export class BrowserManager {
         if (hasProfile) throw new Error('Persistent profiles are not supported in raw CDP mode. Launch Chrome with --user-data-dir instead.');
 
         if (this.isLaunched()) {
-            const needsRelaunch = (!cdpEndpoint && !options.autoConnect && this.cdpEndpoint !== null) ||
-                (!!cdpEndpoint && this.needsCdpReconnect(cdpEndpoint)) ||
-                (!!options.autoConnect && !this.isCdpConnectionAlive());
-            if (needsRelaunch) {
+            if (cdpEndpoint) {
+                if (this.needsCdpReconnect(cdpEndpoint)) {
+                    await this.close();
+                } else {
+                    return;
+                }
+            } else if (options.autoConnect) {
+                if (this.isCdpConnectionAlive()) {
+                    return;
+                }
                 await this.close();
-            } else if (options.autoConnect && this.isCdpConnectionAlive()) {
-                return;
             } else {
                 return;
             }
@@ -2131,12 +2213,12 @@ export class BrowserManager {
         } else if (this.cdpEndpoint !== null) {
             // CDP mode: close targets THIS session created (session isolation cleanup).
             // Only closes our own tabs — other sessions' and user's tabs are untouched.
-            for (const target of this._targets) {
+            for (const target of this._targets.filter((target) => target.owned !== false)) {
                 try { await closeTarget(this.client, target.targetId); } catch { /* ignore */ }
             }
         } else {
             // Close pages we created
-            for (const target of this._targets) {
+            for (const target of this._targets.filter((target) => target.owned !== false)) {
                 try { await closeTarget(this.client, target.targetId); } catch { /* ignore */ }
             }
         }

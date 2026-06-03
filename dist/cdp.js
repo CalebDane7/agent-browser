@@ -104,11 +104,12 @@ export class CDPClient {
      * @param {string} [sessionId] - Target session ID (for page-level commands)
      * @returns {Promise<object>} - CDP response result
      */
-    send(method, params = {}, sessionId) {
+    send(method, params = {}, sessionId, opts = {}) {
         if (!this._connected || !this.ws) {
             return Promise.reject(new Error(`CDP not connected. Cannot send ${method}`));
         }
 
+        const timeout = opts.timeout ?? Number.parseInt(process.env.AGENT_BROWSER_CDP_COMMAND_TIMEOUT_MS ?? '10000', 10);
         const id = ++this._msgId;
         const msg = { id, method, params };
         if (sessionId ?? this._sessionId) {
@@ -116,10 +117,25 @@ export class CDPClient {
         }
 
         return new Promise((resolve, reject) => {
-            this._callbacks.set(id, { resolve, reject });
+            let timer = null;
+            const finish = (fn, value) => {
+                if (timer) clearTimeout(timer);
+                fn(value);
+            };
+            if (Number.isFinite(timeout) && timeout > 0) {
+                timer = setTimeout(() => {
+                    this._callbacks.delete(id);
+                    reject(new Error(`CDP command ${method} timed out after ${timeout}ms`));
+                }, timeout);
+            }
+            this._callbacks.set(id, {
+                resolve: (value) => finish(resolve, value),
+                reject: (error) => finish(reject, error),
+            });
             this.ws.send(JSON.stringify(msg), (err) => {
                 if (err) {
                     this._callbacks.delete(id);
+                    if (timer) clearTimeout(timer);
                     reject(new Error(`Failed to send CDP command ${method}: ${err.message}`));
                 }
             });
@@ -159,6 +175,7 @@ export class CDPClient {
     waitForEvent(event, opts = {}) {
         const timeout = opts.timeout ?? 30000;
         const predicate = opts.predicate ?? (() => true);
+        const sessionId = opts.sessionId;
 
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
@@ -167,6 +184,9 @@ export class CDPClient {
             }, timeout);
 
             const handler = (params) => {
+                if (sessionId && params.sessionId !== sessionId) {
+                    return;
+                }
                 if (predicate(params)) {
                     clearTimeout(timer);
                     this.off(event, handler);
@@ -206,9 +226,10 @@ export class CDPClient {
         if (msg.method) {
             const handlers = this._eventHandlers.get(msg.method);
             if (handlers) {
+                const eventParams = { ...(msg.params ?? {}), sessionId: msg.sessionId };
                 for (const handler of handlers) {
                     try {
-                        handler(msg.params ?? {});
+                        handler(eventParams);
                     } catch {
                         // Don't let one handler crash others
                     }
@@ -304,11 +325,11 @@ export async function navigate(client, url, opts = {}) {
     // Set up load event listener before navigating
     let loadPromise;
     if (waitUntil === 'load') {
-        loadPromise = client.waitForEvent('Page.loadEventFired', { timeout });
+        loadPromise = client.waitForEvent('Page.loadEventFired', { timeout, sessionId });
     } else if (waitUntil === 'domcontentloaded') {
-        loadPromise = client.waitForEvent('Page.domContentEventFired', { timeout });
+        loadPromise = client.waitForEvent('Page.domContentEventFired', { timeout, sessionId });
     } else if (waitUntil === 'networkidle') {
-        loadPromise = waitForNetworkIdle(client, { timeout });
+        loadPromise = waitForNetworkIdle(client, { timeout, sessionId });
     }
 
     const { frameId, errorText } = await client.send('Page.navigate', { url }, sessionId);
@@ -329,6 +350,7 @@ export async function navigate(client, url, opts = {}) {
 export function waitForNetworkIdle(client, opts = {}) {
     const timeout = opts.timeout ?? 30000;
     const idleTime = opts.idleTime ?? 500;
+    const sessionId = opts.sessionId;
 
     return new Promise((resolve, reject) => {
         let pending = 0;
@@ -349,7 +371,10 @@ export function waitForNetworkIdle(client, opts = {}) {
             }
         };
 
-        const onRequest = () => {
+        const matchesSession = (params) => !sessionId || params.sessionId === sessionId;
+
+        const onRequest = (params) => {
+            if (!matchesSession(params)) return;
             pending++;
             if (idleTimer) {
                 clearTimeout(idleTimer);
@@ -357,7 +382,8 @@ export function waitForNetworkIdle(client, opts = {}) {
             }
         };
 
-        const onComplete = () => {
+        const onComplete = (params) => {
+            if (!matchesSession(params)) return;
             pending = Math.max(0, pending - 1);
             checkIdle();
         };
