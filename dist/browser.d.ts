@@ -50,6 +50,10 @@ interface PageError {
 export declare class BrowserManager {
     private browser;
     private cdpEndpoint;
+    private cdpHttpBase;
+    private _targetTrackingInstalled;
+    private _targetAttachPromises;
+    private _pendingTargetIds;
     private isPersistentContext;
     private browserbaseSessionId;
     private browserbaseApiKey;
@@ -84,6 +88,20 @@ export declare class BrowserManager {
      * Get and clear launch warnings (e.g., decryption failures)
      */
     getAndClearWarnings(): string[];
+    private normalizeTargetInfo;
+    private isInternalTargetUrl;
+    private isKnownTarget;
+    private shouldTrackExternalTarget;
+    private attachExternalTarget;
+    private trackExternalTarget;
+    private dedupeTrackedTargets;
+    settleExternalTargetTracking(timeoutMs?: number): Promise<void>;
+    private installTargetTracking;
+    syncExternalTargets(options?: {
+        activateNew?: boolean;
+        waitMs?: number;
+    }): Promise<any[]>;
+    private syncExternalTargetsOnce;
     private static readonly MAX_PROFILE_EVENTS;
     private profilingActive;
     private profileChunks;

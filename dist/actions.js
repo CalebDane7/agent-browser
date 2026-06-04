@@ -429,6 +429,12 @@ async function handleClick(command, browser) {
             clickCount: command.clickCount,
             delay: command.delay,
         });
+        if (typeof browser.settleExternalTargetTracking === 'function') {
+            await browser.settleExternalTargetTracking(300);
+        }
+        if (typeof browser.syncExternalTargets === 'function') {
+            await browser.syncExternalTargets({ activateNew: true, waitMs: 225 });
+        }
     }
     catch (error) {
         throw toAIFriendlyError(error, command.selector);

@@ -1010,6 +1010,55 @@ class CDPContext {
         return state;
     }
 
+    async cookies(urls) {
+        // WHY: Raw CDP contexts do not have Playwright's BrowserContext.cookies
+        // helper. Expose the same Agent Browser command through Network.getCookies
+        // so account/debug flows can inspect login state without switching tools.
+        const page = this._pages.find((candidate) => candidate?._sessionId);
+        const effectiveUrls = urls?.length
+            ? urls
+            : this._pages
+                .map((candidate) => candidate.url())
+                .filter((url) => url && url !== 'about:blank' && !url.startsWith('chrome:'));
+        const params = effectiveUrls.length ? { urls: effectiveUrls } : {};
+        const { cookies } = page
+            ? await this._client.send('Network.getCookies', params, page._sessionId).catch(async () => {
+                return await this._client.send('Storage.getCookies', {});
+            })
+            : await this._client.send('Storage.getCookies', {});
+        return cookies ?? [];
+    }
+
+    async addCookies(cookies) {
+        for (const cookie of cookies) {
+            const params = { ...cookie };
+            if (!params.url && !params.domain) {
+                const pageUrl = this._pages.find((page) => {
+                    const url = page.url();
+                    return url && url !== 'about:blank';
+                })?.url();
+                if (pageUrl) params.url = pageUrl;
+            }
+            if (!params.url && params.domain && !params.path) {
+                params.path = '/';
+            }
+            const page = this._pages.find((candidate) => candidate?._sessionId);
+            const result = await this._client.send('Network.setCookie', params, page?._sessionId);
+            if (result?.success === false) {
+                throw new Error(`Failed to set cookie '${cookie.name}'`);
+            }
+        }
+    }
+
+    async clearCookies() {
+        const page = this._pages.find((candidate) => candidate?._sessionId);
+        if (page) {
+            await this._client.send('Network.clearBrowserCookies', {}, page._sessionId);
+        } else {
+            await this._client.send('Storage.clearCookies', {});
+        }
+    }
+
     on(event, handler) {
         // Context-level event emitter stub for 'page' events
         if (!this._eventHandlers) this._eventHandlers = new Map();
@@ -1157,6 +1206,10 @@ export class BrowserManager {
     client = null;         // CDPClient instance
     _targets = [];         // Array of { targetId, sessionId, page: CDPPage }
     cdpEndpoint = null;
+    cdpHttpBase = null;
+    _targetTrackingInstalled = false;
+    _targetAttachPromises = new Set();
+    _pendingTargetIds = new Set();
     isPersistentContext = false;
 
     // Cloud provider state
@@ -1213,6 +1266,177 @@ export class BrowserManager {
         const warnings = this.launchWarnings;
         this.launchWarnings = [];
         return warnings;
+    }
+
+    normalizeTargetInfo(targetInfo) {
+        if (!targetInfo) return null;
+        const targetId = targetInfo.targetId ?? targetInfo.id;
+        if (!targetId) return null;
+        return {
+            ...targetInfo,
+            targetId,
+            type: targetInfo.type ?? 'page',
+            url: targetInfo.url ?? 'about:blank',
+        };
+    }
+
+    isInternalTargetUrl(url) {
+        return !!url && (
+            url.startsWith('chrome://') ||
+            url.startsWith('chrome-extension://') ||
+            url.startsWith('chrome-untrusted://') ||
+            url.startsWith('devtools://')
+        );
+    }
+
+    isKnownTarget(targetId) {
+        return this._targets.some((target) => target.targetId === targetId);
+    }
+
+    shouldTrackExternalTarget(targetInfo) {
+        const info = this.normalizeTargetInfo(targetInfo);
+        if (!info || info.type !== 'page') return false;
+        if (this.isKnownTarget(info.targetId)) return false;
+        if (this._pendingTargetIds.has(info.targetId)) return false;
+        if (this.isInternalTargetUrl(info.url)) return false;
+        // WHY: OAuth/login popups are separate Chrome targets. We only adopt targets
+        // whose opener is one of this session's pages, so Agent Browser can follow
+        // Google/Exness-style popups without stealing unrelated user tabs.
+        return !!info.openerId && this.isKnownTarget(info.openerId);
+    }
+
+    async attachExternalTarget(targetInfo, options = {}) {
+        if (!this.client) return null;
+        const info = this.normalizeTargetInfo(targetInfo);
+        if (!info || this.isKnownTarget(info.targetId)) return null;
+        const sessionId = await attachToTarget(this.client, info.targetId);
+        await enableDomains(this.client, sessionId);
+        const page = new CDPPage(this.client, sessionId, info.targetId);
+        page._url = info.url || 'about:blank';
+        const ctx = this.contexts[0];
+        if (ctx) {
+            page._contextRef = ctx;
+            ctx._pages.push(page);
+        }
+        this.pages.push(page);
+        this._targets.push({ targetId: info.targetId, sessionId, page, owned: false });
+        if (options.activate) {
+            await this.invalidateCDPSession().catch(() => {});
+            this.activePageIndex = this.pages.length - 1;
+        }
+        await setViewport(this.client, 1280, 720, { sessionId: page._sessionId }).catch(() => {});
+        return page;
+    }
+
+    trackExternalTarget(targetInfo, options = {}) {
+        const info = this.normalizeTargetInfo(targetInfo);
+        if (!this.shouldTrackExternalTarget(info)) return null;
+        // WHY: Chrome can report the same popup through targetCreated,
+        // targetInfoChanged, and the post-click HTTP target scan. Marking a
+        // target pending before attach prevents duplicate Agent Browser tabs
+        // for one real OAuth window.
+        this._pendingTargetIds.add(info.targetId);
+        const promise = this.attachExternalTarget(info, options).catch(() => null);
+        this._targetAttachPromises.add(promise);
+        promise.finally(() => {
+            this._targetAttachPromises.delete(promise);
+            this._pendingTargetIds.delete(info.targetId);
+        });
+        return promise;
+    }
+
+    dedupeTrackedTargets() {
+        const seen = new Set();
+        const targets = [];
+        for (const target of this._targets) {
+            if (seen.has(target.targetId)) continue;
+            seen.add(target.targetId);
+            targets.push(target);
+        }
+        if (targets.length === this._targets.length) return;
+        this._targets = targets;
+        this.pages = targets.map((target) => target.page);
+        if (this.activePageIndex >= this.pages.length) {
+            this.activePageIndex = Math.max(0, this.pages.length - 1);
+        }
+    }
+
+    async settleExternalTargetTracking(timeoutMs = 300) {
+        if (this._targetAttachPromises.size === 0) return;
+        await Promise.race([
+            Promise.allSettled([...this._targetAttachPromises]),
+            new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+        ]);
+    }
+
+    async installTargetTracking() {
+        if (!this.client || this._targetTrackingInstalled) return;
+        this._targetTrackingInstalled = true;
+        this.client.on('Target.targetCreated', (params) => {
+            this.trackExternalTarget(params.targetInfo, { activate: true });
+        });
+        this.client.on('Target.targetInfoChanged', (params) => {
+            const info = this.normalizeTargetInfo(params.targetInfo);
+            if (!info) return;
+            const tracked = this._targets.find((target) => target.targetId === info.targetId);
+            if (tracked) {
+                tracked.page._url = info.url || tracked.page._url;
+                return;
+            }
+            this.trackExternalTarget(info, { activate: true });
+        });
+        this.client.on('Target.targetDestroyed', async (params) => {
+            const targetId = params.targetId;
+            const index = this._targets.findIndex((target) => target.targetId === targetId);
+            if (index < 0) return;
+            const [removed] = this._targets.splice(index, 1);
+            this.pages = this.pages.filter((page) => page !== removed.page);
+            if (removed.page?._contextRef) {
+                removed.page._contextRef._pages = removed.page._contextRef._pages.filter((page) => page !== removed.page);
+            }
+            if (this.activePageIndex >= this.pages.length) {
+                this.activePageIndex = Math.max(0, this.pages.length - 1);
+            }
+            await this.invalidateCDPSession().catch(() => {});
+        });
+        await this.client.send('Target.setDiscoverTargets', { discover: true }).catch(() => {});
+    }
+
+    async syncExternalTargets(options = {}) {
+        if (!this.client || !this.cdpHttpBase) return [];
+        const waitMs = options.waitMs ?? 0;
+        const deadline = Date.now() + waitMs;
+        const added = [];
+        do {
+            const batch = await this.syncExternalTargetsOnce(options);
+            added.push(...batch);
+            if (batch.length > 0 || Date.now() >= deadline) break;
+            await new Promise((resolve) => setTimeout(resolve, 75));
+        } while (Date.now() < deadline);
+        return added;
+    }
+
+    async syncExternalTargetsOnce(options = {}) {
+        let targets;
+        try {
+            targets = await getTargets(this.cdpHttpBase, 1000);
+        } catch {
+            return [];
+        }
+        const targetsById = new Map(targets.map((target) => [target.id, target]));
+        for (const tracked of this._targets) {
+            const current = targetsById.get(tracked.targetId);
+            if (current?.url) tracked.page._url = current.url;
+        }
+        const added = [];
+        for (const target of targets) {
+            const info = this.normalizeTargetInfo({ ...target, targetId: target.id });
+            if (!this.shouldTrackExternalTarget(info)) continue;
+            const page = await this.trackExternalTarget(info, { activate: options.activateNew === true });
+            if (page) added.push(page);
+        }
+        this.dedupeTrackedTargets();
+        return added;
     }
 
     isLaunched() {
@@ -1645,6 +1869,7 @@ export class BrowserManager {
         const client = new CDPClient();
         await client.connect(wsUrl);
         this.client = client;
+        this.cdpHttpBase = this.getHttpEndpointFromCdpUrl(wsUrl);
 
         const ctx = new CDPContext(client);
         this.contexts.push(ctx);
@@ -1663,6 +1888,7 @@ export class BrowserManager {
                 this.activePageIndex = 0;
                 this.browser = client;
                 await setViewport(client, 1280, 720, { sessionId: page._sessionId }).catch(() => {});
+                await this.installTargetTracking();
                 return;
             } catch {
                 // If the chosen existing tab is wedged, fall back to an isolated fresh target.
@@ -1688,6 +1914,7 @@ export class BrowserManager {
 
         // Set default viewport to avoid "0 width" screenshot errors.
         await setViewport(client, 1280, 720, { sessionId: page._sessionId }).catch(() => {});
+        await this.installTargetTracking();
     }
 
     getHttpEndpointFromCdpUrl(cdpUrl) {
@@ -1951,6 +2178,8 @@ export class BrowserManager {
     }
 
     async switchTo(index) {
+        await this.syncExternalTargets();
+        this.dedupeTrackedTargets();
         if (index < 0 || index >= this.pages.length) {
             throw new Error(`Invalid tab index: ${index}. Available: 0-${this.pages.length - 1}`);
         }
@@ -1987,6 +2216,8 @@ export class BrowserManager {
     }
 
     async listTabs() {
+        await this.syncExternalTargets();
+        this.dedupeTrackedTargets();
         const tabs = await Promise.all(this.pages.map(async (page, index) => ({
             index,
             url: page.url(),
@@ -2235,6 +2466,10 @@ export class BrowserManager {
         this.contexts = [];
         this._targets = [];
         this.cdpEndpoint = null;
+        this.cdpHttpBase = null;
+        this._targetTrackingInstalled = false;
+        this._targetAttachPromises.clear();
+        this._pendingTargetIds.clear();
         this.browserbaseSessionId = null;
         this.browserbaseApiKey = null;
         this.browserUseSessionId = null;
