@@ -44,6 +44,20 @@ Use Agent Browser first when the request involves a rendered webpage, visual pro
 
 Use terminal/curl first only for pure API/status/header/DNS checks where rendered browser state is irrelevant. If the task has 3+ independent URLs/pages/sections, switch to `browser-swarm`; for 1-2 pages, use named Agent Browser sessions directly.
 
+## Tab and Session Cleanup Rule
+
+Treat every Agent Browser tab and session as a temporary work surface. Close each tab or session as soon as it is no longer actively needed, especially when a page failed, loaded the wrong account, opened an irrelevant result, or did not produce useful evidence. Do not leave exploratory, failed, duplicate, or finished tabs open for later cleanup.
+
+Before you report that browser work is done, run the smallest appropriate cleanup command for every Agent Browser surface you opened:
+
+```bash
+agent-browser tab close <index>       # Close one finished tab in the current session
+agent-browser close                   # Close the default session/tab
+agent-browser --session <name> close  # Close a named session/tab
+```
+
+Only keep a tab open when it is still needed for an active user-visible state, in-progress login/2FA, or a specific follow-up the user asked to inspect. If you intentionally leave anything open, say exactly which tab/session remains and why. Closing Agent Browser work tabs keeps Chrome usable, reduces memory, and prevents future automations from attaching to stale or dirty pages.
+
 ## Real Chrome Profile First
 
 For account/login work, payment dashboards, registrar/admin consoles, or any task where the user expects existing cookies, saved passwords, extensions, or their visible desktop Chrome session, use the controller-owned real Chrome CDP profile first. Do not use `AGENT_BROWSER_CONFIG=/tmp/agent-browser-clean.json`, `--profile`, `--state`, or `--executable-path` for these tasks unless the user explicitly asks for a disposable browser.
@@ -73,6 +87,7 @@ Every browser automation follows this pattern:
 2. **Snapshot**: `agent-browser snapshot -i` (get element refs like `@e1`, `@e2`)
 3. **Interact**: Use refs to click, fill, select
 4. **Re-snapshot**: After navigation or DOM changes, get fresh refs
+5. **Clean up**: close finished, failed, duplicate, or no-longer-useful tabs/sessions immediately
 
 ```bash
 agent-browser open https://example.com/form
@@ -174,6 +189,7 @@ Simple screenshots, page checks, obvious buttons, and straightforward forms shou
    agent-browser --session task-b open <url>  # Agent 2
    agent-browser --session task-c open <url>  # Agent 3
    ```
+   Each worker closes its own session as soon as its assigned browser work is complete or abandoned.
 4. **Identify sequential dependencies** — tasks that MUST happen in order:
    - Within a single form: fill fields → save → dismiss post-save dialog → next entry
    - Cross-section: if section B depends on section A being saved first
@@ -588,14 +604,21 @@ agent-browser --session agent2 open site-b.com
 agent-browser session list
 ```
 
-Always close your browser session when done to avoid leaked processes:
+Always close your browser session when done to avoid leaked tabs, stale state, and unnecessary memory use:
 
 ```bash
 agent-browser close                    # Close default session
 agent-browser --session agent1 close   # Close specific session
 ```
 
-If a previous session was not closed properly, the daemon may still be running. Use `agent-browser close` to clean it up before starting new work.
+If you opened extra tabs inside a session, close each finished tab as soon as it is no longer useful:
+
+```bash
+agent-browser tab list
+agent-browser tab close <index>
+```
+
+If a previous session was not closed properly, the daemon may still be running. Use `agent-browser close` or `agent-browser --session <name> close` to clean it up before starting new work. Before finalizing browser work, close every tab/session you opened unless it is intentionally being left visible for the user, and then state why it remains open.
 
 ## Ref Lifecycle (Important)
 

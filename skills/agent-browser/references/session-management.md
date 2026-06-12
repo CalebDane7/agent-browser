@@ -4,6 +4,8 @@ Multiple isolated browser sessions with state persistence and concurrent browsin
 
 **Related**: [authentication.md](authentication.md) for login patterns, [SKILL.md](../SKILL.md) for quick start.
 
+Cleanup is mandatory. Treat every browser tab/session as temporary and close it as soon as it is finished, failed, duplicated, pointed at the wrong account, or no longer useful. Do not leave tabs open for later cleanup unless the user explicitly needs to inspect the current visible state.
+
 ## Contents
 
 - [Named Sessions](#named-sessions)
@@ -150,9 +152,17 @@ agent-browser close  # Closes default session
 # Close specific session
 agent-browser --session auth close
 
+# Close default session
+agent-browser close
+
+# Close one finished tab inside the current session
+agent-browser tab close <index>
+
 # List active sessions
 agent-browser session list
 ```
+
+Close failed or irrelevant tabs immediately. If a page did not load correctly, opened the wrong account, hit an extension/offscreen target, or proved unrelated to the task, close it before opening the next page. Before finalizing work, either close every Agent Browser surface you opened or explicitly report which tab/session remains open and why.
 
 ## Best Practices
 
@@ -173,6 +183,14 @@ agent-browser --session s1 open https://github.com
 # Close sessions when done
 agent-browser --session auth close
 agent-browser --session scrape close
+```
+
+For multi-tab checks, list tabs and close each completed tab:
+
+```bash
+agent-browser tab list
+agent-browser tab close 2
+agent-browser tab close 1
 ```
 
 ### 3. Handle State Files Securely

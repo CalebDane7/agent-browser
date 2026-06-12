@@ -13,6 +13,20 @@ Use Agent Browser first when the request involves a rendered webpage, visual pro
 
 Use terminal/curl first only for pure API/status/header/DNS checks where rendered browser state is irrelevant. If the task has 3+ independent URLs/pages/sections, switch to browser-swarm or parallel Agent Browser sessions; for 1-2 pages, use named sessions directly.
 
+## Tab and Session Cleanup Rule
+
+Treat every Agent Browser tab and session as temporary. Close finished, failed, duplicate, wrong-account, irrelevant, or no-longer-useful pages immediately instead of leaving them around for later.
+
+Before reporting browser work as done, close every Agent Browser tab/session you opened:
+
+```bash
+agent-browser tab close <index>       # Close one finished tab in the current session
+agent-browser close                   # Close the default session/tab
+agent-browser --session <name> close  # Close a named session/tab
+```
+
+Only keep a tab open when it is still needed for active user-visible state, in-progress login/2FA, or a specific follow-up the user asked to inspect. If anything is intentionally left open, say which tab/session remains and why.
+
 ## Step 0: Launch Chrome (MANDATORY — Run Before Anything Else)
 
 Before ANY agent-browser command, run:
@@ -187,6 +201,8 @@ agent-browser close                                # Clean up own session
 ```
 
 Workers run in TRUE parallel — each has its own daemon, its own Chrome tab, zero interference.
+
+If a worker opens a bad page, hits the wrong account, or learns a page is useless, it closes that tab/session immediately before claiming another task. Do not let failed exploratory tabs pile up.
 
 ### Fast Execution: `ab-workers`
 
