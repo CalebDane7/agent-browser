@@ -12,6 +12,41 @@
 import { WebSocket } from 'ws';
 
 // ─── CDP Transport ───────────────────────────────────────────────────────────
+const BROKER_AUTHORIZATION_ENV = 'AGENT_BROWSER_BROKER_AUTHORIZATION';
+const BROKER_FORBIDDEN_METHODS = new Set([
+    'Target.createTarget',
+    'Target.activateTarget',
+    'Browser.grantPermissions',
+    'Browser.resetPermissions',
+]);
+
+function exactBrokerWsUrl(wsUrl, transportGeneration) {
+    if (typeof wsUrl !== 'string' || typeof transportGeneration !== 'string') return false;
+    const match = wsUrl.match(/^ws:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})\/cdp\/([0-9a-f]{64})$/);
+    if (!match) return false;
+    const port = Number.parseInt(match[1], 10);
+    return port <= 65535 && match[2] === transportGeneration &&
+        wsUrl === `ws://127.0.0.1:${port}/cdp/${transportGeneration}`;
+}
+
+export function consumeBrokerAuthorizationFromEnvironment(expectedTransportGeneration, expectedLeaseId) {
+    const authorization = process.env[BROKER_AUTHORIZATION_ENV];
+    delete process.env[BROKER_AUTHORIZATION_ENV];
+    if (typeof expectedTransportGeneration !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(expectedTransportGeneration) ||
+        typeof expectedLeaseId !== 'string' ||
+        !/^[A-Za-z0-9_-]{16,128}$/.test(expectedLeaseId) ||
+        typeof authorization !== 'string' || Buffer.byteLength(authorization, 'utf8') > 512) {
+        throw new Error('BROKER_AUTHORIZATION_REQUIRED: exact one-use broker authorization is unavailable.');
+    }
+    const match = authorization.match(
+        /^Bearer ([0-9a-f]{64})\.([A-Za-z0-9_-]{16,128})\.([A-Za-z0-9_-]{43})$/,
+    );
+    if (!match || match[1] !== expectedTransportGeneration || match[2] !== expectedLeaseId) {
+        throw new Error('BROKER_AUTHORIZATION_REQUIRED: broker authorization does not match the exact target lease.');
+    }
+    return authorization;
+}
 
 export class CDPClient {
     ws = null;
@@ -20,30 +55,73 @@ export class CDPClient {
     _eventHandlers = new Map();  // 'Domain.event' → Set<handler>
     _sessionId = null;
     _connected = false;
+    _resolvedWsUrl = null;
+    _brokerTransport = false;
 
     /**
      * Connect to a Chrome CDP WebSocket endpoint.
      * @param {string} wsUrl - Full WebSocket URL (ws://...) or HTTP endpoint (http://...:9222)
      * @param {object} [opts]
      * @param {number} [opts.timeout=10000] - Connection timeout in ms
+     * @param {string} [opts.brokerTransportGeneration] - Exact existing-profile broker generation
+     * @param {string} [opts.brokerLeaseId] - Exact one-use target lease identifier
      */
     async connect(wsUrl, opts = {}) {
+        const brokerTransport = opts.brokerTransportGeneration !== undefined ||
+            opts.brokerLeaseId !== undefined;
+        let brokerAuthorization = null;
+        if (brokerTransport) {
+            // This capability must disappear before URL parsing, fetch, timers,
+            // WebSocket construction, or any other asynchronous boundary.
+            brokerAuthorization = consumeBrokerAuthorizationFromEnvironment(
+                opts.brokerTransportGeneration,
+                opts.brokerLeaseId,
+            );
+            if (!exactBrokerWsUrl(wsUrl, opts.brokerTransportGeneration)) {
+                throw new Error('BROKER_ENDPOINT_REQUIRED: supported existing-profile transport requires the exact direct loopback WebSocket.');
+            }
+        }
         const timeout = opts.timeout ?? 10000;
 
         // If given an HTTP URL, resolve the WebSocket URL from /json/version
-        if (wsUrl.startsWith('http://') || wsUrl.startsWith('https://')) {
+        if (!brokerTransport && (wsUrl.startsWith('http://') || wsUrl.startsWith('https://'))) {
             wsUrl = await this._resolveWsUrl(wsUrl, timeout);
         }
+        this._resolvedWsUrl = wsUrl;
+        this._brokerTransport = brokerTransport;
 
         return new Promise((resolve, reject) => {
+            let opened = false;
             const timer = setTimeout(() => {
-                reject(new Error(`CDP connection timed out after ${timeout}ms to ${wsUrl}`));
+                reject(new Error(brokerTransport
+                    ? `Broker CDP connection timed out after ${timeout}ms`
+                    : `CDP connection timed out after ${timeout}ms to ${wsUrl}`));
+                try {
+                    if (typeof this.ws?.terminate === 'function') this.ws.terminate();
+                    else this.ws?.close();
+                } catch {
+                    // The rejected connect attempt is already terminal.
+                }
             }, timeout);
 
-            this.ws = new WebSocket(wsUrl, { perMessageDeflate: false });
+            try {
+                this.ws = new WebSocket(wsUrl, {
+                    perMessageDeflate: false,
+                    ...(brokerTransport
+                        ? { headers: { Authorization: brokerAuthorization } }
+                        : {}),
+                });
+            } catch (error) {
+                clearTimeout(timer);
+                reject(brokerTransport
+                    ? new Error('Broker CDP connection failed')
+                    : error);
+                return;
+            }
 
             this.ws.on('open', () => {
                 clearTimeout(timer);
+                opened = true;
                 this._connected = true;
                 resolve();
             });
@@ -53,18 +131,32 @@ export class CDPClient {
             });
 
             this.ws.on('close', () => {
+                const closedBeforeOpen = !opened;
+                clearTimeout(timer);
                 this._connected = false;
                 // Reject all pending callbacks
                 for (const [id, cb] of this._callbacks) {
                     cb.reject(new Error('CDP WebSocket closed'));
                 }
                 this._callbacks.clear();
+                if (closedBeforeOpen) {
+                    reject(new Error(brokerTransport
+                        ? 'Broker CDP connection closed before attachment'
+                        : 'CDP WebSocket closed before connection opened'));
+                }
             });
 
             this.ws.on('error', (err) => {
                 clearTimeout(timer);
                 if (!this._connected) {
-                    reject(new Error(`CDP WebSocket error: ${err.message}`));
+                    reject(new Error(brokerTransport
+                        ? 'Broker CDP connection failed'
+                        : `CDP WebSocket error: ${err.message}`));
+                    try {
+                        this.ws?.terminate?.();
+                    } catch {
+                        // The rejected connect attempt is already terminal.
+                    }
                 }
             });
         });
@@ -105,6 +197,11 @@ export class CDPClient {
      * @returns {Promise<object>} - CDP response result
      */
     send(method, params = {}, sessionId, opts = {}) {
+        if (this._brokerTransport && BROKER_FORBIDDEN_METHODS.has(method)) {
+            const error = new Error('BROKER_COMMAND_FORBIDDEN: command is outside the supported existing-profile target contract.');
+            error.code = 'BROKER_COMMAND_FORBIDDEN';
+            return Promise.reject(error);
+        }
         if (!this._connected || !this.ws) {
             return Promise.reject(new Error(`CDP not connected. Cannot send ${method}`));
         }
@@ -257,6 +354,7 @@ export class CDPClient {
         this._callbacks.clear();
         this._eventHandlers.clear();
         this._sessionId = null;
+        this._brokerTransport = false;
     }
 }
 
@@ -615,12 +713,38 @@ export async function typeChar(client, char, opts = {}) {
 }
 
 /**
- * Get the full accessibility tree from the page.
+ * Get the full accessibility tree, or a selector-scoped subtree when requested.
  * @returns {Promise<Array>} - Array of AX nodes
  */
 export async function getAccessibilityTree(client, opts = {}) {
     const sessionId = opts.sessionId ?? client._sessionId;
 
+    if (opts.selector) {
+        const nodeId = await querySelector(client, opts.selector, { sessionId });
+        if (!nodeId) throw new Error(`Snapshot selector not found: ${opts.selector}`);
+        const [{ node }, { nodes }] = await Promise.all([
+            client.send('DOM.describeNode', { nodeId }, sessionId),
+            // queryAXTree is intentionally avoided: it is known to hang on
+            // reused CDP targets. Filter the proven full-tree response locally.
+            client.send('Accessibility.getFullAXTree', {}, sessionId),
+        ]);
+        const root = nodes.find((candidate) => candidate.backendDOMNodeId === node.backendNodeId);
+        if (!root) throw new Error(`Snapshot selector has no accessibility node: ${opts.selector}`);
+        const byId = new Map(nodes.map((candidate) => [candidate.nodeId, candidate]));
+        const scoped = [];
+        const pending = [root.nodeId];
+        const visited = new Set();
+        while (pending.length > 0) {
+            const axNodeId = pending.shift();
+            if (visited.has(axNodeId)) continue;
+            visited.add(axNodeId);
+            const axNode = byId.get(axNodeId);
+            if (!axNode) continue;
+            scoped.push(axNode);
+            pending.push(...(axNode.childIds ?? []));
+        }
+        return scoped;
+    }
     const { nodes } = await client.send('Accessibility.getFullAXTree', {}, sessionId);
     return nodes;
 }
@@ -632,10 +756,13 @@ export async function getAccessibilityTree(client, opts = {}) {
  *     - childrole "childname"
  *
  * @param {Array} nodes - Raw AX nodes from getAccessibilityTree()
- * @returns {string} - Formatted tree text
+ * @param {{structured?: boolean}} options - Include node-bound line records
+ * @returns {string|{tree: string, lines: Array}} - Formatted tree text/records
  */
-export function formatAccessibilityTree(nodes) {
-    if (!nodes || nodes.length === 0) return '';
+export function formatAccessibilityTree(nodes, options = {}) {
+    if (!nodes || nodes.length === 0) {
+        return options.structured ? { tree: '', lines: [] } : '';
+    }
 
     // Build a lookup map: nodeId → node
     const nodeMap = new Map();
@@ -645,6 +772,13 @@ export function formatAccessibilityTree(nodes) {
 
     const root = nodes[0];
     const lines = [];
+
+    // AX names, text, URLs, and property strings are page-controlled. Preserve
+    // the familiar snapshot format while forcing every value onto one physical
+    // line so it cannot forge roles, refs, diff prefixes, or metadata records.
+    const escapeSnapshotText = (value) => JSON.stringify(String(value)).slice(1, -1)
+        .replaceAll('\u2028', '\\u2028')
+        .replaceAll('\u2029', '\\u2029');
 
     // Skip these roles entirely (internal Chrome rendering details)
     const SKIP_ROLES = new Set(['InlineTextBox', 'LineBreak']);
@@ -733,13 +867,13 @@ export function formatAccessibilityTree(nodes) {
             return;
         }
 
-        const name = node.name?.value ?? '';
+        const name = String(node.name?.value ?? '');
         const indent = '  '.repeat(depth);
 
         // Build attribute list
         const attrs = [];
         const level = getProperty(node, 'level');
-        if (level !== undefined) attrs.push(`level=${level}`);
+        if (level !== undefined) attrs.push(`level=${escapeSnapshotText(level)}`);
 
         const checked = getProperty(node, 'checked');
         if (checked === 'true' || checked === true) attrs.push('checked');
@@ -762,34 +896,49 @@ export function formatAccessibilityTree(nodes) {
         if (readonly_ === true || readonly_ === 'true') attrs.push('readonly');
 
         // Build the line
-        let line = `${indent}- ${role}`;
+        let head = `${indent}- ${role}`;
         if (name) {
-            line += ` "${name}"`;
+            head += ` "${escapeSnapshotText(name)}"`;
         }
+        let suffix = '';
         if (attrs.length > 0) {
-            line += ` [${attrs.join('] [')}]`;
+            suffix += ` [${attrs.join('] [')}]`;
         }
 
         // If children are text-only, inline the text after a colon
         if (!name && isTextOnly(node)) {
             const text = collectText(node).trim();
             if (text) {
-                line += `: ${text}`;
+                suffix += `: ${escapeSnapshotText(text)}`;
             }
         }
         // Standard format appends ':' when node has structural children or sub-entries
         else if ((node.childIds && hasStructuralChildren(node)) ||
                  (role === 'link' && getProperty(node, 'url'))) {
-            line += ':';
+            suffix += ':';
         }
 
-        lines.push(line);
+        lines.push({
+            kind: 'node',
+            text: head + suffix,
+            head,
+            suffix,
+            nodeId: node.nodeId,
+            backendNodeId: Number.isInteger(node.backendDOMNodeId) ? node.backendDOMNodeId : null,
+            role,
+            name,
+            depth,
+        });
 
         // For links, add /url child if available
         if (role === 'link') {
             const url = getProperty(node, 'url');
             if (url) {
-                lines.push(`${indent}  - /url: ${url}`);
+                lines.push({
+                    kind: 'metadata',
+                    text: `${indent}  - /url: ${escapeSnapshotText(url)}`,
+                    depth: depth + 1,
+                });
             }
         }
 
@@ -803,7 +952,8 @@ export function formatAccessibilityTree(nodes) {
     }
 
     walkNode(root, 0);
-    return lines.join('\n');
+    const tree = lines.map((line) => line.text).join('\n');
+    return options.structured ? { tree, lines } : tree;
 }
 
 /**
@@ -940,6 +1090,10 @@ export function handleDialogs(client, opts = {}) {
 export async function createTarget(client, url = 'about:blank', opts = {}) {
     const { targetId } = await client.send('Target.createTarget', {
         url,
+        // WHY: Chrome focuses new CDP targets by default, which stole the
+        // user's desktop even when no human input was required. Task tabs are
+        // background surfaces; explicit foreground handoff is a separate act.
+        background: opts.background ?? true,
         ...(opts.browserContextId && { browserContextId: opts.browserContextId }),
     });
     return targetId;

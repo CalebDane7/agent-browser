@@ -306,4 +306,3 @@ export class StreamServer {
         return this.clients.size;
     }
 }
-//# sourceMappingURL=stream-server.js.map

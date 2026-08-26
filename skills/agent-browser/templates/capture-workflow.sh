@@ -1,69 +1,32 @@
-#!/bin/bash
-# Template: Content Capture Workflow
-# Purpose: Extract content from web pages (text, screenshots, PDF)
-# Usage: ./capture-workflow.sh <url> [output-dir]
-#
-# Outputs:
-#   - page-full.png: Full page screenshot
-#   - page-structure.txt: Page element structure with refs
-#   - page-text.txt: All text content
-#   - page.pdf: PDF version
-#
-# Optional: Load auth state for protected pages
+#!/usr/bin/env bash
+# Token-bounded rendered capture in the real Chrome profile.
+# Usage: capture-workflow.sh URL [output-dir] [selector]
 
 set -euo pipefail
 
-TARGET_URL="${1:?Usage: $0 <url> [output-dir]}"
-OUTPUT_DIR="${2:-.}"
+target_url="${1:?Usage: capture-workflow.sh URL [output-dir] [selector]}"
+output_dir="${2:-.}"
+selector="${3:-}"
+IFS= read -r task_uuid </proc/sys/kernel/random/uuid
+task_session="capture-${task_uuid//-/}"
+browser_bin="${BASH_SOURCE[0]%/*}/../../../scripts/agent-browser-real-chrome"
 
-echo "Capturing: $TARGET_URL"
-mkdir -p "$OUTPUT_DIR"
+/usr/bin/mkdir -p "$output_dir"
+created_session=0
+cleanup() {
+  if [[ "$created_session" == 1 ]]; then
+    "$browser_bin" --session "$task_session" close >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
 
-# Optional: Load authentication state
-# if [[ -f "./auth-state.json" ]]; then
-#     echo "Loading authentication state..."
-#     agent-browser state load "./auth-state.json"
-# fi
+"$browser_bin" --session "$task_session" open "$target_url"
+created_session=1
+"$browser_bin" --session "$task_session" snapshot -i --compact >"$output_dir/page-structure.txt"
+"$browser_bin" --session "$task_session" screenshot --full "$output_dir/page-full.png"
 
-# Navigate to target
-agent-browser open "$TARGET_URL"
-agent-browser wait --load networkidle
+if [[ -n "$selector" ]]; then
+  "$browser_bin" --session "$task_session" get text "$selector" >"$output_dir/selected-text.txt"
+fi
 
-# Get metadata
-TITLE=$(agent-browser get title)
-URL=$(agent-browser get url)
-echo "Title: $TITLE"
-echo "URL: $URL"
-
-# Capture full page screenshot
-agent-browser screenshot --full "$OUTPUT_DIR/page-full.png"
-echo "Saved: $OUTPUT_DIR/page-full.png"
-
-# Get page structure with refs
-agent-browser snapshot -i > "$OUTPUT_DIR/page-structure.txt"
-echo "Saved: $OUTPUT_DIR/page-structure.txt"
-
-# Extract all text content
-agent-browser get text body > "$OUTPUT_DIR/page-text.txt"
-echo "Saved: $OUTPUT_DIR/page-text.txt"
-
-# Save as PDF
-agent-browser pdf "$OUTPUT_DIR/page.pdf"
-echo "Saved: $OUTPUT_DIR/page.pdf"
-
-# Optional: Extract specific elements using refs from structure
-# agent-browser get text @e5 > "$OUTPUT_DIR/main-content.txt"
-
-# Optional: Handle infinite scroll pages
-# for i in {1..5}; do
-#     agent-browser scroll down 1000
-#     agent-browser wait 1000
-# done
-# agent-browser screenshot --full "$OUTPUT_DIR/page-scrolled.png"
-
-# Cleanup
-agent-browser close
-
-echo ""
-echo "Capture complete:"
-ls -la "$OUTPUT_DIR"
+printf 'Saved rendered capture in %s\n' "$output_dir"

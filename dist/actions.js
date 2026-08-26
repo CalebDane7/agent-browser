@@ -3,12 +3,573 @@ import * as path from 'path';
 import { mkdirSync } from 'node:fs';
 import { getAppDir } from './daemon.js';
 import { getSessionsDir, readStateFile, isValidSessionName, isEncryptedPayload, listStateFiles, cleanupExpiredStates, } from './state-utils.js';
-import { successResponse, errorResponse } from './protocol.js';
-import { diffSnapshots, diffScreenshots } from './diff.js';
-import { getEnhancedSnapshot } from './snapshot.js';
+import { successResponse, errorResponse, finalizeResponse } from './protocol.js';
+import { diffSnapshots, diffScreenshots, getSnapshotDiffCurrentLineIndexes } from './diff.js';
 import { execSync } from 'child_process';
 // Max screenshot dimension to stay within Claude's 2000px multi-image limit
 const SCREENSHOT_MAX_DIM = 1568;
+const DEFAULT_MAX_OUTPUT_BYTES = 50000;
+const MAX_CONFIGURED_OUTPUT_BYTES = 100000000;
+// Output limiting is adapted and materially changed from vercel-labs/agent-browser
+// 021d9255:cli/src/output.rs (Apache-2.0); this version bounds complete JSON bytes.
+const snapshotBaselines = new WeakMap();
+
+function responseBytes(response) {
+    return Buffer.byteLength(JSON.stringify(response), 'utf8');
+}
+
+function fullOutputRequested(command) {
+    return command.fullOutput === true || process.env.AGENT_BROWSER_FULL_OUTPUT === '1';
+}
+
+function outputLimit(command) {
+    if (fullOutputRequested(command)) {
+        return null;
+    }
+    if (command.maxOutput !== undefined) {
+        return Number.isSafeInteger(command.maxOutput) &&
+            command.maxOutput >= 512 &&
+            command.maxOutput <= MAX_CONFIGURED_OUTPUT_BYTES
+            ? command.maxOutput
+            : DEFAULT_MAX_OUTPUT_BYTES;
+    }
+    const rawEnvLimit = process.env.AGENT_BROWSER_MAX_OUTPUT ?? '';
+    if (!/^[0-9]+$/.test(rawEnvLimit)) {
+        return DEFAULT_MAX_OUTPUT_BYTES;
+    }
+    const envLimit = Number(rawEnvLimit);
+    return Number.isSafeInteger(envLimit) &&
+        envLimit >= 512 &&
+        envLimit <= MAX_CONFIGURED_OUTPUT_BYTES
+        ? envLimit
+        : DEFAULT_MAX_OUTPUT_BYTES;
+}
+
+function jsonEscapedUnit(text, index) {
+    const code = text.charCodeAt(index);
+    if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09 ||
+        code === 0x0a || code === 0x0c || code === 0x0d) {
+        return { bytes: 2, units: 1 };
+    }
+    if (code < 0x20) {
+        return { bytes: 6, units: 1 };
+    }
+    if (code >= 0xd800 && code <= 0xdbff) {
+        const next = text.charCodeAt(index + 1);
+        return next >= 0xdc00 && next <= 0xdfff
+            ? { bytes: 4, units: 2 }
+            : { bytes: 6, units: 1 };
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) {
+        return { bytes: 6, units: 1 };
+    }
+    return { bytes: code <= 0x7f ? 1 : code <= 0x7ff ? 2 : 3, units: 1 };
+}
+
+function countTextLines(text) {
+    let count = 1;
+    let offset = -1;
+    while ((offset = text.indexOf('\n', offset + 1)) !== -1) {
+        count++;
+    }
+    return count;
+}
+
+function textPrefixForJsonBudget(text, maxBytes) {
+    let bytes = 0;
+    let index = 0;
+    while (index < text.length) {
+        const unit = jsonEscapedUnit(text, index);
+        if (bytes + unit.bytes > maxBytes)
+            break;
+        bytes += unit.bytes;
+        index += unit.units;
+    }
+    return { prefix: text.slice(0, index), keepUnits: index };
+}
+
+function linePrefixForJsonBudget(text, maxBytes) {
+    let bytes = 0;
+    let index = 0;
+    let lastEnd = 0;
+    let keepUnits = 0;
+    while (index < text.length) {
+        if (text.charCodeAt(index) === 0x0a) {
+            lastEnd = index;
+            keepUnits++;
+            if (bytes + 2 > maxBytes)
+                break;
+            bytes += 2;
+            index++;
+            continue;
+        }
+        const unit = jsonEscapedUnit(text, index);
+        if (bytes + unit.bytes > maxBytes)
+            break;
+        bytes += unit.bytes;
+        index += unit.units;
+    }
+    if (index === text.length && bytes <= maxBytes) {
+        lastEnd = text.length;
+        keepUnits++;
+    }
+    return { prefix: text.slice(0, lastEnd), keepUnits };
+}
+
+function boundedTextResponse(command, data, field, options = {}) {
+    const fullResponse = options.originalResponse ?? successResponse(command.id, data);
+    const limitBytes = outputLimit(command);
+    // Explicit full output is the fast path: transport will serialize it once.
+    if (limitBytes === null) {
+        return fullResponse;
+    }
+    const fullBytes = options.originalBytes ?? responseBytes(fullResponse);
+    if (!options.forceTruncate && fullBytes <= limitBytes) {
+        return fullResponse;
+    }
+    const source = String(data[field] ?? '');
+    const totalUnits = options.lineSafe ? countTextLines(source) : source.length;
+    const unit = options.lineSafe ? 'lines' : 'UTF-16 code units';
+    const makeResponse = (prefix, keepUnits) => {
+        const omittedUnits = Math.max(0, totalUnits - keepUnits);
+        const marker = `[truncated: showing ${keepUnits} of ${totalUnits} ${unit}; use protocol fullOutput=true/maxOutput or daemon-start AGENT_BROWSER_FULL_OUTPUT=1]`;
+        const value = prefix ? `${prefix}\n${marker}` : marker;
+        let nextData = {
+            ...data,
+            [field]: value,
+            truncated: true,
+            outputLimit: {
+                field,
+                limitBytes,
+                originalBytes: fullBytes,
+                omittedUnits,
+                unit,
+                ...(options.extraMeta ?? {}),
+            },
+        };
+        if (options.projectData) {
+            nextData = options.projectData(nextData, value, { keepUnits, totalUnits, unit });
+        }
+        return successResponse(command.id, nextData);
+    };
+    const zero = makeResponse('', 0);
+    const zeroBytes = responseBytes(zero);
+    let contentBudget = Math.max(0, limitBytes - zeroBytes - 24);
+    for (let attempt = 0; attempt < 4; attempt++) {
+        const fitted = options.lineSafe
+            ? linePrefixForJsonBudget(source, contentBudget)
+            : textPrefixForJsonBudget(source, contentBudget);
+        const candidate = makeResponse(fitted.prefix, fitted.keepUnits);
+        const candidateBytes = responseBytes(candidate);
+        if (candidateBytes <= limitBytes) {
+            return candidate;
+        }
+        contentBudget = Math.max(0, contentBudget - (candidateBytes - limitBytes) - 16);
+    }
+    if (zeroBytes <= limitBytes) {
+        return zero;
+    }
+    let minimalData = {
+        ...(options.requiredData ?? {}),
+        truncated: true,
+        outputLimit: { field, limitBytes, originalBytes: fullBytes },
+        [field]: '[truncated: output limit too small for a preview]',
+    };
+    if (options.projectData) {
+        minimalData = options.projectData(minimalData, minimalData[field], { keepUnits: 0, totalUnits, unit });
+    }
+    return successResponse(command.id, minimalData);
+}
+
+function boundedJsonResponse(command, data, field) {
+    const fullResponse = successResponse(command.id, data);
+    const limitBytes = outputLimit(command);
+    if (limitBytes === null) {
+        return fullResponse;
+    }
+    const fullBytes = responseBytes(fullResponse);
+    if (fullBytes <= limitBytes) {
+        return fullResponse;
+    }
+    let preview;
+    try {
+        preview = typeof data[field] === 'string' ? data[field] : JSON.stringify(data[field]);
+    }
+    catch {
+        preview = String(data[field]);
+    }
+    const originalValue = data[field];
+    const originalType = Array.isArray(originalValue) ? 'array' : originalValue === null ? 'null' : typeof originalValue;
+    return boundedTextResponse(command, { ...data, [field]: preview }, field, {
+        originalResponse: fullResponse,
+        originalBytes: fullBytes,
+        forceTruncate: true,
+        extraMeta: { originalType },
+    });
+}
+
+function boundedArrayResponse(command, data, field, markerItem) {
+    const fullResponse = successResponse(command.id, data);
+    const limitBytes = outputLimit(command);
+    if (limitBytes === null) {
+        return fullResponse;
+    }
+    const fullBytes = responseBytes(fullResponse);
+    if (fullBytes <= limitBytes) {
+        return fullResponse;
+    }
+    const items = Array.isArray(data[field]) ? data[field] : [];
+    const makeResponse = (keepItems) => {
+        const marker = `[truncated: showing ${keepItems} of ${items.length} items; use protocol fullOutput=true/maxOutput or daemon-start AGENT_BROWSER_FULL_OUTPUT=1]`;
+        return successResponse(command.id, {
+            ...data,
+            [field]: [...items.slice(0, keepItems), markerItem(marker)],
+            truncated: true,
+            outputLimit: {
+                field,
+                limitBytes,
+                originalBytes: fullBytes,
+                omittedUnits: items.length - keepItems,
+                unit: 'items',
+            },
+        });
+    };
+    let low = 0;
+    let high = items.length;
+    let best = makeResponse(0);
+    while (low <= high) {
+        const middle = Math.floor((low + high) / 2);
+        const candidate = makeResponse(middle);
+        if (responseBytes(candidate) <= limitBytes) {
+            best = candidate;
+            low = middle + 1;
+        }
+        else {
+            high = middle - 1;
+        }
+    }
+    if (responseBytes(best) > limitBytes) {
+        return successResponse(command.id, {
+            truncated: true,
+            outputLimit: { field, limitBytes, originalBytes: fullBytes },
+            [field]: [markerItem('[truncated: output limit too small for an item preview]')],
+        });
+    }
+    return best;
+}
+
+function pageSurfaceIdentity(browser) {
+    const page = browser.getPage();
+    let url = null;
+    try {
+        url = typeof page?.url === 'function' ? page.url() : page?._url ?? null;
+    }
+    catch { }
+    return {
+        targetId: page?._targetId ?? null,
+        sessionId: page?._sessionId ?? null,
+        url,
+    };
+}
+
+function snapshotSurfaceSignature(browser, options, scope) {
+    const stableBackendNodeId = scope?.backendNodeId ?? null;
+    return JSON.stringify({
+        ...pageSurfaceIdentity(browser),
+        selector: options.selector ?? null,
+        // Frontend nodeIds can be re-issued when the same backend node is pushed
+        // into a fresh document view. Prefer the stable backend capability and
+        // use nodeId only when CDP did not provide one.
+        scopeNodeId: stableBackendNodeId === null
+            ? scope?.nodeId ?? options.scopeNodeId ?? null
+            : null,
+        scopeBackendNodeId: stableBackendNodeId,
+        documentBackendNodeId: scope?.documentBackendNodeId ?? null,
+        interactive: options.interactive === true,
+        cursor: options.cursor === true,
+        compact: options.compact === true,
+        maxDepth: options.maxDepth ?? null,
+    });
+}
+
+function snapshotScopeCapability(command, browser, snapshot) {
+    if (!command.selector || !snapshot.scope) {
+        return null;
+    }
+    return {
+        selector: command.selector,
+        ...pageSurfaceIdentity(browser),
+        nodeId: snapshot.scope.nodeId ?? null,
+        backendNodeId: snapshot.scope.backendNodeId ?? null,
+        documentBackendNodeId: snapshot.scope.documentBackendNodeId ?? null,
+    };
+}
+
+async function restoreBaselineScope(command, browser, prior) {
+    const capability = prior?.scopeCapability;
+    if (!capability || capability.selector !== command.selector) {
+        return null;
+    }
+    const current = pageSurfaceIdentity(browser);
+    if (capability.targetId !== current.targetId ||
+        capability.sessionId !== current.sessionId ||
+        capability.url !== current.url) {
+        throw new Error(`Snapshot scope is stale: ${command.selector}`);
+    }
+    if (!Number.isInteger(capability.backendNodeId)) {
+        throw new Error(`Snapshot scope cannot be safely restored: ${command.selector}`);
+    }
+    if (!Number.isInteger(capability.documentBackendNodeId)) {
+        throw new Error(`Snapshot scope cannot be safely restored: ${command.selector}`);
+    }
+    const page = browser.getPage();
+    const client = page?._client;
+    const sessionId = page?._sessionId;
+    if (!client || typeof client.send !== 'function') {
+        throw new Error(`Snapshot scope cannot be safely restored: ${command.selector}`);
+    }
+    const { root } = await client.send('DOM.getDocument', { depth: 0 }, sessionId);
+    if (!Number.isInteger(root?.backendNodeId) ||
+        capability.documentBackendNodeId !== root.backendNodeId) {
+        throw new Error(`Snapshot scope is stale: ${command.selector}`);
+    }
+    const { nodeIds } = await client.send('DOM.pushNodesByBackendIdsToFrontend', {
+        backendNodeIds: [capability.backendNodeId],
+    }, sessionId);
+    if (!nodeIds || !Number.isInteger(nodeIds[0]) || nodeIds[0] <= 0) {
+        throw new Error(`Snapshot scope is stale: ${command.selector}`);
+    }
+    return nodeIds[0];
+}
+
+async function snapshotOptionsForCommand(command, browser, prior = null) {
+    const options = {
+        interactive: command.interactive,
+        cursor: command.cursor,
+        maxDepth: command.maxDepth,
+        compact: command.compact,
+        selector: command.selector,
+    };
+    if (command.selector && typeof browser.isRef === 'function' && browser.isRef(command.selector)) {
+        const restoredNodeId = await restoreBaselineScope(command, browser, prior);
+        if (restoredNodeId !== null) {
+            options.scopeNodeId = restoredNodeId;
+            return options;
+        }
+        const locator = browser.getLocatorFromRef(command.selector);
+        if (!locator || typeof locator._resolve !== 'function') {
+            throw new Error(`Snapshot ref not found: ${command.selector}`);
+        }
+        // The raw-CDP locator already owns role/name/nth resolution. Reusing its
+        // nodeId keeps @ref scoping exact without translating it to a wider CSS query.
+        options.scopeNodeId = await locator._resolve();
+    }
+    return options;
+}
+
+function boundedSnapshotResponse(command, tree, simpleRefs, refLineIndexes) {
+    const refsByLine = Object.entries(simpleRefs)
+        .map(([ref, data]) => ({ ref, data, line: refLineIndexes?.[ref] }))
+        .filter((entry) => Number.isInteger(entry.line) && entry.line >= 0)
+        .sort((a, b) => a.line - b.line);
+    const refsBeforeLine = (lineCount) => {
+        let low = 0;
+        let high = refsByLine.length;
+        while (low < high) {
+            const middle = Math.floor((low + high) / 2);
+            if (refsByLine[middle].line < lineCount)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+        return Object.fromEntries(refsByLine.slice(0, low).map(({ ref, data }) => [ref, data]));
+    };
+    const data = {
+        snapshot: tree || 'Empty page',
+        refs: Object.keys(simpleRefs).length > 0 ? simpleRefs : undefined,
+    };
+    return boundedTextResponse(command, data, 'snapshot', {
+        lineSafe: true,
+        projectData(nextData, _visibleText, projection) {
+            const refs = refsBeforeLine(projection.keepUnits);
+            const projected = { ...nextData };
+            if (Object.keys(refs).length > 0) {
+                projected.refs = refs;
+            }
+            else {
+                delete projected.refs;
+            }
+            return projected;
+        },
+    });
+}
+
+function compactDiffInvariant(result) {
+    return {
+        diff: result.diff,
+        additions: result.additions,
+        removals: result.removals,
+        unchanged: result.unchanged,
+        changed: result.changed,
+        ...(result.compacted === true ? {
+            compacted: true,
+            ...(Number.isInteger(result.omittedUnchanged)
+                ? { omittedUnchanged: result.omittedUnchanged }
+                : {}),
+        } : {}),
+        ...(result.computationLimited === true ? {
+            computationLimited: true,
+            diffAlgorithm: result.diffAlgorithm,
+            computationLimit: {
+                reason: result.computationLimit?.reason,
+                stats: result.computationLimit?.stats,
+            },
+        } : {}),
+    };
+}
+
+function boundedSnapshotDiffResponse(command, result) {
+    const fullResponse = successResponse(command.id, result);
+    if (outputLimit(command) === null) {
+        return fullResponse;
+    }
+    const fullBytes = responseBytes(fullResponse);
+    if (fullBytes <= outputLimit(command)) {
+        return fullResponse;
+    }
+    const compact = compactDiffInvariant(result);
+    const { diff: _diff, ...requiredData } = compact;
+    return boundedTextResponse(command, compact, 'diff', {
+        originalResponse: fullResponse,
+        originalBytes: fullBytes,
+        forceTruncate: true,
+        lineSafe: true,
+        requiredData,
+    });
+}
+
+function boundedNestedSnapshotDiffResponse(command, data) {
+    const fullResponse = successResponse(command.id, data);
+    if (outputLimit(command) === null) {
+        return fullResponse;
+    }
+    const fullBytes = responseBytes(fullResponse);
+    if (fullBytes <= outputLimit(command)) {
+        return fullResponse;
+    }
+    const compactSnapshot = compactDiffInvariant(data.snapshot);
+    const requiredData = {
+        snapshot: { ...compactSnapshot, diff: '' },
+        ...(data.screenshot ? { screenshot: data.screenshot } : {}),
+    };
+    return boundedTextResponse(command, {
+        ...data,
+        snapshot: { ...compactSnapshot, diff: '' },
+        snapshotDiffPreview: data.snapshot.diff,
+    }, 'snapshotDiffPreview', {
+        originalResponse: fullResponse,
+        originalBytes: fullBytes,
+        lineSafe: true,
+        forceTruncate: true,
+        requiredData,
+        projectData(nextData, visibleText) {
+            const { snapshotDiffPreview, ...projected } = nextData;
+            return {
+                ...projected,
+                snapshot: { ...projected.snapshot, diff: visibleText },
+            };
+        },
+    });
+}
+
+function mutableBrowserRefMap(browser, refs) {
+    if (refs && typeof refs === 'object')
+        return refs;
+    if (typeof browser.getRefMap === 'function')
+        return browser.getRefMap();
+    return browser.refMap && typeof browser.refMap === 'object' ? browser.refMap : null;
+}
+
+function retainBrowserRefs(browser, refs, retained) {
+    const liveRefs = mutableBrowserRefMap(browser, refs);
+    if (!liveRefs)
+        return;
+    for (const ref of Object.keys(liveRefs)) {
+        if (!retained.has(ref)) {
+            delete liveRefs[ref];
+        }
+    }
+}
+
+function clearBrowserRefs(browser, refs) {
+    retainBrowserRefs(browser, refs, new Set());
+}
+
+function projectDiffRefs(browser, snapshot, diffResult, response) {
+    const projection = getSnapshotDiffCurrentLineIndexes(diffResult);
+    if (!Array.isArray(projection) || !snapshot?.refLineIndexes) {
+        clearBrowserRefs(browser, snapshot?.refs);
+        return;
+    }
+    let keptDiffLines = projection.length;
+    if (response.data?.truncated) {
+        const limit = response.data.outputLimit;
+        keptDiffLines = limit?.unit === 'lines' && Number.isInteger(limit.omittedUnits)
+            ? Math.max(0, projection.length - limit.omittedUnits)
+            : 0;
+    }
+    const currentLines = new Set(projection.slice(0, keptDiffLines)
+        .filter((line) => Number.isInteger(line) && line >= 0));
+    const retained = new Set(Object.entries(snapshot.refLineIndexes)
+        .filter(([, line]) => currentLines.has(line))
+        .map(([ref]) => ref));
+    retainBrowserRefs(browser, snapshot.refs, retained);
+}
+export const DAEMON_CAPABILITIES = Object.freeze(['click-expect-popup-v1']);
+const ACTION_ERROR_LIMIT_BYTES = 400;
+
+function truncateUtf8(value, maxBytes) {
+    if (Buffer.byteLength(value, 'utf8') <= maxBytes)
+        return value;
+    const ellipsis = '…';
+    const budget = maxBytes - Buffer.byteLength(ellipsis, 'utf8');
+    let result = '';
+    let bytes = 0;
+    for (const char of value) {
+        const charBytes = Buffer.byteLength(char, 'utf8');
+        if (bytes + charBytes > budget)
+            break;
+        result += char;
+        bytes += charBytes;
+    }
+    return `${result}${ellipsis}`;
+}
+
+export function renderActionError(error) {
+    let message;
+    try {
+        message = error instanceof Error ? error.message : String(error);
+    }
+    catch {
+        message = 'Operation failed';
+    }
+    // Buffer's UTF-8 round trip replaces lone UTF-16 surrogates before any
+    // diagnostic reaches JSON serialization or byte-bound truncation.
+    message = Buffer.from(String(message), 'utf8').toString('utf8')
+        .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+        .replace(/https?:\/\/[^\s"'<>]+/gi, '[url]')
+        .replace(/(?:[A-Za-z]:\\|\/(?:home|run|tmp|mnt|Users)\/)[^\s"'<>]+/g, '[path]')
+        .replace(/(["']?)(access[_-]?token|token|password|passwd|secret|authorization|cookie|api[_-]?key)\1\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:Bearer\s+)?[^\s,;}\]]+)/gi,
+            (_match, quote, key) => `${quote}${key}${quote}=[redacted]`)
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!message)
+        message = 'Operation failed';
+    return truncateUtf8(message, ACTION_ERROR_LIMIT_BYTES);
+}
+function renderSelector(selector) {
+    return truncateUtf8(renderActionError(String(selector ?? '')), 120);
+}
 function resizeScreenshotIfNeeded(filePath) {
     const data = fs.readFileSync(filePath);
     let width, height;
@@ -51,45 +612,86 @@ export function setScreencastFrameCallback(callback) {
  * @internal Exported for testing
  */
 export function toAIFriendlyError(error, selector) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = renderActionError(error);
+    const safeSelector = renderSelector(selector);
     // Handle strict mode violation (multiple elements match)
     if (message.includes('strict mode violation')) {
         // Extract count if available
         const countMatch = message.match(/resolved to (\d+) elements/);
         const count = countMatch ? countMatch[1] : 'multiple';
-        return new Error(`Selector "${selector}" matched ${count} elements. ` +
+        return new Error(`Selector "${safeSelector}" matched ${count} elements. ` +
             `Run 'snapshot' to get updated refs, or use a more specific CSS selector.`);
     }
     // Handle element not interactable (must be checked BEFORE timeout case)
     // This includes cases where an overlay/modal blocks the element
     if (message.includes('intercepts pointer events')) {
-        return new Error(`Element "${selector}" is blocked by another element (likely a modal or overlay). ` +
+        return new Error(`Element "${safeSelector}" is blocked by another element (likely a modal or overlay). ` +
             `Try dismissing any modals/cookie banners first.`);
     }
     // Handle element not visible
     if (message.includes('not visible') && !message.includes('Timeout')) {
-        return new Error(`Element "${selector}" is not visible. ` +
+        return new Error(`Element "${safeSelector}" is not visible. ` +
             `Try scrolling it into view or check if it's hidden.`);
     }
     // Handle general timeout (element exists but action couldn't complete)
     if (message.includes('Timeout') && message.includes('exceeded')) {
-        return new Error(`Action on "${selector}" timed out. The element may be blocked, still loading, or not interactable. ` +
+        return new Error(`Action on "${safeSelector}" timed out. The element may be blocked, still loading, or not interactable. ` +
             `Run 'snapshot' to check the current page state.`);
     }
     // Handle element not found (timeout waiting for element)
     if (message.includes('waiting for') &&
         (message.includes('to be visible') || message.includes('Timeout'))) {
-        return new Error(`Element "${selector}" not found or not visible. ` +
+        return new Error(`Element "${safeSelector}" not found or not visible. ` +
             `Run 'snapshot' to see current page elements.`);
     }
     // Return original error for unknown cases
-    return error instanceof Error ? error : new Error(message);
+    return new Error(message);
 }
 /**
  * Execute a command and return a response
  */
 export async function executeCommand(command, browser) {
+    const response = await executeCommandUnchecked(command, browser);
+    const publishesSnapshotRefs = command.action === 'snapshot' ||
+        command.action === 'diff_snapshot' ||
+        command.action === 'diff_url';
+    if ((!response.success && publishesSnapshotRefs) || command.action === 'diff_screenshot') {
+        clearBrowserRefs(browser);
+    }
+    const finalized = finalizeResponse(response, command);
+    if (finalized !== response && publishesSnapshotRefs) {
+        // The central envelope no longer exposes the structurally projected
+        // snapshot lines, so no ref from the hidden handler response is valid.
+        clearBrowserRefs(browser);
+    }
+    return finalized;
+}
+
+async function executeCommandUnchecked(command, browser) {
     try {
+        // diff_url navigates before each snapshot, so a ref capability owned by
+        // the current document cannot safely identify either post-navigation
+        // scope. Reject it before navigation instead of treating it as raw CSS.
+        if (command.action === 'diff_url' &&
+            typeof command.selector === 'string' &&
+            typeof browser.isRef === 'function' &&
+            browser.isRef(command.selector)) {
+            throw new Error(`Snapshot ref cannot scope diff_url across navigation: ${command.selector}`);
+        }
+        // eN/@eN/ref=eN are reserved snapshot capabilities. If projection or
+        // reset revoked one, no selector-taking action may reinterpret its text
+        // as page-controlled CSS. Scoped snapshot retry is the sole exception:
+        // it can restore the structurally stored backend-node capability.
+        if (command.action !== 'snapshot' &&
+            command.action !== 'diff_snapshot' &&
+            typeof command.selector === 'string' &&
+            typeof browser.isRef === 'function' &&
+            browser.isRef(command.selector) &&
+            typeof browser.getLocatorFromRef === 'function' &&
+            !browser.getLocatorFromRef(command.selector)) {
+            throw new Error(`Snapshot ref not found: ${command.selector}`);
+        }
+        browser?.assertCommandAllowed?.(command.action);
         switch (command.action) {
             case 'launch':
                 return await handleLaunch(command, browser);
@@ -377,13 +979,15 @@ export async function executeCommand(command, browser) {
         }
     }
     catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return errorResponse(command.id, message);
+        return errorResponse(command.id, renderActionError(error));
     }
 }
 async function handleLaunch(command, browser) {
     await browser.launch(command);
-    return successResponse(command.id, { launched: true });
+    return successResponse(command.id, {
+        launched: true,
+        capabilities: DAEMON_CAPABILITIES,
+    });
 }
 async function handleNavigate(command, browser) {
     const page = browser.getPage();
@@ -402,6 +1006,7 @@ async function handleNavigate(command, browser) {
 async function handleClick(command, browser) {
     // Support both refs (@e1) and regular selectors
     const locator = browser.getLocator(command.selector);
+    let popupGuard = null;
     try {
         // If --new-tab flag is set, get the href and open in a new tab
         if (command.newTab) {
@@ -424,22 +1029,33 @@ async function handleClick(command, browser) {
                 url: fullUrl,
             });
         }
+        if (command.expectPopup === true && typeof browser.armPopupTracking !== 'function') {
+            throw new Error('Explicit popup tracking is unavailable; daemon capability click-expect-popup-v1 is required.');
+        }
+        if ((command.expectPopup === true || command.button === 'middle') &&
+            typeof browser.armPopupTracking === 'function') {
+            popupGuard = await browser.armPopupTracking(locator, {
+                force: true,
+                timeoutMs: 350,
+            });
+        }
+        if (command.expectPopup === true && !popupGuard) {
+            throw new Error('Explicit popup tracking could not be armed; refusing an unguarded popup click.');
+        }
         await locator.click({
             button: command.button,
             clickCount: command.clickCount,
             delay: command.delay,
         });
-        if (typeof browser.settleExternalTargetTracking === 'function') {
-            await browser.settleExternalTargetTracking(300);
-        }
-        if (typeof browser.syncExternalTargets === 'function') {
-            await browser.syncExternalTargets({ activateNew: true, waitMs: 225 });
-        }
+        if (popupGuard) await popupGuard.wait();
     }
     catch (error) {
+        popupGuard?.cancel();
         throw toAIFriendlyError(error, command.selector);
     }
-    return successResponse(command.id, { clicked: true });
+    return command.expectPopup === true
+        ? successResponse(command.id, { clicked: true, popupTracking: 'event-armed-v1' })
+        : successResponse(command.id, { clicked: true });
 }
 async function handleType(command, browser) {
     const locator = browser.getLocator(command.selector);
@@ -651,28 +1267,32 @@ async function handleScreenshot(command, browser) {
 }
 async function handleSnapshot(command, browser) {
     // Use enhanced snapshot with refs and optional filtering
-    const { tree, refs } = await browser.getSnapshot({
-        interactive: command.interactive,
-        cursor: command.cursor,
-        maxDepth: command.maxDepth,
-        compact: command.compact,
-        selector: command.selector,
+    const prior = snapshotBaselines.get(browser);
+    const options = await snapshotOptionsForCommand(command, browser, prior);
+    const snapshot = await browser.getSnapshot(options);
+    const { tree, refs, refLineIndexes } = snapshot;
+    snapshotBaselines.set(browser, {
+        tree: tree || 'Empty page',
+        signature: snapshotSurfaceSignature(browser, options, snapshot.scope),
+        scopeCapability: snapshotScopeCapability(command, browser, snapshot),
     });
     // Simplify refs for output (just role and name)
     const simpleRefs = {};
     for (const [ref, data] of Object.entries(refs)) {
         simpleRefs[ref] = { role: data.role, name: data.name };
     }
-    return successResponse(command.id, {
-        snapshot: tree || 'Empty page',
-        refs: Object.keys(simpleRefs).length > 0 ? simpleRefs : undefined,
-    });
+    const response = boundedSnapshotResponse(command, tree, simpleRefs, refLineIndexes);
+    if (response.data?.truncated) {
+        const retained = new Set(Object.keys(response.data.refs ?? {}));
+        retainBrowserRefs(browser, refs, retained);
+    }
+    return response;
 }
 async function handleEvaluate(command, browser) {
     const page = browser.getPage();
     // Evaluate the script directly as a string expression
     const result = await page.evaluate(command.script);
-    return successResponse(command.id, { result });
+    return boundedJsonResponse(command, { result }, 'result');
 }
 async function handleWait(command, browser) {
     const page = browser.getPage();
@@ -757,7 +1377,7 @@ async function handleContent(command, browser) {
     else {
         html = await page.content();
     }
-    return successResponse(command.id, { html });
+    return boundedTextResponse(command, { html }, 'html');
 }
 async function handleClose(command, browser) {
     await browser.close();
@@ -1023,7 +1643,12 @@ async function handleRequests(command, browser) {
     // Start tracking if not already
     browser.startRequestTracking();
     const requests = browser.getRequests(command.filter);
-    return successResponse(command.id, { requests });
+    return boundedArrayResponse(command, { requests }, 'requests', (marker) => ({
+        requestId: 'truncated',
+        method: '…',
+        url: marker,
+        resourceType: 'metadata',
+    }));
 }
 async function handleDownload(command, browser) {
     const page = browser.getPage();
@@ -1125,7 +1750,7 @@ async function handleGetAttribute(command, browser) {
 async function handleGetText(command, browser) {
     const locator = browser.getLocator(command.selector);
     const text = await locator.textContent();
-    return successResponse(command.id, { text });
+    return boundedTextResponse(command, { text }, 'text');
 }
 async function handleIsVisible(command, browser) {
     const locator = browser.getLocator(command.selector);
@@ -1406,7 +2031,7 @@ async function handleConsole(command, browser) {
         return successResponse(command.id, { cleared: true });
     }
     const messages = browser.getConsoleMessages();
-    return successResponse(command.id, { messages });
+    return boundedArrayResponse(command, { messages }, 'messages', (marker) => ({ type: 'warning', text: marker }));
 }
 async function handleErrors(command, browser) {
     if (command.clear) {
@@ -1414,7 +2039,7 @@ async function handleErrors(command, browser) {
         return successResponse(command.id, { cleared: true });
     }
     const errors = browser.getPageErrors();
-    return successResponse(command.id, { errors });
+    return boundedArrayResponse(command, { errors }, 'errors', (marker) => ({ message: marker }));
 }
 async function handleKeyboard(command, browser) {
     const page = browser.getPage();
@@ -1446,7 +2071,7 @@ async function handleClipboard(command, browser) {
             return successResponse(command.id, { pasted: true });
         case 'read':
             const text = await page.evaluate('navigator.clipboard.readText()');
-            return successResponse(command.id, { text });
+            return boundedTextResponse(command, { text }, 'text');
         default:
             return errorResponse(command.id, 'Unknown clipboard operation');
     }
@@ -1469,12 +2094,12 @@ async function handleSelectAll(command, browser) {
 async function handleInnerText(command, browser) {
     const page = browser.getPage();
     const text = await page.locator(command.selector).innerText();
-    return successResponse(command.id, { text });
+    return boundedTextResponse(command, { text }, 'text');
 }
 async function handleInnerHtml(command, browser) {
     const page = browser.getPage();
     const html = await page.locator(command.selector).innerHTML();
-    return successResponse(command.id, { html });
+    return boundedTextResponse(command, { html }, 'html');
 }
 async function handleInputValue(command, browser) {
     const locator = browser.getLocator(command.selector);
@@ -1495,7 +2120,7 @@ async function handleEvalHandle(command, browser) {
     const page = browser.getPage();
     const handle = await page.evaluateHandle(command.script);
     const result = await handle.jsonValue().catch(() => 'Handle (non-serializable)');
-    return successResponse(command.id, { result });
+    return boundedJsonResponse(command, { result }, 'result');
 }
 async function handleExpose(command, browser) {
     const page = browser.getPage();
@@ -1609,7 +2234,7 @@ async function handleNth(command, browser) {
             return successResponse(command.id, { hovered: true });
         case 'text':
             const text = await locator.textContent();
-            return successResponse(command.id, { text });
+            return boundedTextResponse(command, { text }, 'text');
     }
 }
 async function handleWaitForUrl(command, browser) {
@@ -1818,8 +2443,10 @@ async function handleRecordingRestart(command, browser) {
 }
 // Diff handlers
 async function handleDiffSnapshot(command, browser) {
-    let before;
-    if (command.baseline) {
+    const prior = snapshotBaselines.get(browser);
+    const options = await snapshotOptionsForCommand(command, browser, prior);
+    let before = null;
+    if (command.baseline !== undefined) {
         try {
             before = fs.readFileSync(command.baseline, 'utf-8');
         }
@@ -1827,22 +2454,43 @@ async function handleDiffSnapshot(command, browser) {
             return errorResponse(command.id, `Cannot read baseline file: ${command.baseline}`);
         }
     }
-    else {
-        before = browser.getLastSnapshot();
-        if (!before) {
-            return errorResponse(command.id, 'No previous snapshot in this session. Take a snapshot first, or use --baseline <file>.');
-        }
-    }
-    const page = browser.getPage();
-    const { tree } = await getEnhancedSnapshot(page, {
-        selector: command.selector,
-        compact: command.compact,
-        maxDepth: command.maxDepth,
-    });
+    // Use BrowserManager.getSnapshot so the current ref map and diff refs have
+    // one owner. Direct getEnhancedSnapshot left follow-up @refs stale.
+    const snapshot = await browser.getSnapshot(options);
+    const { tree } = snapshot;
     const after = tree || 'Empty page';
-    const result = diffSnapshots(before, after);
+    const signature = snapshotSurfaceSignature(browser, options, snapshot.scope);
+    if (!command.baseline && !command.resetBaseline && prior?.signature === signature) {
+        before = prior.tree;
+    }
+    snapshotBaselines.set(browser, {
+        tree: after,
+        signature,
+        scopeCapability: snapshotScopeCapability(command, browser, snapshot),
+    });
+    if (before === null) {
+        const baselineReason = command.resetBaseline
+            ? 'explicit_reset'
+            : prior
+                ? 'stale_surface'
+                : 'missing_or_discarded';
+        clearBrowserRefs(browser, snapshot.refs);
+        return errorResponse(command.id, `Snapshot diff baseline reset (${baselineReason}); the current snapshot is now the baseline. Run diff snapshot again.`, {
+            comparable: false,
+            baselineReset: true,
+            baselineReason,
+        });
+    }
+    const result = diffSnapshots(before, after, {
+        full: fullOutputRequested(command),
+        compact: command.compact,
+        maxLines: command.maxLines,
+        contextLines: command.contextLines,
+    });
     browser.setLastSnapshot(after);
-    return successResponse(command.id, result);
+    const response = boundedSnapshotDiffResponse(command, result);
+    projectDiffRefs(browser, snapshot, result, response);
+    return response;
 }
 async function handleDiffScreenshot(command, browser) {
     if (!fs.existsSync(command.baseline)) {
@@ -1851,7 +2499,7 @@ async function handleDiffScreenshot(command, browser) {
     const page = browser.getPage();
     let screenshotBuffer;
     if (command.selector) {
-        const locator = browser.getLocatorFromRef(command.selector) || page.locator(command.selector);
+        const locator = browser.getLocator(command.selector);
         screenshotBuffer = await locator.screenshot({ type: 'png' });
     }
     else {
@@ -1877,23 +2525,32 @@ async function handleDiffUrl(command, browser) {
     };
     // Capture state of url1
     await page.goto(command.url1, { waitUntil });
-    const { tree: tree1 } = await getEnhancedSnapshot(page, snapshotOpts);
-    const snapshot1 = tree1 || 'Empty page';
+    const firstSnapshot = await browser.getSnapshot(snapshotOpts);
+    const snapshot1 = firstSnapshot.tree || 'Empty page';
     let screenshot1;
     if (command.screenshot) {
         screenshot1 = await page.screenshot({ fullPage: command.fullPage, type: 'png' });
     }
     // Capture state of url2
     await page.goto(command.url2, { waitUntil });
-    const { tree: tree2 } = await getEnhancedSnapshot(page, snapshotOpts);
-    const snapshot2 = tree2 || 'Empty page';
-    const snapshotDiff = diffSnapshots(snapshot1, snapshot2);
+    // BrowserManager owns the final ref map so refs rendered in the URL diff
+    // resolve against url2 rather than an older snapshot.
+    const secondSnapshot = await browser.getSnapshot(snapshotOpts);
+    const snapshot2 = secondSnapshot.tree || 'Empty page';
+    const snapshotDiff = diffSnapshots(snapshot1, snapshot2, {
+        full: fullOutputRequested(command),
+        compact: command.compact,
+        maxLines: command.maxLines,
+        contextLines: command.contextLines,
+    });
     const result = { snapshot: snapshotDiff };
     if (command.screenshot && screenshot1) {
         const screenshot2 = await page.screenshot({ fullPage: command.fullPage, type: 'png' });
         result.screenshot = await diffScreenshots(page.context(), screenshot1, screenshot2, {});
     }
-    return successResponse(command.id, result);
+    const response = boundedNestedSnapshotDiffResponse(command, result);
+    projectDiffRefs(browser, secondSnapshot, snapshotDiff, response);
+    return response;
 }
 // ── Multi-Agent Coordination Handlers ──────────────────────────────
 const SHARED_DIR = path.join(getAppDir(), 'shared');
@@ -1978,4 +2635,3 @@ async function handleTasksComplete(command) {
     writeTasks(tasks);
     return successResponse(command.id, { task });
 }
-//# sourceMappingURL=actions.js.map

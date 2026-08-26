@@ -1,62 +1,34 @@
-#!/bin/bash
-# Template: Form Automation Workflow
-# Purpose: Fill and submit web forms with validation
-# Usage: ./form-automation.sh <form-url>
-#
-# This template demonstrates the snapshot-interact-verify pattern:
-# 1. Navigate to form
-# 2. Snapshot to get element refs
-# 3. Fill fields using refs
-# 4. Submit and verify result
-#
-# Customize: Update the refs (@e1, @e2, etc.) based on your form's snapshot output
+#!/usr/bin/env bash
+# Safe starting point for a rendered form flow in the real Chrome profile.
+# Usage: form-automation.sh URL [account]
 
 set -euo pipefail
 
-FORM_URL="${1:?Usage: $0 <form-url>}"
+form_url="${1:?Usage: form-automation.sh URL [account]}"
+account="${2:-}"
+IFS= read -r task_uuid </proc/sys/kernel/random/uuid
+task_session="form-flow-${task_uuid//-/}"
+browser_bin="${BASH_SOURCE[0]%/*}/../../../scripts/agent-browser-real-chrome"
+browser_args=(--session "$task_session")
+if [[ -n "$account" ]]; then
+  browser_args=(--account "$account" "${browser_args[@]}")
+fi
 
-echo "Form automation: $FORM_URL"
+created_session=0
+cleanup() {
+  if [[ "$created_session" == 1 ]]; then
+    "$browser_bin" "${browser_args[@]}" close >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
 
-# Step 1: Navigate to form
-agent-browser open "$FORM_URL"
-agent-browser wait --load networkidle
+"$browser_bin" "${browser_args[@]}" open "$form_url"
+created_session=1
+"$browser_bin" "${browser_args[@]}" snapshot -i --compact
 
-# Step 2: Snapshot to discover form elements
-echo ""
-echo "Form structure:"
-agent-browser snapshot -i
+# Continue with fresh refs from the snapshot, for example:
+# agent-browser "${browser_args[@]}" fill @e1 "value"
+# agent-browser "${browser_args[@]}" click @e2
+# agent-browser "${browser_args[@]}" snapshot -i --compact
 
-# Step 3: Fill form fields (customize these refs based on snapshot output)
-#
-# Common field types:
-#   agent-browser fill @e1 "John Doe"           # Text input
-#   agent-browser fill @e2 "user@example.com"   # Email input
-#   agent-browser fill @e3 "SecureP@ss123"      # Password input
-#   agent-browser select @e4 "Option Value"     # Dropdown
-#   agent-browser check @e5                     # Checkbox
-#   agent-browser click @e6                     # Radio button
-#   agent-browser fill @e7 "Multi-line text"   # Textarea
-#   agent-browser upload @e8 /path/to/file.pdf # File upload
-#
-# Uncomment and modify:
-# agent-browser fill @e1 "Test User"
-# agent-browser fill @e2 "test@example.com"
-# agent-browser click @e3  # Submit button
-
-# Step 4: Wait for submission
-# agent-browser wait --load networkidle
-# agent-browser wait --url "**/success"  # Or wait for redirect
-
-# Step 5: Verify result
-echo ""
-echo "Result:"
-agent-browser get url
-agent-browser snapshot -i
-
-# Optional: Capture evidence
-agent-browser screenshot /tmp/form-result.png
-echo "Screenshot saved: /tmp/form-result.png"
-
-# Cleanup
-agent-browser close
-echo "Done"
+printf '%s\n' "Use fresh refs, verify the visible result, and let the cleanup trap close the task session."

@@ -82,4 +82,3 @@ export function isEncryptedPayload(data) {
         'authTag' in data &&
         'data' in data);
 }
-//# sourceMappingURL=encryption.js.map

@@ -1,8 +1,15 @@
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
+const DEFAULT_MAX_OUTPUT_BYTES = 50000;
+const MAX_CONFIGURED_OUTPUT_BYTES = 100000000;
 // Base schema for all commands
 const baseCommandSchema = z.object({
     id: z.string(),
     action: z.string(),
+    // Output controls live in the daemon protocol so raw-CDP callers can raise
+    // or disable the safe default without adding a browser/runtime dependency.
+    maxOutput: z.number().int().min(512).max(MAX_CONFIGURED_OUTPUT_BYTES).optional(),
+    fullOutput: z.boolean().optional(),
 });
 // Individual action schemas
 const launchSchema = baseCommandSchema.extend({
@@ -39,7 +46,7 @@ const launchSchema = baseCommandSchema.extend({
         .optional(),
     args: z.array(z.string()).optional(),
     userAgent: z.string().optional(),
-    provider: z.string().optional(),
+    provider: z.enum(['browserbase', 'kernel', 'browseruse']).optional(),
     ignoreHTTPSErrors: z.boolean().optional(),
     allowFileAccess: z.boolean().optional(),
     profile: z.string().optional(),
@@ -58,6 +65,7 @@ const clickSchema = baseCommandSchema.extend({
     clickCount: z.number().positive().optional(),
     delay: z.number().nonnegative().optional(),
     newTab: z.boolean().optional(),
+    expectPopup: z.boolean().optional(),
 });
 const typeSchema = baseCommandSchema.extend({
     action: z.literal('type'),
@@ -603,22 +611,18 @@ const inputTouchSchema = baseCommandSchema.extend({
     })),
     modifiers: z.number().optional(),
 });
-// iOS-specific schemas
-const swipeSchema = baseCommandSchema.extend({
-    action: z.literal('swipe'),
-    direction: z.enum(['up', 'down', 'left', 'right']),
-    distance: z.number().positive().optional(),
-});
-const deviceListSchema = baseCommandSchema.extend({
-    action: z.literal('device_list'),
-});
 // Diff schemas
 const diffSnapshotSchema = baseCommandSchema.extend({
     action: z.literal('diff_snapshot'),
     baseline: z.string().optional(),
-    selector: z.string().optional(),
+    selector: z.string().min(1).optional(),
+    interactive: z.boolean().optional(),
+    cursor: z.boolean().optional(),
     compact: z.boolean().optional(),
     maxDepth: z.number().nonnegative().optional(),
+    resetBaseline: z.boolean().optional(),
+    maxLines: z.number().int().positive().max(5000).optional(),
+    contextLines: z.number().int().nonnegative().max(20).optional(),
 });
 const diffScreenshotSchema = baseCommandSchema.extend({
     action: z.literal('diff_screenshot'),
@@ -635,9 +639,11 @@ const diffUrlSchema = baseCommandSchema.extend({
     screenshot: z.boolean().optional(),
     fullPage: z.boolean().optional(),
     waitUntil: z.enum(['load', 'domcontentloaded', 'networkidle']).optional(),
-    selector: z.string().optional(),
+    selector: z.string().min(1).optional(),
     compact: z.boolean().optional(),
     maxDepth: z.number().nonnegative().optional(),
+    maxLines: z.number().int().positive().max(5000).optional(),
+    contextLines: z.number().int().nonnegative().max(20).optional(),
 });
 const pressSchema = baseCommandSchema.extend({
     action: z.literal('press'),
@@ -659,7 +665,7 @@ const snapshotSchema = baseCommandSchema.extend({
     cursor: z.boolean().optional(),
     maxDepth: z.number().nonnegative().optional(),
     compact: z.boolean().optional(),
-    selector: z.string().optional(),
+    selector: z.string().min(1).optional(),
 });
 const evaluateSchema = baseCommandSchema.extend({
     action: z.literal('evaluate'),
@@ -879,8 +885,6 @@ const commandSchema = z.discriminatedUnion('action', [
     inputMouseSchema,
     inputKeyboardSchema,
     inputTouchSchema,
-    swipeSchema,
-    deviceListSchema,
     diffSnapshotSchema,
     diffScreenshotSchema,
     diffUrlSchema,
@@ -901,30 +905,40 @@ export function parseCommand(input) {
         json = JSON.parse(input);
     }
     catch {
-        return { success: false, error: 'Invalid JSON' };
+        return { success: false, error: 'Invalid JSON', outputControls: { maxOutput: DEFAULT_MAX_OUTPUT_BYTES } };
     }
     // Extract id for error responses if possible
     const id = typeof json === 'object' && json !== null && 'id' in json
         ? String(json.id)
         : undefined;
+    const outputControls = invalidCommandOutputControls(json);
     // Validate against schema
     const result = commandSchema.safeParse(json);
     if (!result.success) {
         const errors = result.error.errors.map((e) => `${e.path.join('.')}: ${e.message}`).join(', ');
-        return { success: false, error: `Validation error: ${errors}`, id };
+        return { success: false, error: `Validation error: ${errors}`, id, outputControls };
     }
     const command = result.data;
     // Post-parse validation for commands that need cross-field checks
+    if (command.action === 'diff_snapshot' && command.baseline !== undefined && command.resetBaseline) {
+        return {
+            success: false,
+            error: 'diff_snapshot baseline and resetBaseline are mutually exclusive',
+            id,
+            outputControls,
+        };
+    }
     if ((command.action === 'addscript' || command.action === 'addstyle') &&
         !command.content &&
         !command.url) {
-        return { success: false, error: 'Either content or url must be provided', id };
+        return { success: false, error: 'Either content or url must be provided', id, outputControls };
     }
     if (command.action === 'frame' && !command.selector && !command.name && !command.url) {
         return {
             success: false,
             error: 'frame command requires at least one of: selector, name, or url',
             id,
+            outputControls,
         };
     }
     return { success: true, command };
@@ -938,13 +952,206 @@ export function successResponse(id, data) {
 /**
  * Create an error response
  */
-export function errorResponse(id, error) {
-    return { id, success: false, error };
+export function errorResponse(id, error, data) {
+    return data === undefined
+        ? { id, success: false, error }
+        : { id, success: false, error, data };
+}
+
+function invalidCommandOutputControls(value) {
+    const requested = value && typeof value === 'object' ? value.maxOutput : undefined;
+    if (typeof requested !== 'number' || !Number.isFinite(requested)) {
+        return { maxOutput: DEFAULT_MAX_OUTPUT_BYTES };
+    }
+    if (!Number.isSafeInteger(requested) || requested > MAX_CONFIGURED_OUTPUT_BYTES) {
+        return { maxOutput: DEFAULT_MAX_OUTPUT_BYTES };
+    }
+    return { maxOutput: Math.max(512, requested) };
+}
+
+function fullOutputRequested(controls) {
+    return controls?.fullOutput === true || process.env.AGENT_BROWSER_FULL_OUTPUT === '1';
+}
+
+function responseOutputLimit(controls) {
+    if (fullOutputRequested(controls)) {
+        return null;
+    }
+    if (controls?.maxOutput !== undefined) {
+        return Number.isSafeInteger(controls.maxOutput) &&
+            controls.maxOutput >= 512 &&
+            controls.maxOutput <= MAX_CONFIGURED_OUTPUT_BYTES
+            ? controls.maxOutput
+            : DEFAULT_MAX_OUTPUT_BYTES;
+    }
+    const rawEnvLimit = process.env.AGENT_BROWSER_MAX_OUTPUT ?? '';
+    if (!/^[0-9]+$/.test(rawEnvLimit)) {
+        return DEFAULT_MAX_OUTPUT_BYTES;
+    }
+    const envLimit = Number(rawEnvLimit);
+    return Number.isSafeInteger(envLimit) &&
+        envLimit >= 512 &&
+        envLimit <= MAX_CONFIGURED_OUTPUT_BYTES
+        ? envLimit
+        : DEFAULT_MAX_OUTPUT_BYTES;
+}
+
+function jsonEscapedUnit(text, index) {
+    const code = text.charCodeAt(index);
+    if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09 ||
+        code === 0x0a || code === 0x0c || code === 0x0d) {
+        return { bytes: 2, units: 1 };
+    }
+    if (code < 0x20) {
+        return { bytes: 6, units: 1 };
+    }
+    if (code >= 0xd800 && code <= 0xdbff) {
+        const next = text.charCodeAt(index + 1);
+        return next >= 0xdc00 && next <= 0xdfff
+            ? { bytes: 4, units: 2 }
+            : { bytes: 6, units: 1 };
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) {
+        return { bytes: 6, units: 1 };
+    }
+    return { bytes: code <= 0x7f ? 1 : code <= 0x7ff ? 2 : 3, units: 1 };
+}
+
+function jsonEscapedPrefix(text, start, maxBytes) {
+    let bytes = 0;
+    let index = start;
+    while (index < text.length) {
+        const unit = jsonEscapedUnit(text, index);
+        if (bytes + unit.bytes > maxBytes)
+            break;
+        bytes += unit.bytes;
+        index += unit.units;
+    }
+    return text.slice(start, index);
+}
+
+function utf8Prefix(text, maxBytes) {
+    let bytes = 0;
+    let index = 0;
+    while (index < text.length) {
+        const code = text.charCodeAt(index);
+        let unitBytes;
+        let units = 1;
+        if (code >= 0xd800 && code <= 0xdbff) {
+            const next = text.charCodeAt(index + 1);
+            if (next >= 0xdc00 && next <= 0xdfff) {
+                unitBytes = 4;
+                units = 2;
+            }
+            else {
+                unitBytes = 3;
+            }
+        }
+        else {
+            unitBytes = code <= 0x7f ? 1 : code <= 0x7ff ? 2 : 3;
+        }
+        if (bytes + unitBytes > maxBytes)
+            break;
+        bytes += unitBytes;
+        index += units;
+    }
+    return text.slice(0, index);
+}
+
+function boundedCorrelationId(id) {
+    const text = String(id ?? 'unknown');
+    const originalBytes = Buffer.byteLength(text, 'utf8');
+    if (originalBytes <= 96) {
+        return { value: text, originalBytes, truncated: false };
+    }
+    const digest = createHash('sha256').update(text).digest('hex').slice(0, 16);
+    return {
+        value: `${utf8Prefix(text, 48)}…#${digest}`,
+        originalBytes,
+        truncated: true,
+    };
+}
+
+function boundedEnvelope(response, serialized, limitBytes) {
+    const originalBytes = Buffer.byteLength(serialized, 'utf8');
+    const boundedId = boundedCorrelationId(response?.id);
+    const outputLimit = {
+        field: 'response',
+        limitBytes,
+        originalBytes,
+        reason: 'serialized_response',
+        ...(boundedId.truncated ? { originalIdBytes: boundedId.originalBytes } : {}),
+    };
+    const marker = '[truncated: serialized response exceeded output limit]';
+    const makeSuccess = (preview) => successResponse(boundedId.value, {
+        truncated: true,
+        outputLimit,
+        responsePreview: preview,
+    });
+    const makeError = (error) => errorResponse(boundedId.value, error, {
+        truncated: true,
+        outputLimit,
+    });
+    const minimal = response?.success === false ? makeError(marker) : makeSuccess(marker);
+    const minimalBytes = Buffer.byteLength(JSON.stringify(minimal), 'utf8');
+    const budget = Math.max(0, limitBytes - minimalBytes - 16);
+    let candidate;
+    if (response?.success === false) {
+        const source = String(response.error ?? 'Unknown error');
+        const prefix = jsonEscapedPrefix(source, 0, budget);
+        candidate = makeError(prefix ? `${prefix}\n${marker}` : marker);
+    }
+    else {
+        const dataMarker = ',"data":';
+        const markerIndex = serialized.indexOf(dataMarker);
+        const start = markerIndex >= 0 ? markerIndex + dataMarker.length : 0;
+        const prefix = jsonEscapedPrefix(serialized, start, budget);
+        candidate = makeSuccess(prefix ? `${prefix}\n${marker}` : marker);
+    }
+    while (Buffer.byteLength(JSON.stringify(candidate), 'utf8') > limitBytes && budget > 0) {
+        const smallerBudget = Math.max(0, Math.floor(budget / 2));
+        if (response?.success === false) {
+            const prefix = jsonEscapedPrefix(String(response.error ?? 'Unknown error'), 0, smallerBudget);
+            candidate = makeError(prefix ? `${prefix}\n${marker}` : marker);
+        }
+        else {
+            candidate = makeSuccess(marker);
+        }
+        break;
+    }
+    if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') <= limitBytes) {
+        return candidate;
+    }
+    return response?.success === false
+        ? errorResponse(boundedId.value, 'Response exceeded output limit', { truncated: true, outputLimit })
+        : successResponse(boundedId.value, { truncated: true, outputLimit });
+}
+
+/**
+ * Apply the whole-serialized UTF-8 response cap. Handlers may build richer
+ * field previews, but this envelope guard owns every success/error and ID.
+ */
+export function finalizeResponse(response, controls = {}) {
+    const limitBytes = responseOutputLimit(controls);
+    if (limitBytes === null) {
+        return response;
+    }
+    const serialized = JSON.stringify(response);
+    return Buffer.byteLength(serialized, 'utf8') <= limitBytes
+        ? response
+        : boundedEnvelope(response, serialized, limitBytes);
 }
 /**
  * Serialize a response to JSON string
  */
-export function serializeResponse(response) {
-    return JSON.stringify(response);
+export function serializeResponse(response, controls = {}) {
+    const limitBytes = responseOutputLimit(controls);
+    if (limitBytes === null) {
+        return JSON.stringify(response);
+    }
+    const serialized = JSON.stringify(response);
+    if (Buffer.byteLength(serialized, 'utf8') <= limitBytes) {
+        return serialized;
+    }
+    return JSON.stringify(boundedEnvelope(response, serialized, limitBytes));
 }
-//# sourceMappingURL=protocol.js.map

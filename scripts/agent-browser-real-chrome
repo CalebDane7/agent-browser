@@ -1,0 +1,27 @@
+#!/usr/bin/bash
+set -euo pipefail
+umask 077
+
+# This bootstrap has no production test switch. It discards the inherited
+# environment before Node starts, including PATH, account/session selectors,
+# alternate binaries, proxy/profile flags, and NODE_OPTIONS.
+source_path="${BASH_SOURCE[0]}"
+case "$source_path" in
+  /*) ;;
+  *) source_path="$PWD/$source_path" ;;
+esac
+script_path="$(/usr/bin/readlink -f -- "$source_path")"
+if [ -z "$script_path" ]; then
+  /usr/bin/printf '%s\n' 'agent-browser: authenticated wrapper path is unavailable' >&2
+  exit 70
+fi
+script_dir="${script_path%/*}"
+
+exec /usr/bin/env -i \
+  HOME=/home/cabule \
+  USER=cabule \
+  LOGNAME=cabule \
+  PATH=/usr/bin:/bin \
+  LANG=C.UTF-8 \
+  LC_ALL=C.UTF-8 \
+  /usr/bin/node "$script_dir/agent-browser-wrapper.js" "$@"

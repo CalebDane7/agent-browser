@@ -1,0 +1,15 @@
+{
+  "schema": "agent-browser.native-release.v1",
+  "packageVersion": "0.13.0",
+  "platform": "linux-x64",
+  "binary": "bin/agent-browser-linux-x64",
+  "sha256": "a34421a9f7c3e498ce30f6dec4780e53488de5e01f330f2f2abcf8e79a6955f4",
+  "size": 920984,
+  "versionOutput": "agent-browser 0.13.0",
+  "provenance": {
+    "status": "accepted-local-binary",
+    "acceptedBaseline": "228cb15a9812e0bd6a9b99d1dc43fb7151676441",
+    "sourceReproducible": false,
+    "limitation": "These exact binary bytes are the accepted release input; this manifest does not claim source reproducibility."
+  }
+}

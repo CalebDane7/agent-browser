@@ -1,0 +1,18 @@
+{
+  "schema": "agent-browser-canonical-dist.v1",
+  "authority": "tracked-dist-js",
+  "algorithm": "sha256",
+  "files": {
+    "dist/actions.js": "ed83b1d4246baa9446d2832d5f2ecdc81128b2f42d197d15aa87c1710f2dded0",
+    "dist/browser.js": "2796757e9026b298eb394b2f4d4bdf9a78ec6aae5ef8d14a1c2cc706d96eccf7",
+    "dist/cdp.js": "f8252cd40dc9f30949c1f425ccc4e5ae07ff94f4ae7a4a4949919135af1638c7",
+    "dist/daemon.js": "dbb67ad2186071cb568ae4b0cd130873f97ab6e3bfd86114c7cc7f9ffc7e3e04",
+    "dist/diff.js": "4020082d8a0893d44accf9b891b1cafaca31da86e72b083b6afb0e8c219a1207",
+    "dist/encryption.js": "36d560a7f0c17b741e7e2e9b619b4096f04eaad954536a96e4d110a03e27b3d7",
+    "dist/protocol.js": "abcee3c2c4bf995cd966f19692f5780b5c8b80dd5979e7b2537692175342deb0",
+    "dist/snapshot.js": "48e3805d746ba7cc5a83c332340357e058f2d8fe300d3cd5966a11a6f712eda0",
+    "dist/state-utils.js": "f25777ddf80ef51339974efe394bd3b3db04f2d8e50da4e8ee98bb619f375a59",
+    "dist/stream-server.js": "cdcb0dbfc6f212ddd281b52dad294b1625e6cc64977d2b0e3f086c3429984f24",
+    "dist/types.js": "01ae2a5b120382f9a648ced7ee8507493a134f216d100fc61600c6c9738235d2"
+  }
+}
