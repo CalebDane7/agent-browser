@@ -1,202 +1,107 @@
-# Authentication Patterns
+# Authentication
 
-Login flows, session persistence, OAuth, 2FA, and authenticated browsing.
+Use the real persistent Chrome profile as authentication authority. Never start
+from a clean browser or export cookies just because a site shows a login page.
 
-**Related**: [session-management.md](session-management.md) for state persistence details, [SKILL.md](../SKILL.md) for quick start.
+## Resolve The Account First
 
-## Contents
+- Omit `--account` only when the runtime's configured default matches the task.
+- For a requested account, pass `--account HANDLE` using its exact enrolled
+  alias from the local installed operator mapping. Keep that map private.
+- Do not invent an account handle from an email or profile label. For a new
+  profile, follow the [setup and enrollment guide](setup.md).
 
-- [Basic Login Flow](#basic-login-flow)
-- [Saving Authentication State](#saving-authentication-state)
-- [Restoring Authentication](#restoring-authentication)
-- [OAuth / SSO Flows](#oauth--sso-flows)
-- [Two-Factor Authentication](#two-factor-authentication)
-- [HTTP Basic Auth](#http-basic-auth)
-- [Cookie-Based Auth](#cookie-based-auth)
-- [Token Refresh Handling](#token-refresh-handling)
-- [Security Best Practices](#security-best-practices)
-
-## Basic Login Flow
+A session name does not select an account. Verify the destination page's visible
+identity before changing account data, sending anything, or submitting payment.
 
 ```bash
-# Navigate to login page
-agent-browser open https://app.example.com/login
-agent-browser wait --load networkidle
+IFS= read -r default_auth_uuid </proc/sys/kernel/random/uuid
+default_auth_session="default-auth-${default_auth_uuid//-/}"
+agent-browser --session "$default_auth_session" open URL
+agent-browser --session "$default_auth_session" snapshot -i --compact
+agent-browser --session "$default_auth_session" close
 
-# Get form elements
-agent-browser snapshot -i
-# Output: @e1 [input type="email"], @e2 [input type="password"], @e3 [button] "Sign In"
-
-# Fill credentials
-agent-browser fill @e1 "user@example.com"
-agent-browser fill @e2 "password123"
-
-# Submit
-agent-browser click @e3
-agent-browser wait --load networkidle
-
-# Verify login succeeded
-agent-browser get url  # Should be dashboard, not login
+# Explicit account lane, using the locally mapped alias
+: "${browser_account:?Set the requested alias from the local operator mapping}"
+IFS= read -r account_auth_uuid </proc/sys/kernel/random/uuid
+account_auth_session="account-auth-${account_auth_uuid//-/}"
+agent-browser --account "$browser_account" --session "$account_auth_session" open URL
+agent-browser --account "$browser_account" --session "$account_auth_session" snapshot -i --compact
+agent-browser --account "$browser_account" --session "$account_auth_session" close
 ```
 
-## Saving Authentication State
+## Automate Before Asking
 
-After logging in, save state for reuse:
+If the site is not already at the authenticated destination:
 
-```bash
-# Login first (see above)
-agent-browser open https://app.example.com/login
-agent-browser snapshot -i
-agent-browser fill @e1 "user@example.com"
-agent-browser fill @e2 "password123"
-agent-browser click @e3
-agent-browser wait --url "**/dashboard"
+1. Inspect the visible page and current identity.
+2. Use the site's normal account chooser, Continue, Sign in, or OAuth controls
+   when they can reuse the selected Chrome profile's saved session.
+3. Follow redirects in the same named session and verify the returned identity.
+4. Check the requested/default profile's existing signed-in state before saying
+   login is unavailable. Do not silently switch to a different identity for an
+   account-sensitive action.
 
-# Save authenticated state
-agent-browser state save ./auth-state.json
-```
+Do not ask the user to "sign in first" while a saved-profile path remains. Never
+request or expose a password, cookie, token, one-time code, or recovery secret in
+chat or shell commands.
 
-## Restoring Authentication
+## Genuine Human-Input Boundary
 
-Skip login by loading saved state:
+Only pause when the rendered page proves an unavoidable password, 2FA,
+hardware-key, recovery, CAPTCHA, file-picker, or account-authority decision that
+the agent cannot safely complete. A consent page is not automatically a user
+boundary: inspect the identity, requested scope, and existing grant first.
 
-```bash
-# Load saved auth state
-agent-browser state load ./auth-state.json
+Keep the exact named session through the interruption. With the user's
+permission, use `foreground --input-boundary TYPE` from the command reference;
+otherwise identify the profile and task tab for the user to select. The user
+supplies secrets there—not in chat. After input, use `background` with the same
+account, session, and `--current-tab` prefix when applicable. It restores the
+saved prior app or tab only while the handoff's focus history is unchanged.
+Cancellation, denial, an unconfirmed result, or no handoff does not promise where
+focus ends up; do not retry or force focus. Resume the same session, verify the
+authenticated identity and destination, and close it when shared work is finished.
 
-# Navigate directly to protected page
-agent-browser open https://app.example.com/dashboard
+## OAuth And Persistence
 
-# Verify authenticated
-agent-browser snapshot -i
-```
+- Continue same-tab OAuth redirects in the same task session and use fresh refs
+  after every navigation. Exact task-owned popup descendants require cleanup,
+  but the ordinary route cannot switch to or control them. Website-triggered
+  popups may bring Chrome forward; this accepted limitation does not waive
+  their cleanup. A successful root `close` alone does not prove a popup is gone;
+  report a surviving owned popup as cleanup failure to the runtime maintainer,
+  without closing guessed or user-owned tabs. If popup interaction
+  is required, do not guess tab commands or adopt it as the current tab; only a
+  genuine human-input boundary may be handed to the user, otherwise route the
+  unsupported browser action to the runtime maintainer.
+- Authentication persists in the selected Chrome profile. Do not use portable
+  state files for user-owned accounts.
+- Never replace an attachment or transport failure with a new clean tab that
+  forces another login.
+- Keep task tabs inactive by default. The user may select the exact retained
+  task tab for input or ongoing collaboration; that does not authorize the agent
+  to repeatedly bring Chrome forward or to close the tab during shared work.
 
-## OAuth / SSO Flows
+## Browser Extensions And MetaMask
 
-For OAuth redirects:
+- The ordinary private route controls HTTP(S) page tabs; it does not grant
+  extension-UI or extension-storage authority. Never use `eval`, raw CDP, or a
+  guessed internal URL to bypass that boundary.
+- Never reinstall, reset, side-load, unlock, connect, sign, create/import, or
+  repair a wallet merely because a site or transport is blocked.
+- MetaMask onboarding (`Create a new wallet` / `I have an existing wallet`) is
+  a wrong-state RED when the user expects an existing wallet. Preserve the live
+  data and stop the ordinary lane. Only a separately explicit wallet/state task
+  authorizes investigating that state; never ask for a seed phrase, private
+  key, vault, password, or hardware-wallet secret.
+- Site connection never authorizes a wallet signature or transaction. Never
+  repeat either until the first attempt is proven absent.
+- Transport work never authorizes changing MetaMask data or hardware-wallet/USB
+  behavior.
 
-```bash
-# Start OAuth flow
-agent-browser open https://app.example.com/auth/google
-
-# Handle redirects automatically
-agent-browser wait --url "**/accounts.google.com**"
-agent-browser snapshot -i
-
-# Fill Google credentials
-agent-browser fill @e1 "user@gmail.com"
-agent-browser click @e2  # Next button
-agent-browser wait 2000
-agent-browser snapshot -i
-agent-browser fill @e3 "password"
-agent-browser click @e4  # Sign in
-
-# Wait for redirect back
-agent-browser wait --url "**/app.example.com**"
-agent-browser state save ./oauth-state.json
-```
-
-## Two-Factor Authentication
-
-Handle 2FA with manual intervention:
-
-```bash
-# Login with credentials
-agent-browser open https://app.example.com/login --headed  # Show browser
-agent-browser snapshot -i
-agent-browser fill @e1 "user@example.com"
-agent-browser fill @e2 "password123"
-agent-browser click @e3
-
-# Wait for user to complete 2FA manually
-echo "Complete 2FA in the browser window..."
-agent-browser wait --url "**/dashboard" --timeout 120000
-
-# Save state after 2FA
-agent-browser state save ./2fa-state.json
-```
-
-## HTTP Basic Auth
-
-For sites using HTTP Basic Authentication:
-
-```bash
-# Set credentials before navigation
-agent-browser set credentials username password
-
-# Navigate to protected resource
-agent-browser open https://protected.example.com/api
-```
-
-## Cookie-Based Auth
-
-Manually set authentication cookies:
-
-```bash
-# Set auth cookie
-agent-browser cookies set session_token "abc123xyz"
-
-# Navigate to protected page
-agent-browser open https://app.example.com/dashboard
-```
-
-## Token Refresh Handling
-
-For sessions with expiring tokens:
-
-```bash
-#!/bin/bash
-# Wrapper that handles token refresh
-
-STATE_FILE="./auth-state.json"
-
-# Try loading existing state
-if [[ -f "$STATE_FILE" ]]; then
-    agent-browser state load "$STATE_FILE"
-    agent-browser open https://app.example.com/dashboard
-
-    # Check if session is still valid
-    URL=$(agent-browser get url)
-    if [[ "$URL" == *"/login"* ]]; then
-        echo "Session expired, re-authenticating..."
-        # Perform fresh login
-        agent-browser snapshot -i
-        agent-browser fill @e1 "$USERNAME"
-        agent-browser fill @e2 "$PASSWORD"
-        agent-browser click @e3
-        agent-browser wait --url "**/dashboard"
-        agent-browser state save "$STATE_FILE"
-    fi
-else
-    # First-time login
-    agent-browser open https://app.example.com/login
-    # ... login flow ...
-fi
-```
-
-## Security Best Practices
-
-1. **Never commit state files** - They contain session tokens
-   ```bash
-   echo "*.auth-state.json" >> .gitignore
-   ```
-
-2. **Use environment variables for credentials**
-   ```bash
-   agent-browser fill @e1 "$APP_USERNAME"
-   agent-browser fill @e2 "$APP_PASSWORD"
-   ```
-
-3. **Clean up after automation**
-   ```bash
-   agent-browser cookies clear
-   rm -f ./auth-state.json
-   ```
-
-4. **Use short-lived sessions for CI/CD**
-   ```bash
-   # Don't persist state in CI
-   agent-browser open https://app.example.com/login
-   # ... login and perform actions ...
-   agent-browser close  # Session ends, nothing persisted
-   ```
+Run the matching session `close` promptly when finished, including after failure
+or cancellation, unless that exact tab is still in active collaboration with the
+user or awaits genuine user-only input. Retain and repeat the same explicit
+account/session. End an invited user-tab attachment with matching `close`, which
+detaches without closing the user's tab.

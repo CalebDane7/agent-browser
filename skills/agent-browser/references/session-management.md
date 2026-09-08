@@ -1,211 +1,136 @@
 # Session Management
 
-Multiple isolated browser sessions with state persistence and concurrent browsing.
+Named sessions isolate task ownership, tabs, and element refs. They do not
+select or isolate the Google account; Chrome profiles own cookies and saved
+sign-in state.
 
-**Related**: [authentication.md](authentication.md) for login patterns, [SKILL.md](../SKILL.md) for quick start.
+The installed session key binds the alias to the real owner process birth and
+native child-thread namespace. Different owners using the same alias get
+separate tabs; a matching alias is not a handoff or cleanup capability. Keep
+the original worker for ongoing work and close. Native process-death cleanup
+does not imply that a completed child thread has closed its tabs.
 
-Cleanup is mandatory. Treat every browser tab/session as temporary and close it as soon as it is finished, failed, duplicated, pointed at the wrong account, or no longer useful. Do not leave tabs open for later cleanup unless the user explicitly needs to inspect the current visible state.
-
-## Contents
-
-- [Named Sessions](#named-sessions)
-- [Session Isolation Properties](#session-isolation-properties)
-- [Session State Persistence](#session-state-persistence)
-- [Common Patterns](#common-patterns)
-- [Default Session](#default-session)
-- [Session Cleanup](#session-cleanup)
-- [Best Practices](#best-practices)
-
-## Named Sessions
-
-Use `--session` flag to isolate browser contexts:
+## One Workflow, One Named Session
 
 ```bash
-# Session 1: Authentication flow
-agent-browser --session auth open https://app.example.com/login
-
-# Session 2: Public browsing (separate cookies, storage)
-agent-browser --session public open https://example.com
-
-# Commands are isolated by session
-agent-browser --session auth fill @e1 "user@example.com"
-agent-browser --session public get text body
+IFS= read -r task_uuid </proc/sys/kernel/random/uuid
+# This workflow uses the runtime default; omit --account on every command.
+task_session="checkout-${task_uuid//-/}"
+agent-browser --session "$task_session" open URL
+agent-browser --session "$task_session" snapshot -i --compact
+# interact and verify, then run the matching close shown under Cleanup
 ```
 
-## Session Isolation Properties
+- Reuse the matching named session/target for the same workflow.
+- Open a new session only when no matching target exists or a genuinely
+  independent lane needs one.
+- The writer boundary is one owned session/tab tree, not the whole profile.
+- Give every concurrent agent a globally unique semantic session name. Run
+  independent browser lanes concurrently in separate sessions when that
+  materially shortens the full task; the same profile may host several owned
+  sessions safely. Serialize dependent actions and any work on the same tab.
+- The installed broker currently allows 16 total live sessions. This is
+  scalable capacity, not a reason to pre-open tabs; normally keep only a few.
+- If the matching target exists but cannot reconnect, fail closed and resolve its
+  owner or transport. Do not create a replacement tab that repeats login/2FA.
 
-Each session has independent:
-- Cookies
-- LocalStorage / SessionStorage
-- IndexedDB
-- Cache
-- Browsing history
-- Open tabs
-
-## Session State Persistence
-
-### Save Session State
+## Account Lanes
 
 ```bash
-# Save cookies, storage, and auth state
-agent-browser state save /path/to/auth-state.json
+# Runtime default
+IFS= read -r default_uuid </proc/sys/kernel/random/uuid
+default_session="default-settings-${default_uuid//-/}"
+agent-browser --session "$default_session" open URL
+agent-browser --session "$default_session" snapshot -i --compact
+agent-browser --session "$default_session" close
+
+# Explicit account, using the locally mapped alias
+: "${browser_account:?Set the requested alias from the local operator mapping}"
+IFS= read -r account_uuid </proc/sys/kernel/random/uuid
+account_session="account-settings-${account_uuid//-/}"
+agent-browser --account "$browser_account" --session "$account_session" open URL
+agent-browser --account "$browser_account" --session "$account_session" snapshot -i --compact
+agent-browser --account "$browser_account" --session "$account_session" close
 ```
 
-### Load Session State
+Always verify visible identity before account-sensitive work. For another named
+profile or email, use its enrolled alias from the local installed operator
+mapping; never guess that an email is itself a valid `--account` value or silently
+use default.
+Repeat the same explicit account handle on every command for that session.
+
+## Background And Current-Tab Collaboration
+
+Normal `open` creates an inactive tab. If the selected profile has no ordinary
+window, its extension lazily creates one minimized task window; closing its last
+task removes that extension-owned window. Do not keep idle windows per profile.
+
+Use the user's current tab only after an explicit request to help in that tab:
 
 ```bash
-# Restore saved state
-agent-browser state load /path/to/auth-state.json
-
-# Continue with authenticated session
-agent-browser open https://app.example.com/dashboard
+IFS= read -r current_tab_uuid </proc/sys/kernel/random/uuid
+current_tab_session="current-help-${current_tab_uuid//-/}"
+agent-browser --session "$current_tab_session" --current-tab get url
+agent-browser --session "$current_tab_session" --current-tab close
 ```
 
-### State File Contents
+This is a cold-bootstrap, one-shot claim of the exact focused profile/window/tab.
+It never means “find a likely tab.” Another agent's task tab is not claimable.
+Repeat `--current-tab` and the same account/session selectors on every
+command. Closing this session detaches Agent Browser and preserves the user's tab.
 
-```json
-{
-  "cookies": [...],
-  "localStorage": {...},
-  "sessionStorage": {...},
-  "origins": [...]
-}
-```
+Verify the returned URL before acting. At initial claim, wait for the intended
+document to render, not merely for its address to appear. Chrome may report an
+empty frame URL before document loading has begun. If focus changes during the
+claim, preserve the failure; do not force focus back or repeatedly claim. A new
+attempt needs an observed change at that exact failed boundary. After attachment,
+the user may minimize Chrome or switch apps while commands continue in the
+retained tab without activating it.
 
-## Common Patterns
+Two explicitly invited agents sharing one user tab passed a separate real-Chrome
+check: overlapping commands serialized, each detach preserved the other agent,
+and the user's document and input value survived. Each agent needs its own
+session and invitation; a task-owned tab remains exclusive to its owner.
+Prefer independent tabs when work can actually run in parallel.
 
-### Authenticated Session Reuse
+If a task reaches unavoidable user-only input, preserve its exact session.
+With permission, use `foreground --input-boundary TYPE` from the command
+reference; otherwise let the user select the tab. After input, run `background`
+with the exact same account, session, and `--current-tab` selectors used for the
+handoff. Return is conditional on the saved owner/focus state. Cancellation,
+denial, an unconfirmed result, or no handoff does not promise focus; never retry
+or force it. Resume the same session and keep it open while collaborating,
+rather than creating a replacement.
+
+## Pairing And Reconnect
+
+The transport extension is installed, enabled, and enrolled separately in each
+profile. Use only accounts listed in the local installed operator mapping. The
+one-time enrollment gesture is not repeated during ordinary use: an offline
+enrolled profile is started on demand and reconnects automatically. A new approval prompt
+during reuse is a real failure; do not auto-click it or create another Chrome.
+
+## Cleanup
+
+Close a finished task session on success, failure, or cancellation, using the
+original worker and account/session selectors. Retain it only for ongoing
+user collaboration or genuine user-only input:
 
 ```bash
-#!/bin/bash
-# Save login state once, reuse many times
-
-STATE_FILE="/tmp/auth-state.json"
-
-# Check if we have saved state
-if [[ -f "$STATE_FILE" ]]; then
-    agent-browser state load "$STATE_FILE"
-    agent-browser open https://app.example.com/dashboard
-else
-    # Perform login
-    agent-browser open https://app.example.com/login
-    agent-browser snapshot -i
-    agent-browser fill @e1 "$USERNAME"
-    agent-browser fill @e2 "$PASSWORD"
-    agent-browser click @e3
-    agent-browser wait --load networkidle
-
-    # Save for future use
-    agent-browser state save "$STATE_FILE"
-fi
+agent-browser --session "$task_session" close
+# For an explicit-account workflow, repeat --account "$browser_account" too.
 ```
 
-### Concurrent Scraping
+The wrapper closes task-owned targets and preserves the user's real Stable
+Chrome, unrelated retained user/auth tabs, extensions, settings, and profile.
+It follows exact opener descendants created by the task and closes only those it
+owns. For a `--current-tab` session, it detaches without closing the user tab.
+Never leave blank sessions for later cleanup.
 
-```bash
-#!/bin/bash
-# Scrape multiple sites concurrently
+Wait for command exit. If a child stops before cleanup, resume that exact worker
+when possible or report the failure to the runtime maintainer. Parent-side close
+with the same alias operates in the parent's namespace, not the child's. Never
+spoof owner metadata to bypass isolation.
 
-# Start all sessions
-agent-browser --session site1 open https://site1.com &
-agent-browser --session site2 open https://site2.com &
-agent-browser --session site3 open https://site3.com &
-wait
-
-# Extract from each
-agent-browser --session site1 get text body > site1.txt
-agent-browser --session site2 get text body > site2.txt
-agent-browser --session site3 get text body > site3.txt
-
-# Cleanup
-agent-browser --session site1 close
-agent-browser --session site2 close
-agent-browser --session site3 close
-```
-
-### A/B Testing Sessions
-
-```bash
-# Test different user experiences
-agent-browser --session variant-a open "https://app.com?variant=a"
-agent-browser --session variant-b open "https://app.com?variant=b"
-
-# Compare
-agent-browser --session variant-a screenshot /tmp/variant-a.png
-agent-browser --session variant-b screenshot /tmp/variant-b.png
-```
-
-## Default Session
-
-When `--session` is omitted, commands use the default session:
-
-```bash
-# These use the same default session
-agent-browser open https://example.com
-agent-browser snapshot -i
-agent-browser close  # Closes default session
-```
-
-## Session Cleanup
-
-```bash
-# Close specific session
-agent-browser --session auth close
-
-# Close default session
-agent-browser close
-
-# Close one finished tab inside the current session
-agent-browser tab close <index>
-
-# List active sessions
-agent-browser session list
-```
-
-Close failed or irrelevant tabs immediately. If a page did not load correctly, opened the wrong account, hit an extension/offscreen target, or proved unrelated to the task, close it before opening the next page. Before finalizing work, either close every Agent Browser surface you opened or explicitly report which tab/session remains open and why.
-
-## Best Practices
-
-### 1. Name Sessions Semantically
-
-```bash
-# GOOD: Clear purpose
-agent-browser --session github-auth open https://github.com
-agent-browser --session docs-scrape open https://docs.example.com
-
-# AVOID: Generic names
-agent-browser --session s1 open https://github.com
-```
-
-### 2. Always Clean Up
-
-```bash
-# Close sessions when done
-agent-browser --session auth close
-agent-browser --session scrape close
-```
-
-For multi-tab checks, list tabs and close each completed tab:
-
-```bash
-agent-browser tab list
-agent-browser tab close 2
-agent-browser tab close 1
-```
-
-### 3. Handle State Files Securely
-
-```bash
-# Don't commit state files (contain auth tokens!)
-echo "*.auth-state.json" >> .gitignore
-
-# Delete after use
-rm /tmp/auth-state.json
-```
-
-### 4. Timeout Long Sessions
-
-```bash
-# Set timeout for automated scripts
-timeout 60 agent-browser --session long-task get text body
-```
+User-owned authentication remains in the selected Chrome profile. Never print,
+export, copy, save, or transfer its cookies, tokens, passwords, or recovery data.

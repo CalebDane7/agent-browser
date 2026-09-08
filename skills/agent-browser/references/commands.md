@@ -1,263 +1,225 @@
-# Command Reference
+# Authenticated Private-Route Command Reference
 
-Complete reference for all agent-browser commands. For quick start and common patterns, see SKILL.md.
+This is the source-checked syntax subset for the installed private Agent Browser
+route, not a claim that every command has passed a live journey. The pinned
+Vercel v0.36 engine exposes more commands, but its standalone `--help` does not
+prove that the authenticated page capability permits them.
 
-## Navigation
+## Mandatory Prefix
 
-```bash
-agent-browser open <url>      # Navigate to URL (aliases: goto, navigate)
-                              # Supports: https://, http://, file://, about:, data://
-                              # Auto-prepends https:// if no protocol given
-agent-browser back            # Go back
-agent-browser forward         # Go forward
-agent-browser reload          # Reload page
-agent-browser close           # Close browser (aliases: quit, exit)
-agent-browser connect 9222    # Connect to browser via CDP port
-```
-
-## Snapshot (page analysis)
+Every invocation needs one globally unique task session. Generate it once and
+retain its exact value across tool calls; shell variables may not survive a new
+call. Reuse the same account/session on every command:
 
 ```bash
-agent-browser snapshot            # Full accessibility tree
-agent-browser snapshot -i         # Interactive elements only (recommended)
-agent-browser snapshot -c         # Compact output
-agent-browser snapshot -d 3       # Limit depth to 3
-agent-browser snapshot -s "#main" # Scope to CSS selector
+IFS= read -r task_uuid </proc/sys/kernel/random/uuid
+# For examples with --account, set browser_account from the local mapping.
+# Otherwise omit --account consistently to use the runtime default.
+task_session="research-pricing-${task_uuid//-/}"
+agent-browser --session "$task_session" open https://example.com
 ```
 
-## Interactions (use @refs from snapshot)
+For a non-default profile, repeat the exact enrolled account handle on **every**
+command, including `close`. Use the local installed operator mapping, not an
+invented handle or an email guessed from the user's wording:
 
 ```bash
-agent-browser click @e1           # Click
-agent-browser click @e1 --new-tab # Click and open in new tab
-agent-browser dblclick @e1        # Double-click
-agent-browser focus @e1           # Focus element
-agent-browser fill @e2 "text"     # Clear and type
-agent-browser type @e2 "text"     # Type without clearing
-agent-browser press Enter         # Press key (alias: key)
-agent-browser press Control+a     # Key combination
-agent-browser keydown Shift       # Hold key down
-agent-browser keyup Shift         # Release key
-agent-browser hover @e1           # Hover
-agent-browser check @e1           # Check checkbox
-agent-browser uncheck @e1         # Uncheck checkbox
-agent-browser select @e1 "value"  # Select dropdown option
-agent-browser select @e1 "a" "b"  # Select multiple options
-agent-browser scroll down 500     # Scroll page (default: down 300px)
-agent-browser scrollintoview @e1  # Scroll element into view (alias: scrollinto)
-agent-browser drag @e1 @e2        # Drag and drop
-agent-browser upload @e1 file.pdf # Upload files
+IFS= read -r account_uuid </proc/sys/kernel/random/uuid
+: "${browser_account:?Set the requested alias from the local operator mapping}"
+account_session="account-pricing-${account_uuid//-/}"
+agent-browser --account "$browser_account" --session "$account_session" open https://example.com
+agent-browser --account "$browser_account" --session "$account_session" snapshot -i --compact
+agent-browser --account "$browser_account" --session "$account_session" close
 ```
 
-## Get Information
+For an explicitly invited current-tab session, repeat `--current-tab` as well:
 
 ```bash
-agent-browser get text @e1        # Get element text
-agent-browser get html @e1        # Get innerHTML
-agent-browser get value @e1       # Get input value
-agent-browser get attr @e1 href   # Get attribute
-agent-browser get title           # Get page title
-agent-browser get url             # Get current URL
-agent-browser get count ".item"   # Count matching elements
-agent-browser get box @e1         # Get bounding box
-agent-browser get styles @e1      # Get computed styles (font, color, bg, etc.)
+IFS= read -r current_tab_uuid </proc/sys/kernel/random/uuid
+current_tab_session="current-help-${current_tab_uuid//-/}"
+agent-browser --session "$current_tab_session" --current-tab get url
+agent-browser --session "$current_tab_session" --current-tab snapshot -i --compact
+agent-browser --session "$current_tab_session" --current-tab close
 ```
 
-## Check State
+Do not run two commands concurrently against the same session. Independent
+agents should use different semantic session names and may run concurrently,
+including in the same profile. The current broker cap is 16 total live sessions.
+
+## Core Page Commands
+
+Use fresh snapshot refs after navigation or a material DOM change:
 
 ```bash
-agent-browser is visible @e1      # Check if visible
-agent-browser is enabled @e1      # Check if enabled
-agent-browser is checked @e1      # Check if checked
+agent-browser --session "$task_session" snapshot -i --compact
+agent-browser --session "$task_session" snapshot -i --compact -s "#main"
+
+agent-browser --session "$task_session" click @e1
+agent-browser --session "$task_session" dblclick @e1
+agent-browser --session "$task_session" fill @e2 "text"
+agent-browser --session "$task_session" type @e2 "text"
+agent-browser --session "$task_session" press Enter
+agent-browser --session "$task_session" hover @e1
+agent-browser --session "$task_session" check @e3
+agent-browser --session "$task_session" uncheck @e3
+agent-browser --session "$task_session" select @e4 "value"
+agent-browser --session "$task_session" scroll down 500
+agent-browser --session "$task_session" scrollintoview @e5
+agent-browser --session "$task_session" drag @e5 @e6
+agent-browser --session "$task_session" upload @e7 'C:\path\file.pdf'
 ```
 
-## Screenshots and PDF
+The installed engine (`6612815`) supports caller-relative uploads. A scoped
+Chrome check verified the selected file's contents in 58 ms. Use only an
+explicitly authorized file that Windows Chrome can access; this does not grant
+arbitrary filesystem access or justify transferring files to bypass a failure.
+Preserve the current profile's file-access permission boundary.
+
+Never put a password, token, seed phrase, private key, wallet vault, or one-time
+code in a command. User-only secrets are entered by the user in the retained
+exact task tab.
+
+## Navigation, Observation, And Waits
 
 ```bash
-agent-browser screenshot          # Save to temporary directory
-agent-browser screenshot path.png # Save to specific path
-agent-browser screenshot --full   # Full page
-agent-browser pdf output.pdf      # Save as PDF
+agent-browser --session "$task_session" back
+agent-browser --session "$task_session" forward
+agent-browser --session "$task_session" reload
+
+agent-browser --session "$task_session" get text @e1
+agent-browser --session "$task_session" get html @e1
+agent-browser --session "$task_session" get value @e1
+agent-browser --session "$task_session" get attr @e1 href
+agent-browser --session "$task_session" get title
+agent-browser --session "$task_session" get url
+agent-browser --session "$task_session" get count ".item"
+agent-browser --session "$task_session" get box @e1
+agent-browser --session "$task_session" is visible @e1
+agent-browser --session "$task_session" is enabled @e1
+agent-browser --session "$task_session" is checked @e1
+
+agent-browser --session "$task_session" wait "#success"
+agent-browser --session "$task_session" wait --text "Success"
+agent-browser --session "$task_session" wait --url "**/dashboard"
+agent-browser --session "$task_session" wait --load networkidle
+agent-browser --session "$task_session" wait --fn "window.ready === true"
 ```
 
-## Video Recording
+Prefer an observable wait over arbitrary milliseconds. Selector waits use CSS,
+not `@ref`; this engine's wait path does not resolve snapshot references.
+
+## Locators, Screenshots, And Page Diagnostics
 
 ```bash
-agent-browser record start ./demo.webm    # Start recording
-agent-browser click @e1                   # Perform actions
-agent-browser record stop                 # Stop and save video
-agent-browser record restart ./take2.webm # Stop current + start new
+agent-browser --session "$task_session" find role button click --name "Submit"
+agent-browser --session "$task_session" find text "Sign In" click --exact
+agent-browser --session "$task_session" find label "Email" fill "user@example.com"
+agent-browser --session "$task_session" find placeholder "Search" fill "query"
+
+agent-browser --session "$task_session" screenshot "/tmp/${task_session}.png"
+agent-browser --session "$task_session" screenshot --full "/tmp/${task_session}-full.png"
+agent-browser --session "$task_session" console
+agent-browser --session "$task_session" errors
 ```
 
-## Wait
+### Structured Output
+
+Put output flags after the command, following the usual account/session prefix:
 
 ```bash
-agent-browser wait @e1                     # Wait for element
-agent-browser wait 2000                    # Wait milliseconds
-agent-browser wait --text "Success"        # Wait for text (or -t)
-agent-browser wait --url "**/dashboard"    # Wait for URL pattern (or -u)
-agent-browser wait --load networkidle      # Wait for network idle (or -l)
-agent-browser wait --fn "window.ready"     # Wait for JS condition (or -f)
+agent-browser --session "$task_session" snapshot -i --compact -s "#main" --json
 ```
 
-## Mouse Control
+Check `success` and any `error` before using `data`; command exit alone is not
+proof of the requested page result. Scope snapshots/observations first and use
+`--max-output` to bound serialized data. JSON alone does not make output small.
+For an explicit-account workflow, include the same `--account` used to open it.
+
+### Installed Functions
+
+Verified September 8, 2026: engine `6612815` is installed. The ordinary CLI,
+rollback and reapply passed real-Chrome checks. Use these functions through the
+normal command; the measurements below remain scoped to their tested cases.
+
+| Function | Syntax after the account/session prefix | Important boundary |
+| --- | --- | --- |
+| Full-page PNG | `screenshot --full "/tmp/full.png"` | Full document, including below the viewport |
+| Element PNG | `screenshot "#chart" "/tmp/chart.png"` | CSS selector, including a tall offscreen region |
+| JPEG | `screenshot "/tmp/view.jpg" --screenshot-format jpeg --screenshot-quality 80` | Choose format/quality explicitly |
+| Clear captured console | `console --clear` | Only this session's captured console buffer |
+| Clear captured errors | `errors --clear` | Preserves console and other owners; the old engine ignores this clear request |
+| Bounded JSON data | `snapshot -i --compact -s "#main" --json --max-output 4000` | Per-result serialized-character limit, not a total-byte limit |
+| Caller-relative upload | `upload @e7 "./approved-file.txt"` | Only an authorized file; existing upload/path protections still apply |
+
+Oversized JSON data may be omitted with a warning while action status and
+control identifiers survive. Missing output does **not** mean an action failed.
+Never repeat a click, upload, or submission to recover omitted output; make a
+smaller read-only observation instead. Read needed diagnostics before clearing
+their buffers.
+
+Candidate captures observed viewport PNG 201 ms, full-page PNG 731 ms, selector
+PNG 579 ms, and quality-80 JPEG 589–694 ms. These are individual local results,
+not universal speed promises or proof of every later engine/extension pairing.
+Use ordinary viewport capture on the current installation when sufficient.
+
+### User-Only Input
+
+With the user's permission at a genuine input boundary, bring only your existing
+task tab forward:
 
 ```bash
-agent-browser mouse move 100 200      # Move mouse
-agent-browser mouse down left         # Press button
-agent-browser mouse up left           # Release button
-agent-browser mouse wheel 100         # Scroll wheel
+: "${browser_account:?Set the requested alias from the local operator mapping}"
+: "${task_session:?Reuse the session already opened for this task}"
+agent-browser --account "$browser_account" --session "$task_session" foreground --input-boundary two-factor
+# After the user finishes, repeat this command's exact account/session/current-tab prefix:
+agent-browser --account "$browser_account" --session "$task_session" background
 ```
 
-## Semantic Locators (alternative to refs)
+If this is an invited current-tab session, repeat `--current-tab` on both
+commands too. Allowed boundary values:
+`password`, `two-factor`, `hardware-key`, `captcha`, `file-picker`, `recovery`,
+`account-authority`. This wrapper command already returns JSON; do not append
+engine flags. It does not create a tab or retry an interrupted activation.
+`background` is conditional: it restores the saved prior app or tab only while
+the owner-bound handoff's focus history remains unchanged. `cancelled`, `denied`,
+`unconfirmed`, or `no-handoff` does not promise where focus is. Do not retry or
+force focus.
+
+Multiple explicitly invited agents can use `--current-tab` with their own
+sessions to share one user tab. Complete commands are serialized there;
+matching `close` detaches each agent without closing that user tab.
+
+Use `eval` only for a page-local observation/action that normal commands cannot
+express. It must never bypass profile, extension, cookie, wallet, tab-ownership,
+focus, or command restrictions.
+
+## Tabs And Cleanup
 
 ```bash
-agent-browser find role button click --name "Submit"
-agent-browser find text "Sign In" click
-agent-browser find text "Sign In" click --exact      # Exact match only
-agent-browser find label "Email" fill "user@test.com"
-agent-browser find placeholder "Search" type "query"
-agent-browser find alt "Logo" click
-agent-browser find title "Close" click
-agent-browser find testid "submit-btn" click
-agent-browser find first ".item" click
-agent-browser find last ".item" click
-agent-browser find nth 2 "a" hover
+agent-browser --session "$task_session" tab list
+agent-browser --session "$task_session" close
 ```
 
-## Browser Settings
+Only `tab list` is supported; it shows this session's synthetic page entry, not
+all Chrome tabs. The private route rejects tab creation, switching,
+or closing by mutable index. Page-created opener descendants stay within their
+owning session and the matching session `close` retires them. A current-tab
+session detaches without closing the user's tab. `close --all` is rejected.
 
-```bash
-agent-browser set viewport 1920 1080          # Set viewport size
-agent-browser set device "iPhone 14"          # Emulate device
-agent-browser set geo 37.7749 -122.4194       # Set geolocation (alias: geolocation)
-agent-browser set offline on                  # Toggle offline mode
-agent-browser set headers '{"X-Key":"v"}'     # Extra HTTP headers
-agent-browser set credentials user pass       # HTTP basic auth (alias: auth)
-agent-browser set media dark                  # Emulate color scheme
-agent-browser set media light reduced-motion  # Light mode + reduced motion
-```
+## Intentionally Rejected Surface
 
-## Cookies and Storage
+The wrapper rejects these commands: `auth`, `chat`, `clipboard`, `connect`,
+`cookies`, `dashboard`, `inspect`, `install`, `mcp`, `plugin`, `profiles`,
+`storage`, and `upgrade`. It also rejects alternate provider/CDP/profile/state,
+restore, extension, config, namespace, headed, engine, executable, proxy,
+certificate, unrestricted-file, action-policy, and idle-timeout controls.
 
-```bash
-agent-browser cookies                     # Get all cookies
-agent-browser cookies set name value      # Set cookie
-agent-browser cookies clear               # Clear cookies
-agent-browser storage local               # Get all localStorage
-agent-browser storage local key           # Get specific key
-agent-browser storage local set k v       # Set value
-agent-browser storage local clear         # Clear all
-```
+The page capability denies `Target.*`, `WebMCP.*`, cookie CDP methods,
+`Page.bringToFront`, and `Page.setDownloadBehavior`. Therefore do not use legacy
+`window`, trace/profiler, WebMCP, direct-download, donor focus, or profile/state
+examples from the standalone donor documentation. Browser-internal and extension
+URLs are outside the ordinary HTTP(S) task route.
 
-## Network
-
-```bash
-agent-browser network route <url>              # Intercept requests
-agent-browser network route <url> --abort      # Block requests
-agent-browser network route <url> --body '{}'  # Mock response
-agent-browser network unroute [url]            # Remove routes
-agent-browser network requests                 # View tracked requests
-agent-browser network requests --filter api    # Filter requests
-```
-
-## Tabs and Windows
-
-```bash
-agent-browser tab                 # List tabs
-agent-browser tab new [url]       # New tab
-agent-browser tab 2               # Switch to tab by index
-agent-browser tab close           # Close current tab
-agent-browser tab close 2         # Close tab by index
-agent-browser window new          # New window
-```
-
-## Frames
-
-```bash
-agent-browser frame "#iframe"     # Switch to iframe
-agent-browser frame main          # Back to main frame
-```
-
-## Dialogs
-
-```bash
-agent-browser dialog accept [text]  # Accept dialog
-agent-browser dialog dismiss        # Dismiss dialog
-```
-
-## JavaScript
-
-```bash
-agent-browser eval "document.title"          # Simple expressions only
-agent-browser eval -b "<base64>"             # Any JavaScript (base64 encoded)
-agent-browser eval --stdin                   # Read script from stdin
-```
-
-Use `-b`/`--base64` or `--stdin` for reliable execution. Shell escaping with nested quotes and special characters is error-prone.
-
-```bash
-# Base64 encode your script, then:
-agent-browser eval -b "ZG9jdW1lbnQucXVlcnlTZWxlY3RvcignW3NyYyo9Il9uZXh0Il0nKQ=="
-
-# Or use stdin with heredoc for multiline scripts:
-cat <<'EOF' | agent-browser eval --stdin
-const links = document.querySelectorAll('a');
-Array.from(links).map(a => a.href);
-EOF
-```
-
-## State Management
-
-```bash
-agent-browser state save auth.json    # Save cookies, storage, auth state
-agent-browser state load auth.json    # Restore saved state
-```
-
-## Global Options
-
-```bash
-agent-browser --session <name> ...    # Isolated browser session
-agent-browser --json ...              # JSON output for parsing
-agent-browser --headed ...            # Show browser window (not headless)
-agent-browser --full ...              # Full page screenshot (-f)
-agent-browser --cdp <port> ...        # Connect via Chrome DevTools Protocol
-agent-browser -p <provider> ...       # Cloud browser provider (--provider)
-agent-browser --proxy <url> ...       # Use proxy server
-agent-browser --proxy-bypass <hosts>  # Hosts to bypass proxy
-agent-browser --headers <json> ...    # HTTP headers scoped to URL's origin
-agent-browser --executable-path <p>   # Custom browser executable
-agent-browser --extension <path> ...  # Load browser extension (repeatable)
-agent-browser --ignore-https-errors   # Ignore SSL certificate errors
-agent-browser --help                  # Show help (-h)
-agent-browser --version               # Show version (-V)
-agent-browser <command> --help        # Show detailed help for a command
-```
-
-## Debugging
-
-```bash
-agent-browser --headed open example.com   # Show browser window
-agent-browser --cdp 9222 snapshot         # Connect via CDP port
-agent-browser connect 9222                # Alternative: connect command
-agent-browser console                     # View console messages
-agent-browser console --clear             # Clear console
-agent-browser errors                      # View page errors
-agent-browser errors --clear              # Clear errors
-agent-browser highlight @e1               # Highlight element
-agent-browser trace start                 # Start recording trace
-agent-browser trace stop trace.zip        # Stop and save trace
-agent-browser profiler start              # Start Chrome DevTools profiling
-agent-browser profiler stop trace.json    # Stop and save profile
-```
-
-## Environment Variables
-
-```bash
-AGENT_BROWSER_SESSION="mysession"            # Default session name
-AGENT_BROWSER_EXECUTABLE_PATH="/path/chrome" # Custom browser path
-AGENT_BROWSER_EXTENSIONS="/ext1,/ext2"       # Comma-separated extension paths
-AGENT_BROWSER_PROVIDER="browserbase"         # Cloud browser provider
-AGENT_BROWSER_STREAM_PORT="9223"             # WebSocket streaming port
-AGENT_BROWSER_HOME="/path/to/agent-browser"  # Custom install location
-```
+If a needed command is not documented here, inspect the shipped source to
+check the exact wrapper parser, donor dispatch, and page-capability
+contract before running it. Do not probe the live browser by guessing commands.

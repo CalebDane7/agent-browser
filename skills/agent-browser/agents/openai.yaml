@@ -1,0 +1,6 @@
+interface:
+  display_name: "Authenticated Windows Chrome"
+  short_description: "Parallel owned tabs in the user's signed-in Chrome"
+  default_prompt: "Use $agent-browser in my signed-in Windows Chrome. Before the first action, split independent browser work across multiple agents with uniquely named owned tabs whenever that materially reduces wall time; keep normal task tabs inactive, use my current tab only when I explicitly ask, and close every task session."
+policy:
+  allow_implicit_invocation: true

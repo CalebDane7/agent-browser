@@ -1,0 +1,140 @@
+diff --git a/cli/src/native/screenshot.rs b/cli/src/native/screenshot.rs
+--- a/cli/src/native/screenshot.rs
++++ b/cli/src/native/screenshot.rs
+@@ -192,32 +192,12 @@
+             .send_command_no_params("Page.getLayoutMetrics", Some(session_id))
+             .await?;
+ 
+-        let content_size = metrics
+-            .get("contentSize")
+-            .or_else(|| metrics.get("cssContentSize"));
+-        if let Some(size) = content_size {
+-            let width = size.get("width").and_then(|v| v.as_f64()).unwrap_or(1280.0);
+-            let height = size.get("height").and_then(|v| v.as_f64()).unwrap_or(720.0);
+-
+-            params.clip = Some(Viewport {
+-                x: 0.0,
+-                y: 0.0,
+-                width,
+-                height,
+-                scale: 1.0,
+-            });
+-        }
++        params.clip = full_page_clip(&metrics);
+     } else if let Some(ref selector) = options.selector {
+         if let Some(rect) =
+             get_rect_for_selector(client, session_id, ref_map, selector, iframe_sessions).await?
+         {
+-            params.clip = Some(Viewport {
+-                x: rect.x,
+-                y: rect.y,
+-                width: rect.width,
+-                height: rect.height,
+-                scale: 1.0,
+-            });
++            set_selector_clip(&mut params, &rect);
+         }
+     }
+ 
+@@ -228,6 +208,37 @@
+     Ok(result.data)
+ }
+ 
++fn set_selector_clip(params: &mut CaptureScreenshotParams, rect: &Rect) {
++    params.clip = Some(Viewport {
++        x: rect.x,
++        y: rect.y,
++        width: rect.width,
++        height: rect.height,
++        scale: 1.0,
++    });
++    // captureBeyondViewport defaults to false. A tall selector then produced
++    // the right PNG dimensions but blank pixels below the visible viewport.
++    // Enable it only after resolving the exact clip; no scroll or resize is needed.
++    params.capture_beyond_viewport = Some(true);
++}
++
++fn full_page_clip(metrics: &Value) -> Option<Viewport> {
++    // Screenshot clips use device-independent coordinates. Deprecated
++    // contentSize is device-scaled: preferring it applied DPR twice and padded
++    // a 1428x2400 CSS document to a 4500x7562 PNG at DPR 1.775. Prefer CSS
++    // dimensions, retaining the legacy fallback only when CSS metrics are absent.
++    let size = metrics
++        .get("cssContentSize")
++        .or_else(|| metrics.get("contentSize"))?;
++    Some(Viewport {
++        x: 0.0,
++        y: 0.0,
++        width: size.get("width").and_then(|v| v.as_f64()).unwrap_or(1280.0),
++        height: size.get("height").and_then(|v| v.as_f64()).unwrap_or(720.0),
++        scale: 1.0,
++    })
++}
++
+ async fn collect_annotations(
+     client: &CdpClient,
+     session_id: &str,
+@@ -602,6 +613,63 @@
+     use super::*;
+ 
+     #[test]
++    fn selector_clip_captures_beyond_viewport_without_expanding_region() {
++        let mut params = CaptureScreenshotParams {
++            format: Some("png".to_string()),
++            quality: None,
++            clip: None,
++            from_surface: Some(true),
++            capture_beyond_viewport: None,
++        };
++        set_selector_clip(
++            &mut params,
++            &Rect {
++                x: 12.0,
++                y: 30.0,
++                width: 866.0,
++                height: 2400.0,
++            },
++        );
++        assert_eq!(
++            serde_json::to_value(params).unwrap(),
++            serde_json::json!({
++                "format": "png",
++                "fromSurface": true,
++                "captureBeyondViewport": true,
++                "clip": {
++                    "x": 12.0, "y": 30.0, "width": 866.0, "height": 2400.0, "scale": 1.0
++                }
++            })
++        );
++    }
++
++    #[test]
++    fn full_page_clip_prefers_css_metrics_over_device_pixels() {
++        let metrics = serde_json::json!({
++            "contentSize": {"x": 0, "y": 0, "width": 2535, "height": 4260},
++            "cssContentSize": {"x": 0, "y": 0, "width": 1428, "height": 2400}
++        });
++        let clip = full_page_clip(&metrics).unwrap();
++        assert_eq!(
++            serde_json::to_value(clip).unwrap(),
++            serde_json::json!({
++                "x": 0.0, "y": 0.0, "width": 1428.0, "height": 2400.0, "scale": 1.0
++            })
++        );
++    }
++
++    #[test]
++    fn full_page_clip_retains_legacy_fallback() {
++        let metrics = serde_json::json!({
++            "contentSize": {"width": 640, "height": 960}
++        });
++        let clip = full_page_clip(&metrics).unwrap();
++        assert_eq!(clip.width, 640.0);
++        assert_eq!(clip.height, 960.0);
++        assert!(full_page_clip(&serde_json::json!({})).is_none());
++    }
++
++    #[test]
+     fn filters_annotations_to_target_overlap() {
+         let annotations = vec![
+             RawAnnotation {

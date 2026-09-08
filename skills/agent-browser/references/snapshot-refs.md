@@ -1,194 +1,102 @@
-# Snapshot and Refs
+# Snapshot And Refs
 
-Compact element references that reduce context usage dramatically for AI agents.
+Snapshots expose compact element references so agents can interact without
+dumping the page DOM. Every example below uses one generated, globally unique
+session. Keep that variable in the same shell for the whole workflow. For a
+non-default profile, repeat its `--account` on every command; for a user-invited
+current tab, repeat `--current-tab` too.
 
-**Related**: [commands.md](commands.md) for full command reference, [SKILL.md](../SKILL.md) for quick start.
-
-## Contents
-
-- [How Refs Work](#how-refs-work)
-- [Snapshot Command](#the-snapshot-command)
-- [Using Refs](#using-refs)
-- [Ref Lifecycle](#ref-lifecycle)
-- [Best Practices](#best-practices)
-- [Ref Notation Details](#ref-notation-details)
-- [Troubleshooting](#troubleshooting)
-
-## How Refs Work
-
-Traditional approach:
-```
-Full DOM/HTML → AI parses → CSS selector → Action (~3000-5000 tokens)
-```
-
-agent-browser approach:
-```
-Compact snapshot → @refs assigned → Direct interaction (~200-400 tokens)
-```
-
-## The Snapshot Command
+## Fast Loop
 
 ```bash
-# Basic snapshot (shows page structure)
-agent-browser snapshot
-
-# Interactive snapshot (-i flag) - RECOMMENDED
-agent-browser snapshot -i
+IFS= read -r snapshot_uuid </proc/sys/kernel/random/uuid
+snapshot_session="snapshot-example-${snapshot_uuid//-/}"
+agent-browser --session "$snapshot_session" open https://example.com
+agent-browser --session "$snapshot_session" snapshot -i --compact
+# act with the returned refs
 ```
 
-### Snapshot Output Format
+Prefer `-i --compact` first. Use a full snapshot only when structural context is
+actually needed.
 
-```
-Page: Example Site - Home
-URL: https://example.com
+## Ref Shape
 
-@e1 [header]
-  @e2 [nav]
-    @e3 [a] "Home"
-    @e4 [a] "Products"
-    @e5 [a] "About"
-  @e6 [button] "Sign In"
+Typical output:
 
-@e7 [main]
-  @e8 [h1] "Welcome"
-  @e9 [form]
-    @e10 [input type="email"] placeholder="Email"
-    @e11 [input type="password"] placeholder="Password"
-    @e12 [button type="submit"] "Log In"
-
-@e13 [footer]
-  @e14 [a] "Privacy Policy"
+```text
+@e1 [heading] "Account settings"
+@e2 [textbox] "Display name"
+@e3 [button] "Save"
 ```
 
-## Using Refs
-
-Once you have refs, interact directly:
+Use the ref in the same session that produced it:
 
 ```bash
-# Click the "Sign In" button
-agent-browser click @e6
-
-# Fill email input
-agent-browser fill @e10 "user@example.com"
-
-# Fill password
-agent-browser fill @e11 "password123"
-
-# Submit the form
-agent-browser click @e12
+agent-browser --session "$snapshot_session" fill @e2 "New name"
+agent-browser --session "$snapshot_session" click @e3
 ```
 
-## Ref Lifecycle
+Refs are session- and page-state-specific. Never copy one between agents,
+sessions, or tabs. Every snapshot replaces the session's ref map, including a
+scoped snapshot. Use only refs from the latest successful snapshot.
 
-**IMPORTANT**: Refs are invalidated when the page changes!
+## Lifecycle
+
+Re-snapshot after navigation, reload, save, dialog, or a material DOM change
+before using another ref:
 
 ```bash
-# Get initial snapshot
-agent-browser snapshot -i
-# @e1 [button] "Next"
-
-# Click triggers page change
-agent-browser click @e1
-
-# MUST re-snapshot to get new refs!
-agent-browser snapshot -i
-# @e1 [h1] "Page 2"  ← Different element now!
+agent-browser --session "$snapshot_session" snapshot -i --compact
+agent-browser --session "$snapshot_session" click @e1
+agent-browser --session "$snapshot_session" wait --url "**/next"
+agent-browser --session "$snapshot_session" snapshot -i --compact
 ```
 
-## Best Practices
+Do not re-snapshot after every keystroke when the page did not materially change.
 
-### 1. Always Snapshot Before Interacting
+## Scope Output
+
+Limit large pages to the relevant container:
 
 ```bash
-# CORRECT
-agent-browser open https://example.com
-agent-browser snapshot -i          # Get refs first
-agent-browser click @e1            # Use ref
-
-# WRONG
-agent-browser open https://example.com
-agent-browser click @e1            # Ref doesn't exist yet!
+agent-browser --session "$snapshot_session" snapshot -i --compact -s "#settings"
+# If that snapshot returns the desired element as [ref=e9]:
+agent-browser --session "$snapshot_session" get text @e9
 ```
 
-### 2. Re-Snapshot After Navigation
+Snapshot `-s` accepts CSS only, never an `@ref`. A scoped snapshot replaces the
+previous ref map; it does not add refs to it.
 
-```bash
-agent-browser click @e5            # Navigates to new page
-agent-browser snapshot -i          # Get new refs
-agent-browser click @e1            # Use new refs
-```
+Avoid `get text body` unless the whole body is genuinely the requested evidence.
 
-### 3. Re-Snapshot After Dynamic Changes
-
-```bash
-agent-browser click @e1            # Opens dropdown
-agent-browser snapshot -i          # See dropdown items
-agent-browser click @e7            # Select item
-```
-
-### 4. Snapshot Specific Regions
-
-For complex pages, snapshot specific areas:
-
-```bash
-# Snapshot just the form
-agent-browser snapshot @e9
-```
-
-## Ref Notation Details
-
-```
-@e1 [tag type="value"] "text content" placeholder="hint"
-│    │   │             │               │
-│    │   │             │               └─ Additional attributes
-│    │   │             └─ Visible text
-│    │   └─ Key attributes shown
-│    └─ HTML tag name
-└─ Unique ref ID
-```
-
-### Common Patterns
-
-```
-@e1 [button] "Submit"                    # Button with text
-@e2 [input type="email"]                 # Email input
-@e3 [input type="password"]              # Password input
-@e4 [a href="/page"] "Link Text"         # Anchor link
-@e5 [select]                             # Dropdown
-@e6 [textarea] placeholder="Message"     # Text area
-@e7 [div class="modal"]                  # Container (when relevant)
-@e8 [img alt="Logo"]                     # Image
-@e9 [checkbox] checked                   # Checked checkbox
-@e10 [radio] selected                    # Selected radio
-```
+Scoped `snapshot -s` still obtains Chrome's full accessibility tree through the
+normal CDP protocol carried by the enrolled extension, then filters it in the
+engine. For one narrow fact, a CSS-specific `get` or `is` transfers less data
+and is usually cheaper. After a size failure, do not repeat the unchanged
+snapshot or bypass the wrapper with raw CDP.
 
 ## Troubleshooting
 
-### "Ref not found" Error
+For `ref not found`, first ask whether the page changed. If yes, take one fresh
+snapshot. If the control is outside the current viewport or appears
+asynchronously, use an observable wait or scroll, then snapshot once:
 
 ```bash
-# Ref may have changed - re-snapshot
-agent-browser snapshot -i
+agent-browser --session "$snapshot_session" wait --text "Continue"
+agent-browser --session "$snapshot_session" snapshot -i --compact
+
+agent-browser --session "$snapshot_session" scroll down 800
+agent-browser --session "$snapshot_session" snapshot -i --compact
 ```
 
-### Element Not Visible in Snapshot
+If one fresh snapshot still cannot expose the control, use a semantic locator or
+one scoped page-local observation. Do not repeat snapshots, switch tabs by index,
+or use `eval` to bypass ownership, account, wallet, or secret-state protections.
+
+Close the same generated session promptly on success, failure, or cancellation,
+unless its exact tab is still in active collaboration with the user or awaits
+genuine user-only input:
 
 ```bash
-# Scroll down to reveal element
-agent-browser scroll down 1000
-agent-browser snapshot -i
-
-# Or wait for dynamic content
-agent-browser wait 1000
-agent-browser snapshot -i
-```
-
-### Too Many Elements
-
-```bash
-# Snapshot specific container
-agent-browser snapshot @e5
-
-# Or use get text for content-only extraction
-agent-browser get text @e5
+agent-browser --session "$snapshot_session" close
 ```

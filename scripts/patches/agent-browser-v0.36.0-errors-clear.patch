@@ -1,0 +1,64 @@
+diff --git a/cli/src/native/actions.rs b/cli/src/native/actions.rs
+--- a/cli/src/native/actions.rs
++++ b/cli/src/native/actions.rs
+@@ -2690,7 +2690,7 @@
+         "headers" => handle_headers(cmd, state).await,
+         "offline" => handle_offline(cmd, state).await,
+         "console" => handle_console(cmd, state).await,
+-        "errors" => handle_errors(state).await,
++        "errors" => handle_errors(cmd, state).await,
+         "session_info" => handle_session_info(state).await,
+         "state_save" => handle_state_save(cmd, state).await,
+         "state_load" => handle_state_load(cmd, state).await,
+@@ -6209,8 +6209,16 @@
+     }
+ }
+ 
+-async fn handle_errors(state: &DaemonState) -> Result<Value, String> {
+-    Ok(state.event_tracker.get_errors_json())
++async fn handle_errors(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
++    // WHY: the CLI already parses and documents errors --clear, but dropping
++    // its command here silently returned the old errors. Clear only this
++    // daemon's error buffer; console entries and other owners must survive.
++    if cmd.get("clear").and_then(Value::as_bool).unwrap_or(false) {
++        state.event_tracker.error_entries.clear();
++        Ok(json!({ "cleared": true }))
++    } else {
++        Ok(state.event_tracker.get_errors_json())
++    }
+ }
+ 
+ async fn handle_session_info(state: &DaemonState) -> Result<Value, String> {
+@@ -12029,6 +12037,32 @@
+     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+     use tokio::net::TcpListener;
+ 
++    #[tokio::test]
++    async fn errors_clear_preserves_console_and_neighbor_errors() {
++        let mut own = DaemonState::new();
++        let mut neighbor = DaemonState::new();
++        own.event_tracker.add_error("own-error", None, None, None);
++        own.event_tracker.add_console("log", "own-console", vec![]);
++        neighbor.event_tracker.add_error("neighbor-error", None, None, None);
++
++        let before = handle_errors(&json!({ "clear": false }), &mut own)
++            .await.unwrap();
++        assert_eq!(before["errors"][0]["text"], "own-error");
++        assert_eq!(own.event_tracker.error_entries.len(), 1);
++        let cleared = handle_errors(&json!({ "clear": true }), &mut own)
++            .await.unwrap();
++        assert_eq!(cleared, json!({ "cleared": true }));
++        assert!(own.event_tracker.error_entries.is_empty());
++        assert_eq!(own.event_tracker.console_entries.len(), 1);
++        assert_eq!(neighbor.event_tracker.error_entries[0].text, "neighbor-error");
++        let after = handle_errors(&json!({}), &mut own).await.unwrap();
++        assert_eq!(after, json!({ "errors": [] }));
++        assert_eq!(
++            handle_errors(&json!({ "clear": true }), &mut own).await.unwrap(),
++            json!({ "cleared": true }),
++        );
++    }
++
+     /// A binding-recovery failure must tear the connection down: the attach
+     /// paths set `state.browser` before calling this, so returning the error
+     /// alone would let the next command skip the attach path and act on

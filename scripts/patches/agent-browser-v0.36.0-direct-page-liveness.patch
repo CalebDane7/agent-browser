@@ -1,0 +1,44 @@
+diff --git a/cli/src/native/browser.rs b/cli/src/native/browser.rs
+index 798ee5c..9fc143f 100644
+--- a/cli/src/native/browser.rs
++++ b/cli/src/native/browser.rs
+@@ -448,6 +448,17 @@ const LIGHTPANDA_CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+ const LIGHTPANDA_CDP_CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+ const LIGHTPANDA_TARGET_INIT_TIMEOUT: Duration = Duration::from_secs(10);
+ 
++fn liveness_method(direct_page: bool) -> &'static str {
++    // A direct-page transport can expose Page without Browser (for example,
++    // chrome.debugger). Browser.getVersion would misclassify that healthy
++    // connection as dead and trigger a destructive provider close/relaunch.
++    if direct_page {
++        "Page.getFrameTree"
++    } else {
++        "Browser.getVersion"
++    }
++}
++
+ impl BrowserManager {
+     /// True when a *default* idle timeout must not close this browser:
+     /// a headed window may be in direct human use outside the daemon's socket
+@@ -1320,7 +1331,7 @@ impl BrowserManager {
+         let result = tokio::time::timeout(
+             timeout,
+             self.client
+-                .send_command_no_params("Browser.getVersion", None),
++                .send_command_no_params(liveness_method(self.direct_page), None),
+         )
+         .await;
+ 
+@@ -2431,6 +2442,12 @@ mod tests {
+     use super::*;
+     use tokio::time::sleep;
+ 
++    #[test]
++    fn test_liveness_method_matches_connection_scope() {
++        assert_eq!(liveness_method(true), "Page.getFrameTree");
++        assert_eq!(liveness_method(false), "Browser.getVersion");
++    }
++
+     #[test]
+     fn test_format_tab_id() {
+         assert_eq!(format_tab_id(1), "t1");

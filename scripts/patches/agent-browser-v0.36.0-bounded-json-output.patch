@@ -1,0 +1,642 @@
+diff --git a/cli/src/output.rs b/cli/src/output.rs
+--- a/cli/src/output.rs
++++ b/cli/src/output.rs
+@@ -58,6 +58,236 @@
+     }
+ }
+ 
++pub fn bounded_json_text(content: &str, max: Option<usize>) -> String {
++    let Some(limit) = max else {
++        return content.to_string();
++    };
++    let Some(offset) = content.char_indices().nth(limit).map(|(offset, _)| offset) else {
++        return content.to_string();
++    };
++    format!(
++        "{}\n[truncated: showing {} of {} chars]",
++        &content[..offset],
++        limit,
++        content.chars().count()
++    )
++}
++
++fn is_confirm_wrapper(data: &serde_json::Value) -> bool {
++    data.get("confirmed").and_then(|value| value.as_bool()) == Some(true)
++        && data
++            .get("action")
++            .and_then(|value| value.as_str())
++            .is_some()
++        && data
++            .get("result")
++            .and_then(|result| result.get("success"))
++            .and_then(|value| value.as_bool())
++            .is_some()
++}
++
++fn retained_control_data(
++    data: &serde_json::Value,
++    action: Option<&str>,
++    code: Option<&str>,
++    limit: usize,
++) -> serde_json::Value {
++    let mut retained = serde_json::Map::new();
++    // Native inject_lifecycle owns this top-level field. Eval application data
++    // lives below result and must never be traversed as lifecycle authority.
++    if let Some(lifecycle) = data.get("lifecycle").filter(|value| value.is_object()) {
++        retained.insert("lifecycle".to_string(), lifecycle.clone());
++    }
++    if data
++        .get("confirmation_required")
++        .and_then(|value| value.as_bool())
++        == Some(true)
++    {
++        // The pending-action producers return success:true before executing.
++        // These exact prompt/control fields must survive even --max-output 0.
++        for key in [
++            "confirmation_required",
++            "action",
++            "category",
++            "description",
++            "confirmation_id",
++        ] {
++            if let Some(value) = data.get(key) {
++                retained.insert(key.to_string(), value.clone());
++            }
++        }
++    }
++    if code == Some("tab_gone") {
++        for key in ["targetId", "lastUrl"] {
++            if let Some(value) = data.get(key).filter(|value| value.is_string()) {
++                retained.insert(key.to_string(), value.clone());
++            }
++        }
++    }
++    if action == Some("deny") && data.get("denied").and_then(|value| value.as_bool()) == Some(true)
++    {
++        for key in ["denied", "action"] {
++            if let Some(value) = data.get(key) {
++                retained.insert(key.to_string(), value.clone());
++            }
++        }
++    }
++    if action == Some("confirm") && is_confirm_wrapper(data) {
++        // handle_confirm wraps execute_command's real Response. Outer success
++        // can coexist with nested failure or a second pending confirmation.
++        // Walk only this producer's result.data envelope, never arbitrary eval.
++        retained.insert("confirmed".to_string(), data["confirmed"].clone());
++        retained.insert("action".to_string(), data["action"].clone());
++        let result = &data["result"];
++        let mut nested = serde_json::Map::new();
++        for key in ["id", "success", "code"] {
++            if let Some(value) = result.get(key) {
++                nested.insert(key.to_string(), value.clone());
++            }
++        }
++        for key in ["error", "warning"] {
++            if let Some(value) = result.get(key) {
++                nested.insert(
++                    key.to_string(),
++                    value.as_str().map_or_else(
++                        || value.clone(),
++                        |text| serde_json::Value::String(bounded_json_text(text, Some(limit))),
++                    ),
++                );
++            }
++        }
++        if let Some(nested_data) = result.get("data") {
++            let nested_action = if is_confirm_wrapper(nested_data) {
++                Some("confirm")
++            } else if nested_data.get("denied").and_then(|value| value.as_bool()) == Some(true) {
++                Some("deny")
++            } else {
++                None
++            };
++            nested.insert(
++                "data".to_string(),
++                retained_control_data(
++                    nested_data,
++                    nested_action,
++                    result.get("code").and_then(|value| value.as_str()),
++                    limit,
++                ),
++            );
++        }
++        retained.insert("result".to_string(), serde_json::Value::Object(nested));
++    }
++    if retained.is_empty() {
++        serde_json::Value::Null
++    } else {
++        serde_json::Value::Object(retained)
++    }
++}
++
++pub fn bounded_json_response(
++    resp: &Response,
++    action: Option<&str>,
++    max: Option<usize>,
++) -> Option<Response> {
++    let limit = max?;
++    let mut data = resp.data.clone();
++    let mut omitted = false;
++    if let Some(original) = resp.data.as_ref() {
++        let serialized = serde_json::to_string(original).unwrap_or_default();
++        if serialized.chars().count() > limit {
++            let retained = retained_control_data(original, action, resp.code.as_deref(), limit);
++            if retained != *original {
++                omitted = true;
++                data = if retained.is_null() {
++                    None
++                } else {
++                    Some(retained)
++                };
++            }
++        }
++    }
++    let error = resp
++        .error
++        .as_deref()
++        .map(|text| bounded_json_text(text, max));
++    let mut warning = resp
++        .warning
++        .as_deref()
++        .map(|text| bounded_json_text(text, max));
++    if omitted {
++        let notice = "Result content omitted or truncated by --max-output; action status and control identifiers are unchanged. Do not repeat actions to retrieve omitted output.";
++        warning = Some(match warning {
++            Some(previous) => format!("{}\n{}", previous, notice),
++            None => notice.to_string(),
++        });
++    }
++    if !omitted && error == resp.error && warning == resp.warning {
++        return None;
++    }
++    // WHY: JSON formerly bypassed max_output. Whole-result omission avoids
++    // forging truncated refs/URLs/application values while retaining the actual
++    // operation status; formatter loss must never become a retryable action error.
++    // This is a per-result serialized-character cap, not a total-byte cap.
++    // Existing control fields, IDs/URLs, boundaries and loss notices are overhead
++    // outside it; a batch still has one outcome/command envelope per command.
++    Some(Response {
++        success: resp.success,
++        data,
++        error,
++        code: resp.code.clone(),
++        warning,
++    })
++}
++
++fn format_json_response(resp: &Response, action: Option<&str>, opts: &OutputOptions) -> String {
++    let limited = bounded_json_response(resp, action, opts.max_output);
++    let rendered = limited.as_ref().unwrap_or(resp);
++    if opts.content_boundaries {
++        let mut value = serde_json::to_value(rendered).unwrap_or_default();
++        if let Some(obj) = value.as_object_mut() {
++            // The source origin describes the original response even when its
++            // payload is omitted; never derive a fabricated/truncated URL.
++            let origin = resp
++                .data
++                .as_ref()
++                .and_then(boundary_origin)
++                .unwrap_or("unknown");
++            obj.insert(
++                "_boundary".to_string(),
++                serde_json::json!({ "nonce": get_boundary_nonce(), "origin": origin }),
++            );
++        }
++        serde_json::to_string(&value).unwrap_or_default()
++    } else {
++        // Preserve the original Response field ordering, including with no cap.
++        serde_json::to_string(rendered).unwrap_or_default()
++    }
++}
++
++pub fn format_batch_json_response(
++    resp: &Response,
++    command: &[String],
++    action: Option<&str>,
++    opts: &OutputOptions,
++) -> serde_json::Value {
++    let limited = bounded_json_response(resp, action, opts.max_output);
++    let rendered = limited.as_ref().unwrap_or(resp);
++    let mut result = serde_json::json!({
++        "command": command,
++        "success": rendered.success,
++        "result": rendered.data,
++        "error": rendered.error,
++    });
++    // Keep the existing batch schema, optional code/warning, command identity,
++    // and action-based bail/exit decisions. This does not cap the entire array.
++    if let Some(code) = rendered.code.as_ref() {
++        result["code"] = serde_json::json!(code);
++    }
++    if let Some(warning) = rendered.warning.as_ref() {
++        result["warning"] = serde_json::json!(warning);
++    }
++    result
++}
++
+ fn format_with_boundaries(content: &str, origin: Option<&str>, opts: &OutputOptions) -> String {
+     let content = truncate_if_needed(content, opts.max_output);
+     if opts.content_boundaries {
+@@ -435,26 +665,7 @@
+ 
+ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &OutputOptions) {
+     if opts.json {
+-        if opts.content_boundaries {
+-            let mut json_val = serde_json::to_value(resp).unwrap_or_default();
+-            if let Some(obj) = json_val.as_object_mut() {
+-                let nonce = get_boundary_nonce();
+-                let origin = obj
+-                    .get("data")
+-                    .and_then(boundary_origin)
+-                    .unwrap_or("unknown");
+-                obj.insert(
+-                    "_boundary".to_string(),
+-                    serde_json::json!({
+-                        "nonce": nonce,
+-                        "origin": origin,
+-                    }),
+-                );
+-            }
+-            println!("{}", serde_json::to_string(&json_val).unwrap_or_default());
+-        } else {
+-            println!("{}", serde_json::to_string(resp).unwrap_or_default());
+-        }
++        println!("{}", format_json_response(resp, action, opts));
+         // JSON mode includes the warning field in the JSON payload already
+         return;
+     }
+@@ -4078,11 +4289,246 @@
+ #[cfg(test)]
+ mod tests {
+     use super::{
+-        boundary_origin, format_a11y_text, format_storage_text, format_vitals_text,
+-        format_webmcp_text, format_webmcp_tool_text, format_with_boundaries, OutputOptions,
++        boundary_origin, bounded_json_response, format_a11y_text, format_batch_json_response,
++        format_json_response, format_storage_text, format_vitals_text, format_webmcp_text,
++        format_webmcp_tool_text, format_with_boundaries, OutputOptions,
+     };
++    use crate::connection::Response;
+     use serde_json::json;
+ 
++    fn json_output_options(max_output: Option<usize>) -> OutputOptions {
++        OutputOptions {
++            json: true,
++            max_output,
++            ..OutputOptions::default()
++        }
++    }
++
++    #[test]
++    fn test_json_output_unchanged_without_limit_or_within_limit() {
++        let resp = Response {
++            success: true,
++            data: Some(json!({ "result": "small", "origin": "https://example.test/" })),
++            warning: Some("existing warning".to_string()),
++            ..Response::default()
++        };
++        for limit in [None, Some(1_000)] {
++            let opts = json_output_options(limit);
++            assert_eq!(
++                format_json_response(&resp, Some("evaluate"), &opts),
++                serde_json::to_string(&resp).unwrap()
++            );
++            let opts = OutputOptions {
++                content_boundaries: true,
++                ..opts
++            };
++            let mut expected = serde_json::to_value(&resp).unwrap();
++            expected["_boundary"] = json!({
++                "nonce": super::get_boundary_nonce(),
++                "origin": "https://example.test/"
++            });
++            assert_eq!(
++                format_json_response(&resp, Some("evaluate"), &opts),
++                serde_json::to_string(&expected).unwrap()
++            );
++        }
++    }
++
++    #[test]
++    fn test_json_output_unicode_and_many_small_fields_use_whole_result_omission() {
++        let unicode = Response {
++            success: true,
++            data: Some(json!("é")),
++            ..Response::default()
++        };
++        // The serialized result is three Unicode characters, not four UTF-8 bytes.
++        assert!(bounded_json_response(&unicode, Some("evaluate"), Some(3)).is_none());
++        let limited = bounded_json_response(&unicode, Some("evaluate"), Some(2)).unwrap();
++        assert!(limited.success);
++        assert!(limited.data.is_none());
++        assert!(limited.warning.unwrap().contains("omitted or truncated"));
++        let many_fields = Response {
++            success: true,
++            data: Some(json!((0..100).collect::<Vec<_>>())),
++            ..Response::default()
++        };
++        let limited = bounded_json_response(&many_fields, Some("evaluate"), Some(20)).unwrap();
++        assert!(limited.data.is_none());
++        assert!(limited.success);
++    }
++
++    #[test]
++    fn test_json_output_keeps_origin_and_lifecycle_not_fake_eval_control() {
++        let lifecycle = json!({
++            "reused": true, "launched": false, "relaunchedBrowser": false,
++            "restartedBackground": false, "restoreStatus": "not_configured",
++            "saveStatus": "not_attempted",
++            "effectiveLaunch": { "browserLaunched": true, "engine": "chrome", "launchHash": "exact-hash" }
++        });
++        let resp = Response {
++            success: true,
++            data: Some(json!({
++                "origin": "https://example.test/exact-source",
++                "lifecycle": lifecycle,
++                "result": {
++                    "confirmed": true, "action": "click",
++                    "result": { "success": false, "data": { "confirmation_required": true } },
++                    "padding": "x".repeat(200)
++                }
++            })),
++            ..Response::default()
++        };
++        let opts = OutputOptions {
++            content_boundaries: true,
++            ..json_output_options(Some(1))
++        };
++        let value: serde_json::Value =
++            serde_json::from_str(&format_json_response(&resp, Some("evaluate"), &opts)).unwrap();
++        assert_eq!(value["data"], json!({ "lifecycle": lifecycle }));
++        assert_eq!(
++            value["_boundary"]["origin"],
++            "https://example.test/exact-source"
++        );
++        assert_eq!(value["success"], true);
++        assert!(value["warning"]
++            .as_str()
++            .unwrap()
++            .contains("Do not repeat actions"));
++    }
++
++    #[test]
++    fn test_json_output_pending_and_denied_are_not_reported_as_executed() {
++        let prompt = json!({
++            "confirmation_required": true, "action": "click", "category": "interaction",
++            "description": "Click the exact approved control",
++            "confirmation_id": "exact-approval-id".repeat(20)
++        });
++        let mut data = prompt.clone();
++        data["extra"] = json!("x".repeat(200));
++        let pending = Response {
++            success: true,
++            data: Some(data),
++            ..Response::default()
++        };
++        let limited = bounded_json_response(&pending, Some("click"), Some(0)).unwrap();
++        assert!(limited.success);
++        assert_eq!(limited.data.unwrap(), prompt);
++        let warning = limited.warning.unwrap();
++        assert!(!warning.contains("executed"));
++        assert!(!warning.contains("completed"));
++
++        let denied = Response {
++            success: true,
++            data: Some(json!({ "denied": true, "action": "click", "extra": "x".repeat(200) })),
++            ..Response::default()
++        };
++        let limited = bounded_json_response(&denied, Some("deny"), Some(0)).unwrap();
++        assert_eq!(
++            limited.data.unwrap(),
++            json!({ "denied": true, "action": "click" })
++        );
++        assert!(limited.success);
++    }
++
++    #[test]
++    fn test_json_output_retains_nested_confirmation_failure_and_tab_gone_identity() {
++        let url = format!("https://example.test/{}", "path".repeat(100));
++        let resp = Response {
++            success: true,
++            data: Some(json!({
++                "confirmed": true, "action": "click",
++                "result": {
++                    "id": "actual-nested-response",
++                    "success": false, "code": "tab_gone",
++                    "error": "long-error".repeat(100),
++                    "warning": "long-warning".repeat(100),
++                    "data": { "targetId": "exact-owned-target", "lastUrl": url, "extra": "omitted" }
++                }
++            })),
++            ..Response::default()
++        };
++        let limited = bounded_json_response(&resp, Some("confirm"), Some(5)).unwrap();
++        let data = limited.data.unwrap();
++        assert!(limited.success);
++        assert_eq!(data["confirmed"], true);
++        assert_eq!(data["result"]["success"], false);
++        assert_eq!(data["result"]["id"], "actual-nested-response");
++        assert_eq!(data["result"]["code"], "tab_gone");
++        assert_eq!(
++            data["result"]["data"],
++            json!({ "targetId": "exact-owned-target", "lastUrl": url })
++        );
++        assert!(data["result"]["error"]
++            .as_str()
++            .unwrap()
++            .contains("[truncated:"));
++        assert!(data["result"]["warning"]
++            .as_str()
++            .unwrap()
++            .contains("[truncated:"));
++    }
++
++    #[test]
++    fn test_json_output_bounds_error_text_without_changing_failure_code_or_identity() {
++        let resp = Response {
++            success: false,
++            data: Some(
++                json!({ "targetId": "exact-target", "lastUrl": "https://example.test/exact-url" }),
++            ),
++            error: Some("é".repeat(100)),
++            code: Some("tab_gone".to_string()),
++            warning: Some("existing warning".repeat(100)),
++        };
++        let limited = bounded_json_response(&resp, Some("click"), Some(3)).unwrap();
++        assert!(!limited.success);
++        assert_eq!(limited.code, resp.code);
++        assert_eq!(limited.data, resp.data);
++        assert!(limited.error.unwrap().starts_with("ééé\n[truncated:"));
++        assert!(limited.warning.unwrap().starts_with("exi\n[truncated:"));
++    }
++
++    #[test]
++    fn test_json_output_batch_preserves_shape_command_and_per_result_status() {
++        let resp = Response {
++            success: true,
++            data: Some(json!({ "result": "x".repeat(100) })),
++            warning: Some("existing warning".to_string()),
++            ..Response::default()
++        };
++        let command = vec!["eval".to_string(), "mutateOnce()".to_string()];
++        let original = json!({
++            "command": command, "success": true, "result": resp.data,
++            "error": null, "warning": "existing warning"
++        });
++        assert_eq!(
++            format_batch_json_response(
++                &resp,
++                &command,
++                Some("evaluate"),
++                &json_output_options(None)
++            ),
++            original
++        );
++        let limited = format_batch_json_response(
++            &resp,
++            &command,
++            Some("evaluate"),
++            &json_output_options(Some(5)),
++        );
++        assert_eq!(limited["command"], original["command"]);
++        assert_eq!(limited["success"], true);
++        assert!(limited["result"].is_null());
++        assert!(limited.get("data").is_none());
++        assert!(limited.get("code").is_none());
++        assert!(limited["warning"]
++            .as_str()
++            .unwrap()
++            .contains("omitted or truncated"));
++        // Array length/command identity are deliberately not an aggregate cap.
++        let array = json!([limited.clone(), limited]);
++        assert_eq!(array.as_array().unwrap().len(), 2);
++    }
++
+     #[test]
+     fn test_format_stream_status_text_for_enabled_stream() {
+         let data = json!({
+diff --git a/cli/src/main.rs b/cli/src/main.rs
+--- a/cli/src/main.rs
++++ b/cli/src/main.rs
+@@ -370,6 +370,7 @@
+     flags: &Flags,
+     output_opts: &OutputOptions,
+ ) -> Response {
++    let mut confirmed_response = false;
+     while let Some(prompt) = confirmation_prompt_from_response(&resp) {
+         eprintln!("[agent-browser] Action requires confirmation:");
+         if prompt.category.is_empty() {
+@@ -408,6 +409,7 @@
+                     exit(1);
+                 }
+                 resp = next_resp;
++                confirmed_response = true;
+             }
+             Err(e) => {
+                 eprintln!("{} {}", color::error_indicator(), e);
+@@ -416,7 +418,15 @@
+         }
+     }
+ 
+-    print_response_with_opts(&resp, None, output_opts);
++    print_response_with_opts(
++        &resp,
++        if confirmed_response {
++            Some("confirm")
++        } else {
++            None
++        },
++        output_opts,
++    );
+     resp
+ }
+ 
+@@ -2190,7 +2200,7 @@
+                     results.push(json!({
+                         "command": cmd_args,
+                         "success": false,
+-                        "error": e.format(),
++                        "error": output::bounded_json_text(&e.format(), flags.max_output),
+                     }));
+                     if bail {
+                         break;
+@@ -2222,25 +2232,12 @@
+         match send_command_with_respawn(parsed, &flags.session, daemon_opts) {
+             Ok(resp) => {
+                 if flags.json {
+-                    let mut result = json!({
+-                        "command": cmd_args,
+-                        "success": resp.success,
+-                        "result": resp.data,
+-                        "error": resp.error,
+-                    });
+-                    // Match the single-command `Response` serialization,
+-                    // which only emits `code` when set (e.g. `tab_gone`).
+-                    // Without this, machine-readable error codes are
+-                    // silently dropped in batch mode.
+-                    if let Some(ref code) = resp.code {
+-                        result["code"] = json!(code);
+-                    }
+-                    // Mirror the single-command serialization: emit `warning`
+-                    // too, not just `code`.
+-                    if let Some(ref warning) = resp.warning {
+-                        result["warning"] = json!(warning);
+-                    }
+-                    results.push(result);
++                    results.push(output::format_batch_json_response(
++                        &resp,
++                        cmd_args,
++                        action.as_deref(),
++                        &output_opts,
++                    ));
+                 } else {
+                     if i > 0 {
+                         println!();
+@@ -2263,7 +2260,7 @@
+                     results.push(json!({
+                         "command": cmd_args,
+                         "success": false,
+-                        "error": e.to_string(),
++                        "error": output::bounded_json_text(&e.to_string(), flags.max_output),
+                     }));
+                     if bail {
+                         break;
+@@ -2295,6 +2292,38 @@
+     use super::*;
+ 
+     #[test]
++    fn limited_confirm_json_preserves_the_real_pending_prompt_consumer() {
++        let resp = Response {
++            success: true,
++            data: Some(json!({
++                "confirmed": true,
++                "action": "launch",
++                "result": {
++                    "id": "next-response",
++                    "success": true,
++                    "data": {
++                        "confirmation_required": true,
++                        "confirmation_id": "exact-next-approval",
++                        "action": "navigate",
++                        "category": "navigation",
++                        "description": "Navigate to https://example.test/approved-path",
++                        "extra": "x".repeat(500)
++                    }
++                }
++            })),
++            ..Response::default()
++        };
++        let limited = output::bounded_json_response(&resp, Some("confirm"), Some(1)).unwrap();
++        assert_eq!(
++            confirmation_prompt_from_response(&limited),
++            confirmation_prompt_from_response(&resp)
++        );
++        assert!(limited.success);
++        assert!(resp.success); // Rendering cannot change exit/bail's operation status.
++        assert_eq!(limited.data.as_ref().unwrap()["result"]["success"], true);
++    }
++
++    #[test]
+     fn dashboard_config_comparison_rejects_unknown_or_changed_settings() {
+         let requested = DashboardConfig::new(
+             4848,

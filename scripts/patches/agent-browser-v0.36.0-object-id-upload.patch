@@ -1,0 +1,148 @@
+--- a/cli/src/native/browser.rs
++++ b/cli/src/native/browser.rs
+@@ -1963,31 +1963,32 @@
+             resolve_element_object_id(&self.client, session_id, ref_map, selector, iframe_sessions)
+                 .await?;
+ 
+-        let describe: Value = self
+-            .client
+-            .send_command(
+-                "DOM.describeNode",
+-                Some(json!({ "objectId": object_id })),
+-                Some(&effective_session_id),
+-            )
+-            .await?;
+-
+-        let backend_node_id = describe
+-            .get("node")
+-            .and_then(|n| n.get("backendNodeId"))
+-            .and_then(|v| v.as_i64())
+-            .ok_or("Could not get backendNodeId for file input")?;
+-
++        // WHY: the private page route rejected describeNode({objectId}) before
++        // upload. CDP accepts the already-resolved object directly; keep its
++        // session binding instead of converting it into a numeric backend id.
++        // File paths belong to the browser host; this does not map or copy them.
+         self.client
+             .send_command(
+                 "DOM.setFileInputFiles",
+                 Some(json!({
+                     "files": files,
+-                    "backendNodeId": backend_node_id,
++                    "objectId": object_id,
+                 })),
+                 Some(&effective_session_id),
+             )
+-            .await?;
++            .await
++            .map_err(|error| {
++                if error.contains("Page command failed (FILE_ACCESS_REQUIRED)") {
++                    "FILE_ACCESS_REQUIRED: No file was attached. File access for the enrolled Chrome extension must be authorized before uploading; an existing debugger attachment may need to be renewed."
++                        .to_string()
++                } else if error.contains("Page command failed (FILE_ACCESS_UNVERIFIED)") {
++                    // A failed permission lookup is not evidence of a denial.
++                    "FILE_ACCESS_UNVERIFIED: Could not verify file access; no file was attached."
++                        .to_string()
++                } else {
++                    error
++                }
++            })?;
+ 
+         Ok(())
+     }
+@@ -3054,6 +3055,95 @@
+     const TARGET_B: &str = "4F0A1111BBBB2222CCCC3333DDDD4444";
+ 
+     #[tokio::test]
++    async fn test_upload_direct_page_object_and_file_access_error() {
++        use futures_util::{SinkExt, StreamExt};
++        use tokio_tungstenite::tungstenite::Message;
++
++        // Exercise the real upload producer, not a duplicate parameter builder.
++        // Old upload's extra describeNode call must fail this exact sequence.
++        for failure_code in [
++            None,
++            Some("FILE_ACCESS_REQUIRED"),
++            Some("FILE_ACCESS_UNVERIFIED"),
++        ] {
++            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++            let url = format!("ws://{}", listener.local_addr().unwrap());
++            let server = tokio::spawn(async move {
++                let (stream, _) = listener.accept().await.unwrap();
++                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
++                let mut requests = Vec::new();
++                while requests.len() < 2 {
++                    let Message::Text(text) = ws.next().await.unwrap().unwrap() else {
++                        continue;
++                    };
++                    let request: Value = serde_json::from_str(&text).unwrap();
++                    let reply = if request["method"] == "Runtime.evaluate" {
++                        json!({ "id": request["id"], "result": {
++                            "result": { "type": "object", "subtype": "node", "objectId": "owned-file-object" }
++                        } })
++                    } else if let Some(code) = failure_code {
++                        json!({ "id": request["id"], "error": {
++                            "code": -32000, "message": format!("Page command failed ({code})")
++                        } })
++                    } else {
++                        json!({ "id": request["id"], "result": {} })
++                    };
++                    requests.push(request);
++                    ws.send(Message::Text(reply.to_string())).await.unwrap();
++                }
++                requests
++            });
++            let mut root = page(1, TARGET_A, "https://fixture.example/");
++            root.session_id.clear();
++            let mgr = BrowserManager {
++                client: Arc::new(CdpClient::connect(&url).await.unwrap()),
++                browser_process: None,
++                ws_url: url,
++                pages: vec![root],
++                active_page_index: 0,
++                default_timeout_ms: 25_000,
++                download_path: None,
++                ignore_https_errors: false,
++                visited_origins: HashSet::new(),
++                next_tab_id: 2,
++                direct_page: true,
++                pin_tab: true,
++                bound_target_id: Some(TARGET_A.to_string()),
++                bound_target_gone: None,
++                headless: true,
++            };
++            let files = vec![r"C:\fixture\one.txt".to_string()];
++            let result = mgr
++                .upload_files("#upload", &files, &RefMap::new(), &HashMap::new())
++                .await;
++            if let Some(code) = failure_code {
++                let error = result.unwrap_err();
++                if code == "FILE_ACCESS_REQUIRED" {
++                    assert!(error.starts_with("FILE_ACCESS_REQUIRED: No file was attached."));
++                } else {
++                    assert_eq!(error, "FILE_ACCESS_UNVERIFIED: Could not verify file access; no file was attached.");
++                    assert!(!error.contains("authorized"));
++                }
++                assert_eq!(to_ai_friendly_error(&error), error);
++            } else {
++                result.unwrap();
++            }
++            let requests = server.await.unwrap();
++            assert_eq!(requests[0]["method"], "Runtime.evaluate");
++            assert_eq!(requests[1]["method"], "DOM.setFileInputFiles");
++            assert_eq!(
++                requests[1]["params"],
++                json!({
++                    "files": files, "objectId": "owned-file-object"
++                })
++            );
++            assert!(requests
++                .iter()
++                .all(|request| request.get("sessionId").is_none()));
++        }
++    }
++
++    #[tokio::test]
+     async fn test_restore_target_binding_selects_bound_target() {
+         let mut mgr = test_manager(vec![
+             page(1, TARGET_B, "https://other.example"),

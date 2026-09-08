@@ -1,0 +1,201 @@
+--- a/cli/src/commands.rs
++++ b/cli/src/commands.rs
+@@ -89,6 +89,83 @@
+     }
+ }
+ 
++fn is_private_windows_upload_path(path: &str) -> bool {
++    let bytes = path.as_bytes();
++    if bytes.len() >= 3
++        && bytes[0].is_ascii_alphabetic()
++        && bytes[1] == b':'
++        && matches!(bytes[2], b'\\' | b'/')
++    {
++        return true;
++    }
++    let lower = path.to_ascii_lowercase();
++    [r"\\wsl.localhost\", r"\\wsl$\"].iter().any(|prefix| {
++        lower.strip_prefix(*prefix).is_some_and(|rest| {
++            rest.split_once('\\')
++                .is_some_and(|(distro, file)| !distro.is_empty() && !file.is_empty())
++        })
++    })
++}
++
++fn private_upload_path_error() -> ParseError {
++    ParseError::InvalidValue {
++        message: "Could not map an upload path for Windows Chrome. No upload was sent.".to_string(),
++        usage: "upload <selector> <files...>",
++    }
++}
++
++fn private_upload_paths(
++    files: &[String],
++    caller_cwd: &std::path::Path,
++    mut to_windows: impl FnMut(&std::path::Path) -> Result<String, ParseError>,
++) -> Result<Vec<String>, ParseError> {
++    files
++        .iter()
++        .map(|file| {
++            if file.is_empty() || file.bytes().any(|byte| byte < 32 || byte == 127) {
++                return Err(private_upload_path_error());
++            }
++            if is_private_windows_upload_path(file) {
++                return Ok(file.clone());
++            }
++            // Do not turn an unselected remote SMB/device namespace into file access.
++            if file.starts_with(r"\\")
++                || (!std::path::Path::new(file).is_absolute() && !caller_cwd.is_absolute())
++            {
++                return Err(private_upload_path_error());
++            }
++            // WHY: single CLI and batch both parse here in the invoking client.
++            // A daemon/broker cwd can belong to an earlier command or another task.
++            // Join before translation; never copy data or guess a distro/drive name.
++            let source_path = caller_cwd.join(file);
++            let mapped = to_windows(&source_path)?;
++            if !is_private_windows_upload_path(&mapped)
++                || mapped.bytes().any(|byte| byte < 32 || byte == 127)
++            {
++                return Err(private_upload_path_error());
++            }
++            Ok(mapped)
++        })
++        .collect()
++}
++
++fn wsl_upload_path(path: &std::path::Path) -> Result<String, ParseError> {
++    // Invoke the installed WSL mapper with a literal absolute argument, not a
++    // shell. This maps names only; Windows/Chrome readability is separate proof.
++    let output = std::process::Command::new("wslpath")
++        .args(["-w", "-a"])
++        .arg(path)
++        .output()
++        .map_err(|_| private_upload_path_error())?;
++    if !output.status.success() {
++        return Err(private_upload_path_error());
++    }
++    let output = String::from_utf8(output.stdout).map_err(|_| private_upload_path_error())?;
++    // Remove only the mapper's line ending; filename spaces remain meaningful.
++    let mapped = output.strip_suffix('\n').unwrap_or(&output);
++    Ok(mapped.strip_suffix('\r').unwrap_or(mapped).to_string())
++}
++
+ pub fn is_top_level_command(value: &str) -> bool {
+     matches!(
+         value,
+@@ -561,7 +638,16 @@
+                 context: "upload".to_string(),
+                 usage: "upload <selector> <files...>",
+             })?;
+-            Ok(json!({ "id": id, "action": "upload", "selector": sel, "files": &rest[1..] }))
++            let requested_files: Vec<String> = rest[1..].iter().map(|file| file.to_string()).collect();
++            let files = if flags.provider.as_deref() == Some("private-cws") {
++                // Native Windows/absolute WSL paths do not depend on cwd.
++                // An unavailable cwd stays invalid for relative inputs below.
++                let cwd = std::env::current_dir().unwrap_or_default();
++                private_upload_paths(&requested_files, &cwd, wsl_upload_path)?
++            } else {
++                requested_files
++            };
++            Ok(json!({ "id": id, "action": "upload", "selector": sel, "files": files }))
+         }
+         "download" => {
+             let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
+@@ -3361,6 +3447,96 @@
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn test_private_upload_uses_client_cwd_and_keeps_native_windows_paths() {
++        let cwd = std::path::Path::new("/home/invoking-client");
++        let mut mapped_sources = Vec::new();
++        let files = [
++            "relative fixture.txt",
++            "/mnt/c/fixture/drive.txt",
++            r"C:\fixture\existing.txt",
++            r"\\wsl.localhost\Ubuntu\home\caller\existing.txt",
++        ]
++        .map(str::to_string);
++        let result = private_upload_paths(&files, cwd, |path| {
++            mapped_sources.push(path.to_path_buf());
++            Ok(if path.starts_with("/mnt/c") {
++                r"C:\fixture\drive.txt".to_string()
++            } else {
++                r"\\wsl.localhost\Ubuntu\home\invoking-client\relative fixture.txt".to_string()
++            })
++        })
++        .unwrap();
++        assert_eq!(
++            mapped_sources,
++            [
++                cwd.join("relative fixture.txt"),
++                std::path::PathBuf::from("/mnt/c/fixture/drive.txt"),
++            ]
++        );
++        assert_eq!(
++            result[0],
++            r"\\wsl.localhost\Ubuntu\home\invoking-client\relative fixture.txt"
++        );
++        assert_eq!(result[1], r"C:\fixture\drive.txt");
++        assert_eq!(result[2..], files[2..]);
++    }
++
++    #[test]
++    fn test_private_upload_translation_failure_never_passes_linux_or_remote_paths() {
++        let cwd = std::path::Path::new("/home/invoking-client");
++        let files = ["relative.txt".to_string()];
++        assert!(
++            private_upload_paths(&files, std::path::Path::new(""), |_| panic!(
++                "an unknown caller cwd must not be replaced by the broker cwd"
++            ),)
++            .is_err()
++        );
++        assert_eq!(
++            private_upload_paths(
++                &[r"C:\fixture\absolute.txt".to_string()],
++                std::path::Path::new(""),
++                |_| panic!("native Windows paths must not need a caller cwd"),
++            )
++            .unwrap(),
++            [r"C:\fixture\absolute.txt"]
++        );
++        assert!(private_upload_paths(&files, cwd, |_| Err(private_upload_path_error())).is_err());
++        for mapped in [
++            "/home/broker/relative.txt",
++            r"\\remote.example\share\file.txt",
++        ] {
++            assert!(private_upload_paths(&files, cwd, |_| Ok(mapped.to_string())).is_err());
++        }
++        assert!(private_upload_paths(
++            &[r"\\remote.example\share\file.txt".to_string()],
++            cwd,
++            |_| panic!("a remote UNC path must not reach the mapper"),
++        )
++        .is_err());
++    }
++
++    #[test]
++    fn test_upload_parser_preserves_other_providers_and_private_windows_arguments() {
++        let relative = ["upload", "#file", "relative fixture.txt"].map(str::to_string);
++        let mut flags = default_flags();
++        assert_eq!(
++            parse_command(&relative, &flags).unwrap()["files"],
++            json!(["relative fixture.txt"])
++        );
++        flags.provider = Some("another-provider".to_string());
++        assert_eq!(
++            parse_command(&relative, &flags).unwrap()["files"],
++            json!(["relative fixture.txt"])
++        );
++        flags.provider = Some("private-cws".to_string());
++        let native = ["upload", "#file", r"C:\fixture\file.txt"].map(str::to_string);
++        assert_eq!(
++            parse_command(&native, &flags).unwrap()["files"],
++            json!([r"C:\fixture\file.txt"])
++        );
++    }
++
+     fn default_flags() -> Flags {
+         Flags {
+             session: "test".to_string(),

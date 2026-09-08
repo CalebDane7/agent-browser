@@ -1,342 +1,573 @@
-# agent-browser
+# agent-browser — AI browser automation for your real Chrome
 
-![Agent Browser](social-preview.png)
+## Breaking. Browser automation just got completely replaced.
 
-### Breaking. Browser automation just got completely replaced.
+**Your real Chrome as you. Real cookies. Parallel AI agents. Open source.**
 
-Completely undetectable. Your real Chrome as you. Playwright and PinchTab are old news. agent-browser replaces them. No screenshots. Reads page structure. 93% less context. Near-instant. 100s of parallel sessions working together agentically. "Find 5-star Amazon sellers and order from the best." "Message 20 Alibaba suppliers." Whatever you do in Chrome, it handles. Ships with a Claude Code skill that researches the UI, plans the smartest path, and verifies its own work. Open source.
+Reads page structure. No screenshot needed for every click.
+Need pixels? **201 ms viewport capture. 731 ms full-page capture** in local tests.
 
-- **Real Chrome, real cookies** — log in once, stay logged in. Your AI uses your actual browser session with persistent cookies
-- **Invisible to bot detection** — no `navigator.webdriver` flag, no fingerprint mismatches. Sites see a real human, not a bot
-- **93% fewer tokens** than Playwright MCP — ~200 tokens per page vs ~13,700. Your AI does more with less
-- **5x faster** — direct WebSocket to Chrome, no middleware relay. Every call saves seconds
-- **Independent sessions** — run multiple AI agents simultaneously on the same machine. Zero conflicts, zero shared state
-- **Headed, not headless** — you see everything the AI does in real time. Watch it work, jump in anytime, take over when you want
-- **Claude Code skill included** — drop one file and Claude knows how to drive your browser. No setup, no configuration
+One agent researches. Another tests your site. You keep working in your own tab.
+When they finish, they close their tabs—not yours.
 
----
+**Browser automation CLI + skills for Codex, Claude Code, and other LLM-powered agents.**
+The skills teach agents to research the UI, plan the smartest path, split independent
+work across tabs, and verify the result. Not just click and hope.
 
-**agent-browser** is a CLI that gives AI agents direct control of your real, visible Chrome browser — without Playwright, without Puppeteer, without downloading bundled browser binaries, and without burning through your token budget.
+> “Find 5-star Amazon sellers and order from the best.”
+>
+> “Message 20 Alibaba suppliers.”
 
-It speaks raw [Chrome DevTools Protocol (CDP)](https://chromedevtools.github.io/devtools-protocol/) over a single WebSocket. That's it. No middleware. No relay servers. No 50MB dependency you never asked for.
+That's the kind of work this is built for: real websites, real accounts, real tasks.
+Those are example requests, not claims of completed Amazon or Alibaba tests;
+purchases and messages still need your authorization.
 
-Built by [Caleb Dane](https://github.com/CalebDane7). Originally forked from [vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser) — CDP transport layer rewritten from scratch.
+Built by [Caleb Dane](https://github.com/CalebDane7), on
+[Vercel Agent Browser](https://github.com/vercel-labs/agent-browser).
 
----
-
-## The Problem with Playwright and Puppeteer
-
-If you're using Playwright or Puppeteer for AI browser automation, here's what's actually happening under the hood:
-
-```
-Your AI  →  Playwright/Puppeteer  →  Node.js WebSocket relay  →  Chrome  →  back through all of that
-```
-
-That middle layer — the Node.js relay — adds **an extra network hop on every single browser call**. Click a button? Extra hop. Take a screenshot? Extra hop. Read the page? Extra hop. Multiply that by hundreds of operations per session and you get real, measurable slowdowns.
-
-And then there's the size. Playwright alone adds **~50MB** to your `node_modules`. It downloads its own browser binaries. It bundles Firefox and WebKit engines you'll never use for AI automation.
-
-**The industry is moving away from this.** [browser-use reported 5x faster element extraction](https://browser-use.com/posts/playwright-to-cdp) after dropping Playwright for raw CDP. Stagehand (Browserbase) is making the same move. Even Microsoft built [Playwright CLI](https://testcollab.com/blog/playwright-cli) to work around their own tool's token bloat.
-
-Newer tools like [PinchTab](https://github.com/pinchtab/pinchtab) still add an HTTP relay layer between your AI and Chrome. agent-browser skips that entirely.
-
----
+> **Development status:** the improved engine is installed locally, with real-Chrome
+> installation, rollback and reapply checks passed. Portable setup and automatic
+> app return still have limits. [Current limits →](#current-limits)
 
 ## How agent-browser Is Different
 
-```
-Your AI  →  agent-browser  →  Chrome
-```
+**The best all-around agent browser should finish your work—not give you
+another browser to babysit. That's the case for this fork.**
 
-That's the whole stack. One WebSocket connection. Zero relay layers. Your commands go straight to Chrome and the response comes straight back.
+The original plan was bigger than faster clicks: keep Vercel's action engine,
+give agents the Chrome you're already signed into, and let several of them work
+beside you without fighting over tabs, dragging windows forward, or leaving a
+pile of finished pages in RAM. Pair the runtime with skills that teach agents
+to use that freedom well. Judge the combination, not one isolated feature.
 
-### By the numbers
-
-| | agent-browser | Playwright MCP | Playwright CLI |
-|---|---|---|---|
-| **Tokens per page** | ~200-400 | ~13,700 per step | ~2,700 per step |
-| **10-step workflow** | ~7,000 tokens | ~114,000 tokens | ~27,000 tokens |
-| **Install size** | Lightweight (uses your Chrome) | ~50MB + browser binaries | ~50MB + browser binaries |
-| **Network hops per call** | 1 (direct to Chrome) | 2 (relay + Chrome) | 2 (relay + Chrome) |
-| **Extra browser download?** | No — uses your existing Chrome | Yes — downloads Chromium | Yes — downloads Chromium |
-
-Under the same token budget, agent-browser runs **5.7x more automation cycles** than Playwright MCP. That's not a minor optimization — it's the difference between your AI agent finishing the job or running out of context halfway through.
-
----
+- **Real Chrome, real cookies** — your actual browser session, with the sign-ins
+  already in your enrolled profile. No copied login store.
+- **Token-efficient browser automation** — compact page structure and element
+  references instead of an image or a giant page dump at every step.
+- **Fast screenshots** — inspect fresh pixels without dragging Chrome in front
+  of the work you're doing. [See the measured capture times.](#screenshots-in-under-a-second)
+- **Independent sessions** — run multiple AI agents simultaneously on the same
+  machine. Each owns its task tabs; closing one task leaves the others running.
+- **Headed, not a separate hidden browser** — watch the AI work when you choose.
+  Keep Chrome minimized when you don't. Ordinary commands don't demand the foreground.
+- **Agent skills included** — instructions for Codex, Claude Code, and compatible
+  LLM agents: plan, act, verify, clean up. A skill alone does not install the runtime.
 
 ## You and Your AI Share the Same Browser
 
-This isn't headless automation running invisibly in the background. **agent-browser is headed** — it controls your real, visible Chrome window. You can watch everything the AI does in real time.
+**agent-browser is a CLI that gives AI agents control of your real Chrome browser.**
+The one with your profiles, your extensions, and the websites you're already using.
 
-Think of it like handing someone a remote control to your computer:
+- **Watch the AI work** — inspect its tabs whenever you want.
+- **Jump in anytime** — navigate to a page, then ask “now fill out this form” or
+  “click that button.” An explicitly invited agent can help in that selected tab.
+- **Keep working** — independent agents use their own background tabs, not the
+  one you're typing in. Minimize Chrome and carry on.
+- **Finish without the mess** — agents close completed task tabs to free memory.
+  Your own tabs and active co-working tabs stay open.
 
-- **Watch the AI work** — see it click buttons, fill forms, navigate pages, all on your actual screen
-- **Jump in anytime** — navigate to a page manually, then tell the AI "now fill out this form" or "click that button"
-- **Hand control back and forth** — you browse to the right page, the AI handles the tedious parts, you verify the result
-- **Pair browse** — stream the viewport via WebSocket so you can watch from another machine or share with a teammate
-- **Debug in real time** — when something goes wrong, you see exactly what the AI sees. No guessing what happened in a headless void
-
-Other automation tools run in a hidden browser you can't see or interact with. agent-browser runs in **your** browser — the one you're already looking at.
-
----
+Same profile means shared website login—not permission to hijack another agent's
+tab. You can explicitly invite several agents into your own tab; complete
+commands take turns there, and detaching leaves your page intact.
 
 ## What It Actually Does (Plain English)
 
-If you're new to browser automation, here's the simple version:
+- **Open websites** — navigate, go back, and go forward.
+- **Read the page** — get buttons, links, text fields and headings as a compact
+  accessibility snapshot the agent can act on.
+- **Click things** — use fresh element references such as `@e1`.
+- **Fill out forms** — type text, select options, check boxes and press Enter.
+- **Take screenshots** — capture the viewport, a full page or a selected section.
+- **Run JavaScript** — inspect or interact with the task's page.
+- **Track errors** — read the task's console and error output.
+- **Manage task tabs** — open independent work and close it when finished.
 
-**agent-browser lets an AI control your Chrome browser the same way you do** — it can open websites, click buttons, fill out forms, read what's on the page, and take screenshots. You see everything it does because it's working in your real, visible browser — not some hidden process running in the background.
+All through one command-line tool: `agent-browser`. The configured private route
+limits commands to the agent's granted page; it does not expose every upstream
+browser-wide feature. [Usage and setup](#usage-and-setup) covers the supported route.
 
-Here's everything it automates:
+## Use It as a Codex Skill, Claude Code Skill, or LLM Browser Tool
 
-- **Open any website** — navigate to URLs, go back, go forward, refresh
-- **Read the page** — get a structured snapshot of everything on the page (buttons, links, text fields, headings) that an AI can understand in ~200 tokens instead of thousands
-- **Click things** — buttons, links, checkboxes, dropdowns — by simple reference like `@e1` instead of fragile CSS selectors
-- **Fill out forms** — type into text fields, select options, check boxes
-- **Take screenshots** — capture what the page looks like for visual verification
-- **Run JavaScript** — execute any code in the browser for advanced automation
-- **Track errors** — catch console errors and broken pages automatically
-- **Manage tabs** — open new tabs, switch between them, close them
-- **Intercept network requests** — mock API responses, block tracking scripts, test error states
-- **Stream the viewport** — watch what the browser is doing in real time via screencast
+**Agent Browser** opens pages, reads controls, fills forms and takes screenshots.
+Its ownership rules decide which agent may use or close each task tab.
 
-All of this through one simple CLI: `agent-browser <command>`.
+**The operator skill** teaches the everyday loop: split independent work, open
+owned tabs, read compact snapshots, act, verify, and close. It keeps agents from
+wasting time on unnecessary screenshots, oversized page dumps or repeated failures.
 
----
+These are instructions paired with a command-line tool—not a Claude-only plugin.
+Use them with **Codex, Claude Code, or another agent that can read instructions
+and run local commands**. A model without tool access needs that connection first;
+skill discovery and caller-identity integration depend on the agent host.
+
+## Screenshots in under a second
+
+Measured local candidate captures, including the complete CLI call:
+
+| Capture | Time |
+| --- | ---: |
+| Viewport PNG | **201 ms** |
+| Full-page PNG | **731 ms** |
+| Tall page section | **579 ms** |
+| JPEG, quality 80 | **694 ms** |
+
+These checks verified fresh pixels and no focus changes during capture.
+They are scoped observations on this machine—not a universal latency promise
+or a matched “10× faster than stock” benchmark.
+
+For reading and clicking, compact snapshots avoid sending an image every step.
+Bounded output keeps huge pages from flooding the agent's context. That is how
+the design limits unnecessary model input; there is no fixed cost-saving
+percentage to promise.
 
 ## Sessions That Don't Step on Each Other
 
-This is a big deal if you're running multiple AI agents at the same time.
+**Session A can test your login page while Session B tests the checkout flow.**
+Simultaneously, on the same machine. An agent doing independent work should not
+wait behind another agent's entire task.
 
-**Every session is completely independent.** Each AI session (like each Claude Code window) gets its own daemon process through an environment variable:
+- Give each independent agent its own task session and tabs.
+- Use a few at a time; the current ceiling is **16 live sessions**, not hundreds.
+- Open tabs only when needed. Nothing reserves 16 browsers or prewarms idle tabs.
+- Close finished tasks promptly; keep tabs still being used with the user.
+- Serialize changes to the same account state. Shared login does not mean shared tab ownership.
 
-```bash
-AGENT_BROWSER_SESSION="claude-$$"  # Each session gets a unique ID
-```
+More agents still consume more memory and model tokens. Parallelize when it
+finishes the job sooner—not to keep every slot busy.
 
-What this means in practice:
+## Vercel Agent Browser, Improved for Parallel Work in Your Chrome
 
-- **Session A** can be testing your login page while **Session B** tests the checkout flow — simultaneously, on the same machine
-- No shared state between sessions — different cookies, different tabs, different browsing history
-- No race conditions — one agent clicking a button won't interfere with another agent reading a page
-- Sessions clean up after themselves — close one and the others keep running
+Vercel supplies the native action engine, compact snapshots, element references,
+named sessions and tab pinning. This fork adds the Windows Chrome integration
+around it: real caller ownership, background task tabs, shared profile
+connections and exact cleanup across owner lifecycles.
 
-If you've ever had two Playwright scripts fight over the same browser instance, you know why this matters.
+Focused engine patches also address screenshot geometry, below-viewport
+capture, bounded JSON and direct-page integration. The [full history](#the-full-improvement-history)
+separates upstream work from this fork's changes.
 
----
+**The payoff: your AI spends its time on the job—not fighting another agent for
+a tab, waiting on a screenshot, or making you log into a copied browser.**
 
-## Real Chrome. Real Cookies. Invisible to Bot Detection.
+This comparison uses pinned [Vercel Agent Browser v0.36.0](https://github.com/vercel-labs/agent-browser/tree/eb05921bad874cd2a1b4fa5d1149f1ed26576cae).
+Standard Agent Browser already supports sessions sharing Chrome; we do not
+claim to have invented that, or to beat every newer release at every task.
 
-This is the part most automation tools get wrong.
+## agent-browser vs Playwright, Playwright MCP, and PinchTab
 
-Playwright and Puppeteer download their own Chromium binary — a stripped-down, identifiable browser that websites can detect instantly. They set `navigator.webdriver = true`. They leave fingerprint mismatches in canvas rendering, WebGL, and device memory. Even with "stealth" plugins, [they fail advanced detection systems](https://blog.castle.io/how-to-detect-headless-chrome-bots-instrumented-with-playwright/) like Cloudflare and Pixelscan.
+Looking for a **Playwright alternative**, a **PinchTab alternative**, or
+**browser control for AI agents**? The important question isn't just “can it
+click?” It's what happens when several agents work in the browser you're using.
 
-**agent-browser doesn't have this problem.** It connects to your real Chrome — the same browser you use every day, with your real cookies, your real extensions, your real fingerprint. Websites can't tell the difference between you and your AI agent because there is no difference. It's the same browser.
+| Tool | What to compare |
+| --- | --- |
+| [Vercel Agent Browser](https://github.com/vercel-labs/agent-browser) | The upstream CLI, compact snapshots, sessions and tab pinning this work builds on. |
+| [Playwright MCP](https://github.com/microsoft/playwright/tree/main/packages/extension#multiple-clients) | Structured snapshots and existing logged-in Chrome; its extension also supports simultaneous clients with separate tab groups and one-client-per-tab access. |
+| [Playwright CLI](https://github.com/microsoft/playwright-cli) | A CLI-and-skills route with snapshots, named sessions and existing-browser connections. |
+| [PinchTab](https://pinchtab.com/docs/attach-chrome/) | A bridge for externally owned Chrome using a browser-level CDP endpoint; it rejects page-level attach endpoints and preserves external Chrome when the bridge stops. |
+| **This fork** | Vercel's engine paired with caller-bound tab ownership, shared profile connections, background operation, exact cleanup and the Agent Browser skill. |
 
-### What this means in practice
+**Real Chrome and multiple sessions are the starting point. The whole working
+experience is the reason for this fork:** caller-bound tab authority, background
+work, exact cleanup, fast fresh captures, compact output and practical agent
+skills together. Other tools also organize concurrent clients; this project's
+case rests on its demonstrated integration, not on pretending they cannot.
+The [improvement history](#the-full-improvement-history)
+shows exactly what Caleb added, and the [release limits](#current-limits) show
+what still needs finishing.
 
-**Log in once, stay logged in forever.** Sign into Amazon, Gmail, your bank — whatever. Those cookies persist in your Chrome profile. Next time your AI agent opens that site, it's already authenticated. No re-entering passwords. No 2FA loops. No expired sessions.
+## Real Chrome. Real Cookies. Your Actual Browser Session.
 
-**Shop on Amazon.** Your AI can browse products, compare prices, add items to your cart, and go through checkout — on your real account, with your saved payment methods, at your saved addresses. The same workflow that gets blocked instantly with Playwright just works here because Amazon sees a real Chrome browser with a real browsing history.
+Use the sign-ins in your normal Chrome profile instead of rebuilding a login
+inside a disposable browser. Work with authenticated dashboards, admin panels,
+SaaS tools and the other websites you already use.
 
-**Manage any authenticated account.** Banking dashboards, social media, email, admin panels, SaaS tools — if you can access it in Chrome, your AI agent can too. Same cookies. Same session. No bot flags.
+The transport must not copy profiles, change wallet settings or tamper with
+other extensions' private data. It keeps its own ownership records separately.
 
-**Get past Cloudflare, CAPTCHAs, and bot walls.** Sites that block automated browsers don't block yours — because yours isn't automated in the way they're detecting. There's no `navigator.webdriver` flag. No stripped-down Chromium binary. No fingerprint inconsistencies. It's your real Chrome, headed and visible.
-
-### Why this works
-
-| | agent-browser | Playwright / Puppeteer |
-|---|---|---|
-| Browser used | Your real Chrome | Downloaded Chromium binary |
-| `navigator.webdriver` | `false` (real browser) | `true` (automation flag) |
-| Cookies | Your real cookies, persistent | Fresh/empty every session |
-| Browser fingerprint | Genuine (canvas, WebGL, etc.) | Detectable mismatches |
-| Bot detection result | Passes as human | Detected and blocked |
-
----
-
-## Quick Start
-
-### Install
-
-```bash
-npm install -g agent-browser
-```
-
-### Use it right now
-
-```bash
-# Start Chrome with debugging enabled
-google-chrome --remote-debugging-port=9222 &
-
-# Open a website
-agent-browser open https://example.com
-
-# See what's on the page (AI-readable snapshot)
-agent-browser snapshot -i --compact
-# Output:
-# - heading "Example Domain" [level=1]
-# - paragraph "This domain is for use in illustrative examples..."
-# - link "More information..." [ref=e1]
-
-# Click the link
-agent-browser click @e1
-
-# Take a screenshot
-agent-browser screenshot
-```
-
-That `@e1` is an element reference. Instead of writing brittle CSS selectors like `#main > div:nth-child(3) > a.link-class`, you just say "click element 1." The AI reads the snapshot, picks the right ref, and acts on it.
-
----
-
-## Use It as a Claude Code Skill
-
-Drop one file and Claude Code knows how to drive a browser:
-
-```bash
-mkdir -p ~/.claude/skills/agent-browser
-cp SKILL.md ~/.claude/skills/agent-browser/SKILL.md
-```
-
-Now you can tell Claude things like:
-- *"Test the login page and make sure it works"*
-- *"Check if the homepage has any console errors"*
-- *"Fill out the contact form and submit it"*
-- *"Take a screenshot of the dashboard"*
-
-Claude will use agent-browser automatically — opening the browser, navigating, clicking, filling forms, taking screenshots, and reporting back what it found.
-
----
-
-## Every Command
-
-| Command | What it does |
-|---------|-------------|
-| `open <url>` | Navigate to a URL |
-| `snapshot -i --compact` | AI-readable page snapshot (interactive elements only) |
-| `snapshot` | Full page structure |
-| `click @e1` | Click an element by ref |
-| `fill @e1 "text"` | Clear a field and type text |
-| `type @e1 "text"` | Append text to a field |
-| `hover @e1` | Hover over an element |
-| `press Enter` | Press a keyboard key |
-| `screenshot` | Capture the viewport as PNG |
-| `eval "document.title"` | Run JavaScript in the browser |
-| `errors` | Show console errors |
-| `back` / `forward` | Navigate browser history |
-| `wait --load networkidle` | Wait for the page to finish loading |
-| `close` | Close the browser connection |
-
----
-
-## How It Works Under the Hood
-
-```
-Claude Code  →  agent-browser CLI (Rust)  →  daemon (Node.js)  →  Chrome CDP (WebSocket)
-                                                   |
-                                                 cdp.js      Raw WebSocket JSON-RPC
-                                                 browser.js   Page/Locator/Context API
-                                                 snapshot.js  Accessibility tree + refs
-                                                 actions.js   Command handlers
-```
-
-**cdp.js** — The engine. ~950 lines of raw WebSocket CDP transport. Connects to `ws://localhost:9222`, sends JSON-RPC commands, handles sessions, lifecycle events, dialogs, and network idle detection. No npm CDP libraries.
-
-**browser.js** — Wraps the raw CDP calls into a clean Page/Locator/Context API so the rest of the code doesn't need to think about WebSocket frames.
-
-**snapshot.js** — Calls Chrome's `Accessibility.getFullAXTree()` and formats it into the compact text tree with element refs (`@e1`, `@e2`, ...) that AI agents read.
-
-**actions.js** — Maps CLI commands to browser actions. `click @e1` resolves the ref, scrolls the element into view, gets its coordinates, and dispatches a click event through CDP.
-
----
+Real Chrome is not a promise of invisibility. Websites can still detect
+automation, expire sessions, require 2FA or show CAPTCHAs. Saved authentication
+removes needless setup; it does not remove a site's security checks.
 
 ## Who This Is For
 
-- **AI developers** building agents that need to interact with real websites
-- **Claude Code users** who want their AI to test, verify, and automate browser tasks
-- **Teams running parallel AI agents** that need session isolation
-- **Anyone frustrated with Playwright/Puppeteer bloat** who just wants to talk to Chrome
-- **People who want AI to handle real-world tasks** — shopping on Amazon, managing accounts, interacting with sites that block bots
-- **New developers** who want a simple CLI instead of learning a complex automation framework
+- **AI developers** building agents that need to interact with real websites.
+- **Codex and Claude Code users** who want their AI to test, verify and automate
+  browser tasks in the Chrome they already use.
+- **Teams running parallel AI agents** that need explicit tab ownership and cleanup.
+- **People comparing Playwright or PinchTab alternatives** for authenticated
+  Chrome automation, compact snapshots and multi-agent work.
+- **Anyone who wants AI to handle real-world browser tasks** without making
+  browser babysitting another job.
 
----
+## The full improvement history
 
-## Compared to the Alternatives
+Every change below serves the same purpose: less waiting, less interruption,
+and less risk of an agent touching the wrong thing. The details also separate
+what came from upstream, what we added, and what still needs finishing.
 
-| Feature | agent-browser | PinchTab | Playwright | Puppeteer | Playwright MCP | Selenium |
-|---------|--------------|----------|------------|-----------|---------------|----------|
-| Direct CDP (no relay) | Yes | No (HTTP→CDP) | No | No | No | No |
-| Token-efficient snapshots | ~200-400/page | ~800/page | N/A | N/A | ~13,700/step | N/A |
-| Session isolation | Built-in | Per-instance | Manual | Manual | Manual | Manual |
-| Install size | Lightweight | 12MB Go binary | ~50MB | ~30MB | ~50MB | ~100MB+ |
-| Downloads browsers | No | Yes (its own Chrome) | Yes | Yes | Yes | Yes |
-| AI-native refs (`@e1`) | Yes | No | No | No | Yes | No |
-| CLI-first design | Yes | No (HTTP API) | No | No | Partial | No |
-| Persistent cookies | Yes (real Chrome profile) | No (fresh instances) | No (fresh each run) | No (fresh each run) | No (fresh each run) | No (fresh each run) |
-| Invisible to bot detection | Yes (real browser) | No (stealth injection) | No (`webdriver=true`) | No (`webdriver=true`) | No (`webdriver=true`) | No (`webdriver=true`) |
-| Visible browser (headed) | Yes — you watch it work | No (headless default) | No (headless default) | No (headless default) | No (headless default) | No (headless default) |
-| Cross-browser | Chrome only | Chrome only | Chrome, Firefox, WebKit | Chrome only | Chrome only | All |
+<details>
+<summary>From the original custom browser to the current integration: what changed and why</summary>
 
-**The trade-off is intentional**: agent-browser only supports Chrome because that's what AI agents need. Dropping Firefox and WebKit means zero bundled browsers, zero extra downloads, and a much simpler codebase.
+### 1. Reuse the engine. Put our work into making it a better coworker.
 
----
+The earlier fork rebuilt the raw CDP transport and page/action layer around a
+Rust CLI and Node daemon. That gave us direct control, but also made this
+project responsible for low-level browser behavior that upstream continued to
+develop.
 
-## agent-browser vs PinchTab
+The modernization separates the jobs. Vercel's pinned native engine handles
+actions and snapshots. Our wrapper, broker and extension handle who may use
+which profile and tab. We keep the part that makes this a coworking browser
+without maintaining a second implementation of every click.
 
-[PinchTab](https://github.com/pinchtab/pinchtab) (7,300+ stars) markets itself as "5-13x cheaper than screenshots." That's true — but it's comparing against the worst-case baseline. When you compare PinchTab against agent-browser, the picture flips:
+### 2. Use the real profile, not an imitation of it.
 
-- **2-4x fewer tokens** — agent-browser uses ~200-400 tokens per page. PinchTab uses ~800. PinchTab compares itself against screenshots (~3,600+ tokens), not against snapshot-based tools like agent-browser
-- **One fewer network hop** — agent-browser talks directly to Chrome over WebSocket. PinchTab adds an HTTP server between your AI and Chrome (HTTP→CDP), doubling the round trips
-- **Real Chrome, real cookies** — PinchTab launches its own Chrome instances with fresh sessions. agent-browser uses your actual browser with your actual cookies. Log in once, stay logged in
-- **No HTTP server to manage** — agent-browser is a CLI. Call it directly. PinchTab runs a localhost daemon that your AI talks to through HTTP — an extra process to start, monitor, and kill
-- **50+ commands vs a basic set** — agent-browser includes video recording, network interception, device emulation, frame support, semantic locators, and profiling. PinchTab covers navigate, click, type, and extract
-- **Headed by default** — you watch agent-browser work in your real browser. PinchTab is headless-first — your AI works in a browser you can't see
-- **No bot detection flags** — agent-browser is invisible because it's your real Chrome. PinchTab uses stealth injection, which advanced detection systems can still catch
+A copied browser profile can look familiar without preserving the user's
+working state. Earlier recovery work made that distinction painful. The rule
+now is explicit: Agent Browser transport work must not copy profiles or touch
+wallets, credentials, other extensions' private state, or hardware-wallet
+settings. The transport keeps its own tab-ownership records separately.
 
-If you're searching for a PinchTab alternative, browser control for AI agents, or the most token-efficient way to automate Chrome — agent-browser does more with less.
+We moved the transport into an extension in each enrolled Chrome profile,
+connected through a local native bridge. The broker shares those native
+connections among agents; enrollment is per profile. The extension still
+attaches Chrome's debugger separately to each owned tab. Reusing the transport
+does not mean one debugger attachment covers the whole browser. Chrome's own
+consent and security boundaries still apply. This is not an auto-clicker for approval
+dialogs, nor a promise that permission can never be revoked.
 
----
+### 3. Know who owns a tab—not just what they named the task.
 
-## License
+Two agents can choose the same name. Names alone therefore cannot decide who
+owns a tab or who may close it. The wrapper binds a task to its actual caller
+and thread; the broker gives the engine authority over that task's page, not
+the whole browser.
 
-Apache-2.0
+That narrower authority also required a focused upstream patch: the engine's
+direct-page liveness check must use a page-level operation. Giving it
+browser-wide target discovery merely to pass a health check would defeat the
+ownership boundary.
 
-## Author
+### 4. Let one agent keep working when another gets stuck.
 
-**Caleb Dane** ([@CalebDane7](https://github.com/CalebDane7))
+One blocked page must not freeze every agent using the same profile. An earlier
+profile-wide queue did exactly that. Page work now runs in session-specific
+queues, with a separate teardown lane so a stalled command cannot make cleanup
+unreachable.
 
-Originally forked from [vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser). CDP transport layer (`cdp.js`, `browser.js`) rewritten from scratch — zero Playwright code, zero Puppeteer code, zero browser automation library dependencies.
+Cleanup has its own order. Removing the last task window could disconnect
+native messaging before the close acknowledgment reached the broker. The
+repair retires task state before final window cleanup. A user tab in that
+window prevents whole-window removal. An invited user tab is detached, never
+treated as disposable agent property.
 
----
+Late replies and reconnects must obey the same ownership rules. A delayed
+response is not permission to resurrect an old task, and a fresh connection
+does not inherit stale command authority. These changes belong to our
+integration; they are not claims that every upstream browser has these bugs.
 
-## Research & References
+### 5. Get a fresh screenshot without dragging Chrome in front of you.
 
-The claims in this README are backed by real benchmarks, migration reports, and industry analysis:
+In minimized Chrome, surface screenshots reached a roughly 15-second deadline
+while a comparable payload crossed the transport in 69 ms. That evidence
+pointed away from a blanket “WSL is slow” explanation. The transport gained a
+scoped internal capture path that obtains a fresh frame without activating
+Chrome, then acknowledges and stops that capture.
 
-### Performance & Token Efficiency
-- [Closer to the Metal: Leaving Playwright for CDP](https://browser-use.com/posts/playwright-to-cdp) — browser-use's migration report documenting 5x faster element extraction after dropping Playwright
-- [Why Vercel's agent-browser Is Winning the Token Efficiency War](https://dev.to/chen_zhang_bac430bc7f6b95/why-vercels-agent-browser-is-winning-the-token-efficiency-war-for-ai-browser-automation-4p87) — 5.7x more test cycles under the same token budget
-- [Agent-Browser: AI-First Browser Automation That Saves 93% of Your Context Window](https://medium.com/@richardhightower/agent-browser-ai-first-browser-automation-that-saves-93-of-your-context-window-7a2c52562f8c) — Deep dive on token savings
-- [Playwright CLI: The Token-Efficient Alternative to Playwright MCP](https://testcollab.com/blog/playwright-cli) — Microsoft's own acknowledgment of the MCP token problem (~114K tokens vs ~27K with CLI)
-- [MCP vs Playwright CLI: Best Browser Control for Agents](https://supatest.ai/blog/playwright-mcp-vs-cli-ai-browser-automation) — Head-to-head comparison
+Two separate image defects needed separate engine changes. Full-page capture
+mixed device-pixel dimensions with a CSS clip, producing excess blank space on
+scaled displays. Selector capture could produce the right dimensions but white
+pixels below the viewport. The fixes use CSS metrics and enable capture beyond
+the viewport for the requested selector. Image dimensions alone were never
+enough: the checks inspect fresh content through the bottom edge.
 
-### CDP vs Playwright vs Puppeteer
-- [CDP vs Playwright vs Puppeteer: Is This the Wrong Question?](https://lightpanda.io/blog/posts/cdp-vs-playwright-vs-puppeteer-is-this-the-wrong-question) — Architectural analysis of the relay layer overhead
-- [Playwright vs Puppeteer: Which to Choose in 2026?](https://www.firecrawl.dev/blog/playwright-vs-puppeteer) — Puppeteer runs 15-20% faster than Playwright on identical Chromium tasks
-- [Stagehand vs Browser Use vs Playwright: AI Browser Automation Compared](https://www.nxcode.io/resources/news/stagehand-vs-browser-use-vs-playwright-ai-browser-automation-2026) — Industry comparison of AI browser approaches
-- [Top Playwright Alternatives in 2026](https://www.browserstack.com/guide/playwright-alternative) — BrowserStack's overview of the alternative landscape
+Local candidate observations now include 201 ms for a viewport PNG, 731 ms for
+a full page, 579 ms for a tall selector, and 694 ms for a quality-80 JPEG. These
+are end-to-end CLI observations on this machine, not a stock-versus-fork
+benchmark or a universal speed guarantee.
 
-### Bot Detection & Real Chrome
-- [How to Detect Headless Chrome Bots Instrumented with Playwright](https://blog.castle.io/how-to-detect-headless-chrome-bots-instrumented-with-playwright/) — Why Playwright's `navigator.webdriver=true` is an instant detection signal
-- [From Puppeteer Stealth to Nodriver: How Anti-Detect Frameworks Evolved](https://securityboulevard.com/2025/06/from-puppeteer-stealth-to-nodriver-how-anti-detect-frameworks-evolved-to-evade-bot-detection/) — The industry shift toward CDP-minimal frameworks
-- [Stealth AI Browser Agents: Ultimate 2026 Guide](https://o-mega.ai/articles/stealth-for-ai-browser-agents-the-ultimate-2026-guide) — Comprehensive guide on browser fingerprinting and detection evasion
-- [The Best Headless Chrome Browser for Bypassing Anti-Bot Systems](https://kameleo.io/blog/the-best-headless-chrome-browser-for-bypassing-anti-bot-systems) — Testing results showing Playwright/Puppeteer fail advanced detection
+### 6. Give the AI the right information without burying it.
 
-### PinchTab Comparison
-- [PinchTab](https://github.com/pinchtab/pinchtab) — Popular HTTP-based alternative (7,300+ stars). Comparison: agent-browser uses 2-4x fewer tokens (~200-400 vs ~800 per page) and connects directly to Chrome without an HTTP relay
+Compact snapshots and references come from upstream. The local JSON patch
+closes a different gap: a text-output cap did not necessarily bound JSON
+responses. The candidate keeps structured results valid, explicitly reports
+omitted content, and preserves action status and required continuation fields.
+Truncating a response must not turn a successful mutation into a false failure
+that encourages the agent to repeat it.
 
-### AI Browser Agents Landscape
-- [11 Best AI Browser Agents in 2026](https://www.firecrawl.dev/blog/best-browser-agents) — Firecrawl's comprehensive review
-- [Top 10 Browser AI Agents 2026: Complete Review & Guide](https://o-mega.ai/articles/top-10-browser-use-agents-full-review-2026) — o-mega's agent comparison
-- [The Agentic Browser Landscape in 2026](https://www.nohackspod.com/blog/agentic-browser-landscape-2026) — Full landscape analysis
-- [Browser Agent Security Risks: CDP Automation Leaking Cookies](https://debugg.ai/resources/browser-agent-security-risks-cdp-automation-leaking-cookies-oauth-internal-data) — Security considerations for CDP-based agents
+Diagnostics and uploads also needed direct-page integration. Console/error
+events must reach the correct owner through bounded forwarding. Upload must
+identify the exact file input and translate a relative path from the invoking
+CLI's working directory—not the broker's. A real relative-file upload now has
+content-readback and cleanup proof. Separate diagnostics checks delivered each
+generated log and error once to its intended task. Clearing one task's console
+left the neighboring task's log and both error buffers intact.
+
+One lesson belongs in the test, not the browser: a real page can emit additional
+logs. An earlier check wrongly expected the fixture's log to be the only one.
+The corrected check tracks unique test messages, rejects duplicates and
+cross-task delivery, and leaves ordinary page logging alone. It does not hide
+unexpected output to manufacture a pass.
+
+### 7. Let agents help in your tab without taking ownership of it.
+
+Two real agents claimed the same invited tab and sent overlapping commands.
+The commands ran in order, not over each other. Detaching the first agent left
+the second working; detaching the second left the page and its input intact.
+The ordinary command interval had no foreground changes, and test cleanup
+preserved existing tabs.
+
+An explicitly permitted user-input request can also bring the exact task tab
+forward. After input, the same owner can request a conditional return to the
+saved prior app. One scoped Windows return and a separate tab-selection
+cancellation journey passed; other-app interference and wider lifecycle
+reliability remain separate limits.
+
+### The focused changes to the pinned engine
+
+The installed engine's pin records the exact donor and ordered patch hashes.
+Its focused changes include:
+
+| Patch | Reason |
+| --- | --- |
+| Direct-page liveness | Check the granted page without requesting whole-browser authority |
+| Full-page CSS metrics and selector capture | Correct scaled-display geometry and below-viewport pixels |
+| Direct-page diagnostic events | Match incoming events to the direct-page connection |
+| Bounded JSON output | Limit content without corrupting the result or hiding action status |
+| Object-ID upload | Address the exact file input through the scoped page connection |
+| Private upload paths | Resolve caller-relative files for the Windows browser host |
+| Private shared commands | Keep shared-tab command ownership through actual native completion |
+| Error-buffer cleanup | Clear one task's errors without clearing its console or another task's diagnostics |
+
+The compiled candidate also passed a real two-task `errors --clear` check in
+50 ms: the selected error buffer emptied, both console buffers and the other
+task's errors stayed unchanged, and both task tabs closed without taking focus.
+Those measurements came from the scoped candidate checks. The selected engine
+subsequently passed the ordinary installed CLI, rollback and reapply journeys.
+The source and build recipe are included; byte-identical clean-room rebuilding
+has not been verified.
+
+### How the pieces connect
+
+```text
+LLM or agent → CLI / pinned native engine → local ownership broker
+            → WSL–Windows native bridge → profile extension → owned Chrome tab
+```
+
+There are relays in this path. The goal is low end-to-end latency and correct
+ownership, not a diagram that hides the transport.
+
+</details>
+
+## What we deliberately did not add
+
+<details>
+<summary>Scope, tradeoffs and what this integration does not replace</summary>
+
+No browser per agent. No idle window for every saved profile. No copied wallet
+or login store. No broad browser-control fallback when ownership fails. No
+separate Google DevTools agent runtime is merged into this installation, and
+WebMCP is deferred. We use Chrome's browser APIs; we do not claim to have
+combined every Google agent product into this fork.
+
+If you need a portable general-purpose browser CLI, standard Agent Browser may
+be the simpler choice. Choose this integration when agents need to work beside
+you in your existing Windows Chrome profiles, with explicit control over whose
+tabs they may use and close.
+
+</details>
+
+## Usage and setup
+
+<details>
+<summary>Commands, parallel sessions, user-tab help and installation requirements</summary>
+
+## Work in parallel, without opening a browser per agent
+
+Independent agents use separate named task sessions. Several sessions can work
+in the same profile at once. They share that profile's normal website login and
+cookies; they do **not** share ownership of task tabs or element references.
+
+The wrapper also binds the session name to the real agent's identity. Two
+agents choosing the same name receive different tabs. Keep an ongoing task in
+its original agent; copying its name to another agent is not a handoff.
+
+The current limit is 16 live sessions, not 16 preallocated browsers. Open only
+what is needed. A closed enrolled profile starts on demand without a startup
+window; its task window is created minimized and retired when its last owned
+task closes, provided no user tabs would be lost.
+
+Parallelize independent pages. Serialize work on shared account state when
+simultaneous changes could interfere with each other.
+
+## The ordinary workflow
+
+On an already configured installation, choose an enrolled account handle and
+keep the same account, session and agent for the whole task:
+
+```bash
+agent-browser --account ACCOUNT --session TASK open https://example.com/
+agent-browser --account ACCOUNT --session TASK snapshot -i --compact
+agent-browser --account ACCOUNT --session TASK click @e1
+agent-browser --account ACCOUNT --session TASK close
+```
+
+`ACCOUNT` and `TASK` are placeholders. Use a fresh reference from the actual
+snapshot, not the example's `@e1`. Put command-specific options after the command:
+for example, `snapshot -i --compact --json`.
+
+Use compact snapshots for page structure and available controls. Use screenshots
+when pixels matter. Refresh references after navigation or a material page
+change. Wait for command exit and check the requested result—not just an early
+success line.
+
+Close a finished task on success, failure or cancellation. Keep a tab only while
+the user is collaborating in it or genuine user-only input is pending. Closing
+a task removes its owned tabs; it must not close a user's pre-existing tab or a
+neighboring agent's work.
+
+Confirmed native owner-process death also permits exact cleanup. A child agent
+can finish while its shared native process stays alive, so each child must
+still close its own task. A parent cannot clean up a child's tab merely by
+repeating its session name.
+
+## Help in the user's tab
+
+An explicit request to help in the currently selected tab uses `--current-tab`
+with a fresh session. The initial claim checks the exact focused profile and
+tab. Once claimed, interaction continues even if the user minimizes Chrome.
+Matching `close` detaches and preserves the user-owned tab.
+
+Several explicitly invited agents can claim that user tab using separate
+sessions. The runtime serializes complete commands and each agent detaches
+separately. Independent research still belongs in separate owned tabs.
+
+At genuine user-only input, `foreground --input-boundary ...` can show the exact
+task tab with permission. After input, `background` must use the exact same
+account, session, and `--current-tab` prefix when applicable. It returns to the
+saved prior app or tab only while the handoff's focus history is unchanged.
+Cancellation, denial, an unconfirmed result, or no handoff is not a promise about focus. Do
+not retry or force focus. Keep the session while the user supplies input; never
+activate Chrome merely to inspect it.
+
+## Setup and trust
+
+Agents: start with the [fast setup and reuse guide](skills/agent-browser/references/setup.md).
+An existing installation goes straight to the task. First-time setup separates
+the files an agent prepares from the per-profile consent only the user can give.
+
+This is currently a Windows Chrome plus WSL integration, not a portable
+one-command npm install. It needs the pinned engine, wrapper and broker, WSL
+relay, Windows native host, and a transport extension enrolled separately in
+each chosen Chrome profile. Machine-local enrollment data is not a public
+installation template.
+
+During unpacked-extension development, changing the connection code requires
+an extension reload in each affected profile. Reconnecting is not the same as
+loading the update. This is a development-update step, not a new approval for
+every task. See [Chrome's reload requirements](https://developer.chrome.com/docs/extensions/get-started/tutorial/hello-world#when-to-reload-the-extension).
+
+The extension's debugging permission is powerful. Enrollment requires the
+user's consent; ordinary reuse should not repeatedly request it. A fresh prompt
+is a connection problem to diagnose, not permission to auto-click it or weaken
+Chrome's protections.
+
+The control path must not copy profiles, export credentials or cookies, alter
+wallet storage, reset extensions, or change hardware-wallet/USB settings.
+Working in a signed-in browser does not authorize a payment, signature or other
+account action beyond the user's request. Sites can still expire logins,
+require two-factor authentication, detect automation or display CAPTCHAs.
+
+</details>
+
+## Current limits
+
+The local engine and operator skill are updated. Live Windows checks verified
+return to the previous app and Chrome tab after an explicit input handoff.
+Switching tabs or independently minimizing the task window cancelled the return,
+without pulling focus back. Windows can still refuse foreground activation;
+the browser reports failure instead of forcing it. First-time Windows/WSL setup
+still requires agent-assisted installation and per-profile enrollment, not a
+one-command npm install. The supplied build is pinned and its source recipe is
+documented; byte-identical clean-room reproduction is not claimed.
+
+<details>
+<summary>What the live checks establish—and their limits</summary>
+
+- Normal owned-tab interaction, parallel same-profile work, exact native-owner
+  cleanup, and installed parent/child name isolation have scoped browser proof.
+  These do not establish every command, screenshot mode or lifecycle case.
+- Local checks measured ordinary viewport PNG capture at 201 ms, full-page
+  PNG at 731 ms, a below-viewport selector PNG at 579 ms, and JPEG at 694 ms. The
+  candidate engine returned fresh pixels at the correct extent without foreground
+  transitions during those tasks, and closed its tabs. These observations do
+  not prove universal latency. The JPEG used the newly combined transport;
+  earlier PNG proofs remain scoped to their tested revisions. An initial
+  enrolled-profile attempt rejected the capture command (`OP_NOT_ALLOWED`).
+  After separate reload/runtime binding, quality-80 JPEG passed in 589 ms with fresh
+  pixels, exact task cleanup and no foreground events during the journey. That
+  closes the tested candidate path; it does not prove the subsequently staged
+  worker, shared user-tab behavior, popup no-focus behavior or the full release.
+- Two invited agents sharing one user tab passed overlapping-command,
+  detach/survival and exact-cleanup checks. Explicit user-input foregrounding
+  also passed its separate check. One scoped Windows handoff returned to the
+  exact prior app in 65 ms; a separate tab away/back journey correctly cancelled
+  the handoff without changing foreground. On the reloaded Erebora extension,
+  restoring the previous tab took 61 ms. Independently minimizing its isolated
+  task window cancelled return in 44 ms, with no transient focus return. Both
+  task tabs were confirmed closed. These checks do not guarantee activation
+  under every Windows condition or cover every installed profile/generation.
+  Programmatic popup switching is not available.
+- Relative-path upload passed actual file-content readback in 58 ms on the
+  candidate, with exact cleanup and no foreground transition. It depends on
+  Chrome's local-file-access permission; it is not general filesystem authority.
+- Generated console/error delivery and console-clear isolation passed separate
+  two-task checks. These do not prove every diagnostic shape or event volume.
+  A separate compiled-candidate check also proved `errors --clear` isolation:
+  clearing one task's errors preserved both consoles and the other task's errors.
+- The candidate engine returned valid bounded JSON for an oversized text
+  result and preserved a short result. That closes the tested output case,
+  not every command's output behavior. There is no fixed percentage of token
+  savings to promise.
+- The selected engine passed the normal installed command after installation,
+  rollback and reapply. The final reapply opened its task in 562 ms, read the
+  page in 60–65 ms, and closed in 482 ms, preserving existing tabs. These are
+  local observations, not universal timing guarantees. WebMCP is deferred;
+  a separate Google DevTools agent runtime is not part of this installation.
+
+Use the Agent Browser skill for everyday browsing. Keep the code's failure
+guards and explanations of why they exist; they protect behavior, not a
+permanently frozen architecture.
+
+</details>
+
+## Upstream credit
+
+### Vercel maintainers: here's the work you can inspect and reuse
+
+**Caleb Dane built this on your engine—not to bury your contribution, but to
+take it further in the browser people already use.**
+
+Start with the focused patches: [full-page and selector screenshot geometry](scripts/patches/agent-browser-v0.36.0-full-page-css-metrics.patch),
+[bounded JSON without losing action status](scripts/patches/agent-browser-v0.36.0-bounded-json-output.patch),
+and [isolated error-buffer cleanup](scripts/patches/agent-browser-v0.36.0-errors-clear.patch).
+The [source and build notes](scripts/agent-browser-engine-build.md) identify the
+pinned donor, ordered patches and scoped checks. The Windows profile connection,
+caller ownership and cleanup layer is separate from those engine changes, so
+reviewers can see which part belongs where.
+
+This is Caleb's independent fork, not a Vercel-endorsed release. The purpose of
+publishing the work is to make the improvements inspectable, reusable and worth
+bringing upstream—with clear credit for both sides.
+
+Built on [Vercel Agent Browser](https://github.com/vercel-labs/agent-browser),
+with Chrome's [Debugger API](https://developer.chrome.com/docs/extensions/reference/api/debugger)
+and [native messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging).
+This fork adds local integration and ownership policy. Preserve the upstream
+license and notices alongside the corresponding source and artifacts.
+
+Created by [Caleb Dane](https://github.com/CalebDane7). The earlier fork's custom
+CDP work and the modernization's ownership integration are part of that lineage;
+the reused native action engine remains Vercel's work. Keep Apache-2.0 and the
+bundled axe-core and third-party notices with their corresponding artifacts.

@@ -1,24 +1,14 @@
 # LinkedIn Profile Automation Playbook
 
-## Parallelization Strategy
+## Session Ownership
 
-When automating multiple LinkedIn profile sections, spawn parallel agents with isolated sessions:
+LinkedIn profile sections share one authenticated account and publication
+surface. Use one named session/writer for the selected real Stable profile; do
+not run parallel profile mutations merely because sections differ.
 
-```
-Agent 1 (--session linkedin-exp): Experience entries (sequential within)
-Agent 2 (--session linkedin-skills): Skills (sequential within)
-Agent 3 (--session linkedin-feat): Featured links (sequential within)
-```
-
-Each agent opens linkedin.com/in/USERNAME independently using `--session` flag.
-Different profile sections are independent — no cross-tab dependencies.
-This turns a ~45min sequential task into ~15min parallel execution.
-
-Important: Each agent must connect to the user's Chrome debug session separately:
+The wrapper attaches the lane to the selected real Stable profile automatically:
 ```bash
-agent-browser --session linkedin-exp connect 9222
-agent-browser --session linkedin-skills connect 9222
-agent-browser --session linkedin-feat connect 9222
+agent-browser --session linkedin-exp open https://www.linkedin.com/in/USERNAME
 ```
 
 ## Pre-Interaction Checklist

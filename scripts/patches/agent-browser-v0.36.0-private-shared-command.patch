@@ -1,0 +1,776 @@
+--- a/cli/src/connection.rs
++++ b/cli/src/connection.rs
+@@ -789,8 +789,62 @@
+     }
+ }
+ 
++fn private_transaction_mode(opts: &DaemonOptions) -> bool {
++    opts.provider == Some("private-cws")
++        && env::var("AGENT_BROWSER_PRIVATE_CWS_TRANSACTION").as_deref() == Ok("1")
++}
++
++#[cfg(target_os = "linux")]
++fn private_recorded_owner_is_dead(session: &str) -> bool {
++    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
++    let observe = || -> Option<bool> {
++        let path = get_pid_path(session);
++        let file = fs::OpenOptions::new().read(true)
++            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path).ok()?;
++        let before = file.metadata().ok()?;
++        if !before.is_file() || before.uid() != unsafe { libc::getuid() }
++            || before.nlink() != 1 || before.mode() & 0o022 != 0
++            || before.len() == 0 || before.len() > 32
++        {
++            return None;
++        }
++        let mut raw = String::new();
++        file.take(33).read_to_string(&mut raw).ok()?;
++        if raw.len() as u64 != before.len() || raw.len() > 32 {
++            return None;
++        }
++        let digits = raw.trim();
++        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
++            return None;
++        }
++        let pid: u32 = digits.parse().ok()?;
++        if pid == 0 || pid > i32::MAX as u32 || is_pid_alive(pid) {
++            return Some(false);
++        }
++        // WHY: native startup records its PID before binding. An unavailable
++        // socket with a live/uncertain owner must not be replaced, but a crash
++        // must retain autonomous exact-session recovery. is_pid_alive treats
++        // only ESRCH as dead. Do not infer death from missing/malformed files.
++        // The owner+alias grant serializes this startup entry. Reject a changed
++        // record too; never widen this predicate into a general stale-file sweep.
++        let after = fs::symlink_metadata(path).ok()?;
++        Some(after.is_file()
++            && (before.dev(), before.ino(), before.len(), before.mtime(), before.mtime_nsec(),
++                before.ctime(), before.ctime_nsec())
++                == (after.dev(), after.ino(), after.len(), after.mtime(), after.mtime_nsec(),
++                    after.ctime(), after.ctime_nsec()))
++    };
++    observe().unwrap_or(false)
++}
++
++#[cfg(not(target_os = "linux"))]
++fn private_recorded_owner_is_dead(_session: &str) -> bool {
++    false
++}
++
+ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {
+     let mut restarted = false;
++    let private = private_transaction_mode(opts);
+ 
+     // Socket connectivity is the sole liveness check — no PID check — so
+     // callers in a different PID namespace (e.g. unshare) can still reuse
+@@ -802,6 +856,15 @@
+     // this check is handled at request time: callers respawn via
+     // ensure_daemon when the request fails with daemon_unreachable().
+     if daemon_ready(session) {
++        if private {
++            // WHY: a same-version warm daemon can still execute pre-transaction
++            // bytes. Never send an unknown action to probe it (auto_launch runs
++            // first), and never restart a live owner merely to upgrade it.
++            let stream = connect(session)?;
++            require_private_daemon_peer(&stream)?;
++            return ready_existing_daemon_result(session, opts, Duration::from_secs(1))
++                .ok_or_else(|| "PRIVATE_DAEMON_CONFIG_MISMATCH".to_string());
++        }
+         // Check version: if the running daemon is from a different CLI
+         // version (e.g. after an upgrade), kill it and start a fresh one.
+         if !daemon_version_matches(session) {
+@@ -823,6 +886,22 @@
+         }
+     }
+ 
++    if private {
++        // Preserve unknown/live owners. A definitively dead recorded owner may
++        // use the existing exact-session cleanup below, without signaling it
++        // or moving its retained browser participant to a different namespace.
++        #[cfg(unix)]
++        let paths = [get_socket_path(session), get_pid_path(session)];
++        #[cfg(not(unix))]
++        let paths = [get_port_path(session), get_pid_path(session)];
++        if paths.iter().any(|path| match fs::symlink_metadata(path) {
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
++            _ => true,
++        }) && !private_recorded_owner_is_dead(session) {
++            return Err("PRIVATE_DAEMON_OWNER_UNAVAILABLE".to_string());
++        }
++    }
++
+     // Clean up any stale socket/pid files before starting fresh
+     cleanup_stale_files(session);
+ 
+@@ -1011,6 +1090,12 @@
+ }
+ 
+ pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
++    // WHY: EOF/reset after delivery does not prove the native transaction
++    // stopped or failed. Never replay actions after an ambiguous response loss;
++    // a broker restart also loses the ordinary consumed-grant nonce cache.
++    if cmd.get("action").and_then(Value::as_str) == Some("private_cws_transaction") {
++        return send_command_once(&cmd, session);
++    }
+     // Retry logic for transient errors (EAGAIN/EWOULDBLOCK/connection issues)
+     const MAX_RETRIES: u32 = 5;
+     const RETRY_DELAY_MS: u64 = 200;
+@@ -1100,10 +1185,59 @@
+     Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
+ }
+ 
++#[cfg(target_os = "linux")]
++fn require_private_daemon_peer(stream: &Connection) -> Result<(), String> {
++    use std::os::fd::AsRawFd;
++    use std::os::unix::fs::MetadataExt;
++
++    let Connection::Unix(socket) = stream else {
++        return Err("PRIVATE_DAEMON_IDENTITY_UNAVAILABLE".to_string());
++    };
++    let mut peer = libc::ucred { pid: 0, uid: 0, gid: 0 };
++    let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
++    let result = unsafe {
++        libc::getsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
++            (&mut peer as *mut libc::ucred).cast(), &mut size)
++    };
++    if result != 0 || size as usize != std::mem::size_of::<libc::ucred>()
++        || peer.pid <= 0 || peer.uid != unsafe { libc::geteuid() }
++    {
++        return Err("PRIVATE_DAEMON_IDENTITY_UNAVAILABLE".to_string());
++    }
++    // WHY: SO_PEERCRED binds this connected stream, not a mutable socket path
++    // or PID file. Opening /proc/*/exe binds the actually running inode even
++    // after package replacement unlinks it. Same filename/version/disk pin is
++    // insufficient. No wire bytes are sent before this check; recheck on EVERY
++    // transaction connection so a warm-check/endpoint-replacement race fails.
++    let image = |path| fs::File::open(path).and_then(|file| file.metadata())
++        .map_err(|_| "PRIVATE_DAEMON_IDENTITY_UNAVAILABLE".to_string());
++    let caller = image("/proc/self/exe".to_string())?;
++    let daemon = image(format!("/proc/{}/exe", peer.pid))?;
++    if !caller.is_file() || !daemon.is_file()
++        || (caller.dev(), caller.ino()) != (daemon.dev(), daemon.ino())
++    {
++        return Err("PRIVATE_DAEMON_IMAGE_MISMATCH".to_string());
++    }
++    Ok(())
++}
++
++#[cfg(not(target_os = "linux"))]
++fn require_private_daemon_peer(_stream: &Connection) -> Result<(), String> {
++    // The private provider currently owns Linux Unix sockets. Do not replace
++    // missing kernel identity with version-file or localhost TCP trust.
++    Err("PRIVATE_DAEMON_IDENTITY_UNAVAILABLE".to_string())
++}
++
+ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
+     let mut stream = connect(session)?;
++    if cmd.get("action").and_then(Value::as_str) == Some("private_cws_transaction") {
++        require_private_daemon_peer(&stream)?;
++    }
+ 
+-    stream.set_read_timeout(Some(read_timeout_for(cmd))).ok();
++    // A private transaction can wait for another invited writer. A read timeout
++    // is not cancellation; retrying that live execution would duplicate it.
++    stream.set_read_timeout(if cmd.get("action").and_then(Value::as_str) ==
++        Some("private_cws_transaction") { None } else { Some(read_timeout_for(cmd)) }).ok();
+     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+ 
+     let mut json_str = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
+@@ -1127,6 +1261,217 @@
+     use super::*;
+     use crate::test_utils::EnvGuard;
+ 
++    #[cfg(target_os = "linux")]
++    struct ForeignPrivatePeer {
++        child: std::process::Child,
++        output: BufReader<std::process::ChildStdout>,
++    }
++
++    #[cfg(target_os = "linux")]
++    impl ForeignPrivatePeer {
++        fn start(path: &std::path::Path, connections: usize) -> Self {
++            // A different *running* image, even when its version/config files
++            // say v0.36.0. This fixture cannot launch a browser. Bound every
++            // socket wait and retain only the count of received wire bytes.
++            let program = r#"
++import socket, sys
++s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++s.bind(sys.argv[1]); s.listen(8); s.settimeout(5)
++print("ready", flush=True)
++count = 0
++for _ in range(int(sys.argv[2])):
++    c, _ = s.accept(); c.settimeout(2)
++    try:
++        data = c.recv(65536); count += len(data)
++        if data:
++            c.sendall(b'{"success":false,"error":"fixture refuses actions"}\n')
++    finally:
++        c.close()
++print(count, flush=True)
++sys.stdin.readline()
++"#;
++            let mut child = Command::new("python3").arg("-c").arg(program)
++                .arg(path).arg(connections.to_string())
++                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
++                .spawn().expect("python3 is required by the isolated peer fixture");
++            let mut output = BufReader::new(child.stdout.take().unwrap());
++            let mut ready = String::new();
++            output.read_line(&mut ready).unwrap();
++            assert_eq!(ready, "ready\n");
++            Self { child, output }
++        }
++
++        fn assert_no_wire_bytes(&mut self) {
++            let mut count = String::new();
++            self.output.read_line(&mut count).unwrap();
++            assert_eq!(count, "0\n", "incompatible peer received private wire bytes");
++            assert!(self.child.try_wait().unwrap().is_none(),
++                "compatibility rejection must not stop the serving process");
++        }
++    }
++
++    #[cfg(target_os = "linux")]
++    impl Drop for ForeignPrivatePeer {
++        fn drop(&mut self) {
++            // Only this test-created fixture process; no session/PID-file kill.
++            let _ = self.child.kill();
++            let _ = self.child.wait();
++        }
++    }
++
++    #[test]
++    #[cfg(target_os = "linux")]
++    fn private_warm_old_image_rejects_before_wire_or_restart_despite_matching_version() {
++        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR",
++            "AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_PRIVATE_CWS_TRANSACTION"]);
++        let dir = tempfile::tempdir().unwrap();
++        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
++        guard.remove("AGENT_BROWSER_NAMESPACE");
++        guard.set("AGENT_BROWSER_PRIVATE_CWS_TRANSACTION", "1");
++        let session = "warm-old";
++        let mut peer = ForeignPrivatePeer::start(&get_socket_path(session), 2);
++        let mut opts = test_daemon_options(None, false, None);
++        opts.provider = Some("private-cws");
++        fs::write(get_version_path(session), env!("CARGO_PKG_VERSION")).unwrap();
++        fs::write(get_pid_path(session), peer.child.id().to_string()).unwrap();
++        write_daemon_config(session, &opts);
++        let paths = [get_version_path(session), get_pid_path(session), get_config_path(session)];
++        let before: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
++        let error = ensure_daemon(session, &opts).err().expect("old image must fail");
++        assert_eq!(error, "PRIVATE_DAEMON_IMAGE_MISMATCH");
++        peer.assert_no_wire_bytes();
++        for (path, bytes) in paths.iter().zip(before) {
++            assert_eq!(fs::read(path).unwrap(), bytes, "must preserve exact owner records");
++        }
++    }
++
++    #[test]
++    #[cfg(target_os = "linux")]
++    fn private_transaction_checks_its_own_socket_before_writing_or_retrying() {
++        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
++        let dir = tempfile::tempdir().unwrap();
++        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
++        guard.remove("AGENT_BROWSER_NAMESPACE");
++        let session = "replacement-peer";
++        let mut peer = ForeignPrivatePeer::start(&get_socket_path(session), 1);
++        // No reliance on a previous ensure_daemon result or mutable PID file.
++        let error = send_command(json!({"action":"private_cws_transaction"}), session)
++            .err().expect("replacement image must fail before receiving the action");
++        assert_eq!(error, "PRIVATE_DAEMON_IMAGE_MISMATCH");
++        peer.assert_no_wire_bytes();
++    }
++
++    #[test]
++    #[cfg(target_os = "linux")]
++    fn private_same_image_reuses_warm_owner_but_never_restarts_for_config() {
++        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR",
++            "AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_PRIVATE_CWS_TRANSACTION"]);
++        let dir = tempfile::tempdir().unwrap();
++        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
++        guard.remove("AGENT_BROWSER_NAMESPACE");
++        guard.set("AGENT_BROWSER_PRIVATE_CWS_TRANSACTION", "1");
++        let session = "same-image";
++        let _listener = std::os::unix::net::UnixListener::bind(get_socket_path(session)).unwrap();
++        let mut opts = test_daemon_options(None, false, None);
++        assert!(!private_transaction_mode(&opts), "ordinary provider path stays unchanged");
++        opts.provider = Some("private-cws");
++        write_daemon_config(session, &opts);
++        let before = fs::read(get_config_path(session)).unwrap();
++        // The kernel reports this actual test image, not a fixture PID override.
++        let result = ensure_daemon(session, &opts).expect("same-image warm reuse");
++        assert!(result.already_running && !result.restarted);
++        opts.idle_timeout = Some("1000");
++        assert_eq!(ensure_daemon(session, &opts).err().unwrap(),
++            "PRIVATE_DAEMON_CONFIG_MISMATCH");
++        assert_eq!(fs::read(get_config_path(session)).unwrap(), before);
++    }
++
++    #[test]
++    #[cfg(target_os = "linux")]
++    fn private_unreachable_owner_is_not_unlinked_or_replaced() {
++        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR",
++            "AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_PRIVATE_CWS_TRANSACTION"]);
++        let dir = tempfile::tempdir().unwrap();
++        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
++        guard.remove("AGENT_BROWSER_NAMESPACE");
++        guard.set("AGENT_BROWSER_PRIVATE_CWS_TRANSACTION", "1");
++        let session = "unavailable-owner";
++        fs::write(get_socket_path(session), b"unavailable exact owner").unwrap();
++        let mut opts = test_daemon_options(None, false, None);
++        opts.provider = Some("private-cws");
++        assert_eq!(ensure_daemon(session, &opts).err().unwrap(),
++            "PRIVATE_DAEMON_OWNER_UNAVAILABLE");
++        assert_eq!(fs::read(get_socket_path(session)).unwrap(), b"unavailable exact owner");
++        assert!(!get_pid_path(session).exists(), "must not spawn a replacement");
++    }
++
++    #[test]
++    #[cfg(target_os = "linux")]
++    fn private_retained_owner_death_admits_only_exact_crash_recovery() {
++        use std::os::unix::fs::PermissionsExt;
++        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
++        let dir = tempfile::tempdir().unwrap();
++        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
++        guard.remove("AGENT_BROWSER_NAMESPACE");
++        let session = "crashed-owner";
++        let mut child = Command::new("sh").args(["-c", "exit 0"])
++            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
++            .spawn().unwrap();
++        let pid = child.id();
++        child.wait().unwrap();
++        // Actual test-created process death, not an invented unallocated PID.
++        assert!(!is_pid_alive(pid));
++        fs::write(get_pid_path(session), pid.to_string()).unwrap();
++        fs::set_permissions(get_pid_path(session), fs::Permissions::from_mode(0o600)).unwrap();
++        fs::write(get_socket_path(session), b"retained crash endpoint").unwrap();
++        fs::write(get_pid_path("neighbor"), std::process::id().to_string()).unwrap();
++        fs::write(get_socket_path("neighbor"), b"live neighbor endpoint").unwrap();
++        assert!(private_recorded_owner_is_dead(session), "definite death admits recovery");
++        // Exercise only the reached admission + existing exact cleanup boundary.
++        // This is not a native daemon respawn or browser reconnect proof.
++        cleanup_stale_files(session);
++        assert!(!get_pid_path(session).exists());
++        assert!(!get_socket_path(session).exists());
++        assert_eq!(fs::read(get_socket_path("neighbor")).unwrap(), b"live neighbor endpoint");
++        assert_eq!(fs::read_to_string(get_pid_path("neighbor")).unwrap(),
++            std::process::id().to_string());
++    }
++
++    #[test]
++    #[cfg(target_os = "linux")]
++    fn private_unreachable_live_or_malformed_owner_never_admits_respawn() {
++        use std::os::unix::fs::PermissionsExt;
++        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR",
++            "AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_PRIVATE_CWS_TRANSACTION"]);
++        let dir = tempfile::tempdir().unwrap();
++        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
++        guard.remove("AGENT_BROWSER_NAMESPACE");
++        guard.set("AGENT_BROWSER_PRIVATE_CWS_TRANSACTION", "1");
++        let session = "uncertain-owner";
++        let mut opts = test_daemon_options(None, false, None);
++        opts.provider = Some("private-cws");
++        fs::write(get_socket_path(session), b"retained owner endpoint").unwrap();
++        for record in [std::process::id().to_string(), String::new(), "not-a-pid".into(),
++            "0".into(), "-1".into(), "2147483648".into(), "9".repeat(33)]
++        {
++            fs::write(get_pid_path(session), &record).unwrap();
++            fs::set_permissions(get_pid_path(session), fs::Permissions::from_mode(0o600)).unwrap();
++            assert_eq!(ensure_daemon(session, &opts).err().unwrap(),
++                "PRIVATE_DAEMON_OWNER_UNAVAILABLE");
++            assert_eq!(fs::read_to_string(get_pid_path(session)).unwrap(), record);
++            assert_eq!(fs::read(get_socket_path(session)).unwrap(), b"retained owner endpoint");
++        }
++        // A symlink, directory, or missing owner is not death evidence either.
++        fs::remove_file(get_pid_path(session)).unwrap();
++        std::os::unix::fs::symlink(get_socket_path(session), get_pid_path(session)).unwrap();
++        assert!(!private_recorded_owner_is_dead(session));
++        fs::remove_file(get_pid_path(session)).unwrap();
++        fs::create_dir(get_pid_path(session)).unwrap();
++        assert!(!private_recorded_owner_is_dead(session));
++        fs::remove_dir(get_pid_path(session)).unwrap();
++        assert!(!private_recorded_owner_is_dead(session));
++    }
++
+     #[test]
+     fn test_get_socket_dir_explicit_override() {
+         let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+--- a/cli/src/main.rs
++++ b/cli/src/main.rs
+@@ -1894,7 +1894,15 @@
+         }
+     }
+ 
++    // The private route sends preflight and action together. Two independently
++    // locked daemon requests leave a whole-command interleaving boundary.
++    let private_preflight = if env::var("AGENT_BROWSER_PRIVATE_CWS_TRANSACTION").as_deref() == Ok("1") &&
++        flags.provider.as_deref() == Some("private-cws") {
++        Some(build_provider_launch_command("private-cws", &flags))
++    } else { None };
++
+     // Launch with cloud provider if -p flag is set.
++    if private_preflight.is_none() {
+     if let Some(ref provider) = flags.provider {
+         let launch_cmd = build_provider_launch_command(provider, &flags);
+ 
+@@ -1916,6 +1924,7 @@
+             exit(1);
+         }
+     }
++    }
+ 
+     // Launch headed browser or configure browser options (without CDP or provider)
+     if should_send_local_launch_config(&flags, &cmd) {
+@@ -2081,7 +2090,11 @@
+ 
+     let output_opts = OutputOptions::from_flags(&flags);
+ 
+-    match send_command_with_respawn(cmd.clone(), &flags.session, &daemon_opts) {
++    let wire = match private_preflight {
++        Some(launch) => private_transaction(launch, vec![cmd.clone()], false, true),
++        None => Ok(cmd.clone()),
++    };
++    match wire.and_then(|wire| send_command_with_respawn(wire, &flags.session, &daemon_opts)) {
+         Ok(mut resp) => {
+             if daemon_restarted {
+                 mark_restarted_background(&mut resp);
+@@ -2134,6 +2147,35 @@
+     }
+ }
+ 
++fn private_transaction(
++    launch: serde_json::Value, commands: Vec<serde_json::Value>, batch: bool, bail: bool,
++) -> Result<serde_json::Value, String> {
++    use std::io::Read;
++    let path = env::var("AGENT_BROWSER_PROVIDER_GRANT_PATH").map_err(|_| "grant_unavailable")?;
++    let mut options = std::fs::OpenOptions::new();
++    options.read(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.custom_flags(libc::O_NOFOLLOW);
++    }
++    let file = options.open(path).map_err(|_| "grant_unavailable")?;
++    let metadata = file.metadata().map_err(|_| "grant_unavailable")?;
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::MetadataExt;
++        if metadata.uid() != unsafe { libc::getuid() } || metadata.mode() & 0o077 != 0 ||
++            metadata.nlink() != 1 { return Err("grant_invalid".to_string()); }
++    }
++    if !metadata.is_file() || metadata.len() > 65536 { return Err("grant_invalid".to_string()); }
++    let mut text = String::new();
++    file.take(65537).read_to_string(&mut text).map_err(|_| "grant_invalid")?;
++    if text.len() > 65536 { return Err("grant_invalid".to_string()); }
++    let grant: serde_json::Value = serde_json::from_str(&text).map_err(|_| "grant_invalid")?;
++    Ok(json!({ "id": gen_id(), "action": "private_cws_transaction",
++        "grant": grant, "launch": launch, "commands": commands, "batch": batch, "bail": bail }))
++}
++
+ fn run_batch(
+     flags: &Flags,
+     daemon_opts: &DaemonOptions,
+@@ -2184,6 +2226,12 @@
+ 
+     let output_opts = OutputOptions::from_flags(flags);
+ 
++    if env::var("AGENT_BROWSER_PRIVATE_CWS_TRANSACTION").as_deref() == Ok("1") &&
++        flags.provider.as_deref() == Some("private-cws") {
++        run_private_batch(flags, daemon_opts, bail, &commands, &output_opts);
++        return;
++    }
++
+     let mut results: Vec<serde_json::Value> = Vec::new();
+     let mut had_error = false;
+ 
+@@ -2287,6 +2335,64 @@
+     }
+ }
+ 
++fn run_private_batch(
++    flags: &Flags, daemon_opts: &DaemonOptions, bail: bool,
++    commands: &[Vec<String>], output_opts: &OutputOptions,
++) {
++    let mut parsed = Vec::new();
++    let mut original = Vec::new();
++    for args in commands.iter().filter(|args| !args.is_empty()) {
++        let mut command = match parse_command(args, flags) {
++            Ok(command) => command,
++            Err(error) => json!({ "id": gen_id(), "privateParseError": error.format() }),
++        };
++        let parse_failed = command.get("privateParseError").is_some();
++        attach_plugins_to_command(&mut command, &flags.plugins);
++        attach_restore_config_to_command(&mut command, flags);
++        attach_pin_tab_to_command(&mut command, flags);
++        original.push((args, command.get("action").and_then(|value| value.as_str()).map(str::to_string)));
++        parsed.push(command);
++        if parse_failed && bail { break; }
++    }
++    if parsed.is_empty() {
++        if flags.json { println!("[]"); }
++        return;
++    }
++    let result = private_transaction(build_provider_launch_command("private-cws", flags), parsed, true, bail)
++        .and_then(|wire| send_command_with_respawn(wire, &flags.session, daemon_opts));
++    let responses = match result {
++        Ok(response) if response.success => response.data.and_then(|data| data["responses"].as_array().cloned()),
++        Ok(response) => {
++            print_response_with_opts(&response, Some("batch"), output_opts);
++            exit(1);
++        }
++        Err(error) => {
++            if flags.json { print_json_error(error); } else { eprintln!("{}", error); }
++            exit(1);
++        }
++    };
++    let Some(responses) = responses else {
++        if flags.json { print_json_error("private batch response invalid"); }
++        else { eprintln!("private batch response invalid"); }
++        exit(1);
++    };
++    let mut output = Vec::new();
++    let mut failed = false;
++    for (index, value) in responses.into_iter().enumerate() {
++        let Some((args, action)) = original.get(index) else { exit(1); };
++        let Ok(response) = serde_json::from_value::<connection::Response>(value) else { exit(1); };
++        failed |= !response.success;
++        if flags.json {
++            output.push(output::format_batch_json_response(&response, args, action.as_deref(), output_opts));
++        } else {
++            if index > 0 { println!(); }
++            print_response_with_opts(&response, action.as_deref(), output_opts);
++        }
++    }
++    if flags.json { println!("{}", serde_json::to_string(&output).unwrap_or_else(|_| "[]".to_string())); }
++    if failed { exit(1); }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+--- a/cli/src/native/mod.rs
++++ b/cli/src/native/mod.rs
+@@ -26,6 +26,7 @@
+ pub mod policy;
+ #[allow(dead_code)]
+ pub mod providers;
++pub mod private_cws;
+ #[allow(dead_code)]
+ pub mod react;
+ #[allow(dead_code)]
+--- a/cli/src/native/daemon.rs
++++ b/cli/src/native/daemon.rs
+@@ -551,7 +551,12 @@
+ 
+                 let response = {
+                     let mut s = state.lock().await;
+-                    let response = execute_command(&cmd, &mut s).await;
++                    let response = if cmd.get("action").and_then(Value::as_str) ==
++                        Some("private_cws_transaction") {
++                        super::private_cws::execute(&cmd, &mut s).await
++                    } else {
++                        execute_command(&cmd, &mut s).await
++                    };
+                     // Refresh while the state lock is still held. An idle
+                     // timer waiting on this command will observe the updated
+                     // clock as soon as it acquires the lock.
+--- a/cli/src/native/providers.rs
++++ b/cli/src/native/providers.rs
+@@ -190,6 +190,12 @@
+     plugins: &[crate::plugins::PluginConfig],
+     launch_options: Option<Value>,
+ ) -> Result<ProviderConnection, String> {
++    if provider_name == "private-cws" && crate::plugins::find_plugin(plugins, provider_name)
++        .is_some_and(|plugin| crate::plugins::plugin_has_capability(plugin, crate::plugins::CAPABILITY_BROWSER_PROVIDER)) {
++        if let Some(connection) = super::private_cws::provider_connection() {
++            return Ok(connection);
++        }
++    }
+     if crate::plugins::find_plugin(plugins, provider_name).is_none() {
+         return Err(format!(
+             "Unknown provider '{}'. Supported: browserbase, browserless, browser-use, kernel, agentcore, or a configured plugin with browser.provider",
+--- a/cli/src/native/cdp/client.rs
++++ b/cli/src/native/cdp/client.rs
+@@ -260,8 +260,7 @@
+             session_id: session_id.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+         };
+ 
+-        let json = serde_json::to_string(&cmd)
+-            .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
++        let json = super::super::private_cws::encode_cdp(&cmd)?;
+ 
+         let (tx, rx) = oneshot::channel();
+ 
+@@ -369,8 +368,7 @@
+             session_id: session_id.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+         };
+ 
+-        let json = serde_json::to_string(&cmd)
+-            .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
++        let json = super::super::private_cws::encode_cdp(&cmd)?;
+ 
+         let mut ws_tx = self.ws_tx.lock().await;
+         ws_tx
+--- /dev/null
++++ b/cli/src/native/private_cws.rs
+@@ -0,0 +1,161 @@
++//! Private-CWS execution ownership. This is an internal provider transaction,
++//! not a browser-wide capability or a CLI-exit lock.
++use serde_json::{json, Value};
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use super::actions::{execute_command, DaemonState};
++use super::providers::{ProviderConnection, ProviderSession};
++
++const SCHEMA: &str = "agent-browser.extension-control.v1";
++#[derive(Clone)]
++struct Execution { command: String, cdp_url: String, cleanup: String }
++tokio::task_local! { static EXECUTION: Execution; }
++
++fn opaque(value: &str) -> bool {
++    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++pub fn encode_cdp<T: serde::Serialize>(value: &T) -> Result<String, String> {
++    let mut message = serde_json::to_value(value).map_err(|_| "CDP serialization failed")?;
++    if let Ok(command) = EXECUTION.try_with(|execution| execution.command.clone()) {
++        message["agentBrowserCommand"] = json!(command);
++    }
++    serde_json::to_string(&message).map_err(|_| "CDP serialization failed".to_string())
++}
++
++pub fn provider_connection() -> Option<ProviderConnection> {
++    EXECUTION.try_with(|execution| ProviderConnection {
++        ws_url: execution.cdp_url.clone(), direct_page: true, metadata: None,
++        session: Some(ProviderSession {
++            provider: "plugin:private-cws".to_string(),
++            session_id: json!(execution.cleanup).to_string(),
++        }),
++    }).ok()
++}
++
++fn parse_execution(value: &Value) -> Result<Execution, String> {
++    if !value.as_object().is_some_and(|object| object.len() == 3) {
++        return Err("COMMAND_ENVELOPE_INVALID".to_string());
++    }
++    let command = value["command"].as_str().ok_or("COMMAND_ENVELOPE_INVALID")?;
++    let cleanup = value["cleanup"].as_str().ok_or("COMMAND_ENVELOPE_INVALID")?;
++    let cdp_url = value["cdpUrl"].as_str().ok_or("COMMAND_ENVELOPE_INVALID")?;
++    let url = url::Url::parse(cdp_url).map_err(|_| "COMMAND_ENVELOPE_INVALID")?;
++    if !opaque(command) || !opaque(cleanup) || url.scheme() != "ws" ||
++        url.host_str() != Some("127.0.0.1") || url.port().is_none() ||
++        !url.username().is_empty() || url.password().is_some() ||
++        url.query().is_some() || url.fragment().is_some() ||
++        !url.path().strip_prefix("/page/").is_some_and(opaque) {
++        return Err("COMMAND_ENVELOPE_INVALID".to_string());
++    }
++    Ok(Execution { command: command.to_string(), cleanup: cleanup.to_string(), cdp_url: cdp_url.to_string() })
++}
++
++#[cfg(unix)]
++async fn control(mut request: Value, id: &str) -> Result<Value, String> {
++    if !opaque(id) { return Err("COMMAND_ENVELOPE_INVALID".to_string()); }
++    request["schema"] = json!(SCHEMA);
++    request["id"] = json!(id);
++    let path = std::env::var("AGENT_BROWSER_EXTENSION_CONTROL_SOCKET")
++        .map_err(|_| "CONTROL_UNAVAILABLE")?;
++    if !std::path::Path::new(&path).is_absolute() { return Err("CONTROL_UNAVAILABLE".to_string()); }
++    let mut socket = tokio::net::UnixStream::connect(path).await.map_err(|_| "CONTROL_UNAVAILABLE")?;
++    let encoded = request.to_string() + "\n";
++    if encoded.len() > 65536 { return Err("COMMAND_ENVELOPE_INVALID".to_string()); }
++    socket.write_all(encoded.as_bytes()).await.map_err(|_| "CONTROL_UNAVAILABLE")?;
++    let mut bytes = Vec::new();
++    let mut chunk = [0u8; 8192];
++    loop {
++        let count = socket.read(&mut chunk).await.map_err(|_| "CONTROL_UNAVAILABLE")?;
++        if count == 0 { return Err("CONTROL_UNAVAILABLE".to_string()); }
++        bytes.extend_from_slice(&chunk[..count]);
++        if bytes.len() > 65536 { return Err("COMMAND_ENVELOPE_INVALID".to_string()); }
++        if let Some(end) = bytes.iter().position(|b| *b == b'\n') {
++            if end + 1 != bytes.len() { return Err("COMMAND_ENVELOPE_INVALID".to_string()); }
++            let response: Value = serde_json::from_slice(&bytes[..end]).map_err(|_| "COMMAND_ENVELOPE_INVALID")?;
++            if response["schema"] != SCHEMA || response["id"] != id { return Err("COMMAND_ENVELOPE_INVALID".to_string()); }
++            if response["ok"] != true {
++                let code = response["error"]["code"].as_str().unwrap_or("CONTROL_REJECTED");
++                return Err(if code.len() <= 64 && code.bytes().all(|c| c.is_ascii_uppercase() || c == b'_') {
++                    code.to_string()
++                } else { "CONTROL_REJECTED".to_string() });
++            }
++            return Ok(response["result"].clone());
++        }
++    }
++}
++
++#[cfg(not(unix))]
++async fn control(_request: Value, _id: &str) -> Result<Value, String> {
++    Err("PRIVATE_CWS_REQUIRES_UNIX".to_string())
++}
++
++fn error(cmd: &Value, message: &str) -> Value {
++    json!({ "id": cmd["id"], "success": false, "error": message })
++}
++
++pub async fn execute(transaction: &Value, state: &mut DaemonState) -> Value {
++    let grant = &transaction["grant"];
++    let Some(nonce) = grant["nonce"].as_str() else { return error(transaction, "COMMAND_ENVELOPE_INVALID"); };
++    let Some(commands) = transaction["commands"].as_array() else { return error(transaction, "COMMAND_ENVELOPE_INVALID"); };
++    if commands.is_empty() || !opaque(nonce) ||
++        std::env::var("AGENT_BROWSER_SESSION").ok().as_deref() != grant["session"].as_str() ||
++        transaction["launch"]["provider"] != "private-cws" {
++        return error(transaction, "COMMAND_ENVELOPE_INVALID");
++    }
++    let begin = control(json!({ "op": "command.begin", "grant": grant, "daemonPid": std::process::id() }), nonce).await;
++    let execution = match begin.and_then(|result| parse_execution(&result)) {
++        Ok(execution) => execution,
++        Err(message) => return error(transaction, &message),
++    };
++    let command = execution.command.clone();
++    // WHY: preflight and action share one native execution lifetime. The CLI
++    // may disconnect while this future still emits input; only this completion
++    // boundary, or independently proven daemon death, permits another writer.
++    let response = EXECUTION.scope(execution, async {
++        let launched = execute_command(&transaction["launch"], state).await;
++        if launched["success"] != true { return launched; }
++        let mut responses = Vec::new();
++        for command in commands {
++            let response = if let Some(message) = command["privateParseError"].as_str() {
++                error(command, message)
++            } else {
++                execute_command(command, state).await
++            };
++            let failed = response["success"] != true;
++            responses.push(response);
++            if failed && transaction["bail"] == true { break; }
++        }
++        if transaction["batch"] == true {
++            json!({ "id": transaction["id"], "success": true, "data": { "responses": responses } })
++        } else { responses.remove(0) }
++    }).await;
++    // No timeout means cancellation here. If transport is lost, broker/worker
++    // epoch fencing rejects old frames; exact daemon death remains observable.
++    if let Err(message) = control(json!({
++        "op": "command.end", "command": command, "daemonPid": std::process::id()
++    }), &command).await { return error(transaction, &message); }
++    response
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn private_execution_accepts_only_one_page_capability() {
++        let value = json!({ "command": "a".repeat(64), "cleanup": "b".repeat(64),
++            "cdpUrl": format!("ws://127.0.0.1:1234/page/{}", "c".repeat(64)) });
++        assert!(parse_execution(&value).is_ok());
++        let mut bad = value;
++        bad["cdpUrl"] = json!("ws://127.0.0.1:1234/devtools/browser/not-a-page");
++        assert!(parse_execution(&bad).is_err());
++    }
++    #[tokio::test]
++    async fn only_execution_scoped_frames_carry_generation() {
++        let message = json!({ "id": 1, "method": "Input.insertText", "params": { "text": "fixture" } });
++        assert!(!encode_cdp(&message).unwrap().contains("agentBrowserCommand"));
++        let encoded = EXECUTION.scope(Execution {
++            command: "a".repeat(64), cdp_url: String::new(), cleanup: String::new(),
++        }, async { encode_cdp(&message).unwrap() }).await;
++        assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap()["agentBrowserCommand"], "a".repeat(64));
++    }
++}

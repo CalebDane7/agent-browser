@@ -1,0 +1,75 @@
+diff --git a/cli/src/native/actions.rs b/cli/src/native/actions.rs
+--- a/cli/src/native/actions.rs
++++ b/cli/src/native/actions.rs
+@@ -236,6 +236,22 @@
+     har_finished_requests: Vec<(String, Option<String>)>,
+ }
+ 
++fn event_matches_active_page(
++    direct_page: bool,
++    active_session_id: Option<&str>,
++    event_session_id: Option<&str>,
++) -> bool {
++    // WHY: a direct-page connection stores its bound page as session "", while
++    // valid root Runtime console/exception events omit sessionId. Comparing
++    // None to Some("") silently discarded them. A missing active page is never
++    // authority, and multiplexed connections still require an exact nonempty ID.
++    match active_session_id {
++        Some("") if direct_page => event_session_id.is_none(),
++        Some(active) if !direct_page && !active.is_empty() => event_session_id == Some(active),
++        _ => false,
++    }
++}
++
+ fn is_active_iframe_network_event(
+     method: &str,
+     session_id: Option<&str>,
+@@ -1519,7 +1535,11 @@
+                     }
+ 
+                     let session_matches = if let Some(ref browser) = self.browser {
+-                        event.session_id.as_deref() == browser.active_session_id().ok()
++                        event_matches_active_page(
++                            browser.is_direct_page_connection(),
++                            browser.active_session_id().ok(),
++                            event.session_id.as_deref(),
++                        )
+                     } else {
+                         false
+                     };
+@@ -12483,6 +12503,35 @@
+     }
+ 
+     #[test]
++    fn test_direct_page_events_require_a_bound_root_without_session_id() {
++        assert!(event_matches_active_page(true, Some(""), None));
++        assert!(!event_matches_active_page(true, None, None));
++        assert!(!event_matches_active_page(true, Some(""), Some("")));
++        assert!(!event_matches_active_page(true, Some(""), Some("other")));
++        assert!(!event_matches_active_page(true, Some("other"), None));
++        assert!(!event_matches_active_page(
++            true,
++            Some("other"),
++            Some("other")
++        ));
++
++        assert!(event_matches_active_page(
++            false,
++            Some("active"),
++            Some("active")
++        ));
++        assert!(!event_matches_active_page(
++            false,
++            Some("active"),
++            Some("other")
++        ));
++        assert!(!event_matches_active_page(false, Some("active"), None));
++        assert!(!event_matches_active_page(false, None, None));
++        assert!(!event_matches_active_page(false, Some(""), None));
++        assert!(!event_matches_active_page(false, Some(""), Some("")));
++    }
++
++    #[test]
+     fn test_iframe_network_events_are_scoped_to_active_page_sessions() {
+         let active_sessions = HashSet::from(["active-iframe".to_string()]);
+ 

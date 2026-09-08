@@ -1,0 +1,101 @@
+{
+  "schema": "agent-browser-engine-pin.v1",
+  "name": "agent-browser",
+  "version": "0.36.0",
+  "tag": "v0.36.0",
+  "commit": "eb05921bad874cd2a1b4fa5d1149f1ed26576cae",
+  "repository": "https://github.com/vercel-labs/agent-browser",
+  "release": "https://github.com/vercel-labs/agent-browser/releases/tag/v0.36.0",
+  "license": "Apache-2.0",
+  "npm": {
+    "tarballUrl": "https://registry.npmjs.org/agent-browser/-/agent-browser-0.36.0.tgz",
+    "shasumSha1": "e672393279a620fb6c79f6c00797908631450a04",
+    "integritySha512": "sha512-Ljjj4nRKUEqtrFF0pgev8lxTfC79tNgPj67sNi6BLnUAWIG8y9Cu2VQIeZ0MY3N2fTQagoBlfQ/pUY/4NWPD3w==",
+    "fileCount": 50,
+    "unpackedSize": 92964198
+  },
+  "engine": {
+    "platform": "linux-x64",
+    "archivePath": "package/bin/agent-browser-linux-x64",
+    "outputName": "agent-browser-v0.36.0-linux-x64",
+    "size": 12076512,
+    "sha256": "6612815bd78804803f9d1a0272528d1c6fa555f9a6d994511126ed9eed8c7f23",
+    "releaseUrl": "https://github.com/vercel-labs/agent-browser/releases/download/v0.36.0/agent-browser-linux-x64",
+    "localBuild": {
+      "baseCommit": "eb05921bad874cd2a1b4fa5d1149f1ed26576cae",
+      "patchSha256": "3ae199addcad94218f17c6a1d68c19660377d3938a1ba2f9d900a84fbe36d33f",
+      "sourceFileSha256": "6c089d03bfec21c867b9aa81dbd0bf58533b6604382dfa255c554a0e7de4f843",
+      "guard": "test_liveness_method_matches_connection_scope",
+      "cargoLockSha256": "0fe5b217b90d08750adb87a1618ff7efc5405c861b8d49da9aa2b869c68fcf02",
+      "patches": [
+        {
+          "path": "patches/agent-browser-v0.36.0-direct-page-liveness.patch",
+          "sha256": "3ae199addcad94218f17c6a1d68c19660377d3938a1ba2f9d900a84fbe36d33f"
+        },
+        {
+          "path": "patches/agent-browser-v0.36.0-full-page-css-metrics.patch",
+          "sha256": "15fd4e3ff0caac3373902641d14ebd8240dda0d71f2242df435532a009e09fe9"
+        },
+        {
+          "path": "patches/agent-browser-v0.36.0-direct-page-diagnostic-events.patch",
+          "sha256": "5d7d61fd22f7ce5a58c65802ec81bbb26b77d142498ac19439844e0dc0c17b29"
+        },
+        {
+          "path": "patches/agent-browser-v0.36.0-bounded-json-output.patch",
+          "sha256": "ecaf08e22c646995a8ba407acf1ff6b7cf34c748a4478627a2c125c0317b59dc"
+        },
+        {
+          "path": "patches/agent-browser-v0.36.0-object-id-upload.patch",
+          "sha256": "0f07af0901941d3f90f39e24d533373895e0d22ad384b9441ca96acbbf10ea1e"
+        },
+        {
+          "path": "patches/agent-browser-v0.36.0-private-upload-paths.patch",
+          "sha256": "31b97f5c30f651ab99e0057c41e74b29efbede9d37f2d3259758d47ccdf78498"
+        },
+        {
+          "path": "patches/agent-browser-v0.36.0-private-shared-command.patch",
+          "sha256": "d1d183b68c101150806cf10d3f34bfbd13e43f50b70dcb37a7c50374022de4c5"
+        },
+        {
+          "path": "patches/agent-browser-v0.36.0-errors-clear.patch",
+          "sha256": "df8803e3650a9c442e93a591e36ef9233ff24c1030220cd40c5df50d11613326"
+        }
+      ]
+    }
+  },
+  "referenceEngines": [
+    {
+      "platform": "win32-x64",
+      "archivePath": "package/bin/agent-browser-win32-x64.exe",
+      "size": 13837312,
+      "sha256": "412ff72737a109e93f5304b0ff76c988fb6f1f451d0fc7e010577922bcc20ff3",
+      "releaseUrl": "https://github.com/vercel-labs/agent-browser/releases/download/v0.36.0/agent-browser-win32-x64.exe"
+    }
+  ],
+  "licenses": [
+    {
+      "archivePath": "package/LICENSE",
+      "outputName": "LICENSE.agent-browser"
+    },
+    {
+      "archivePath": "package/cli/src/native/a11y/LICENSE-axe-core.txt",
+      "outputName": "LICENSE-axe-core.txt"
+    },
+    {
+      "archivePath": "package/cli/src/native/a11y/LICENSE-axe-core-THIRD-PARTY.txt",
+      "outputName": "LICENSE-axe-core-THIRD-PARTY.txt"
+    }
+  ],
+  "integration": {
+    "providerName": "private-cws",
+    "pluginProtocol": "agent-browser.plugin.v1",
+    "pluginCapability": "browser.provider",
+    "transport": "direct-page",
+    "pageCapabilityPath": "/page/<64-lowercase-hex>",
+    "opaqueIdEncoding": "64-lowercase-hex",
+    "forbiddenMethodPrefixes": [
+      "Target.",
+      "WebMCP."
+    ]
+  }
+}

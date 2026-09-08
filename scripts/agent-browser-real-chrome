@@ -17,11 +17,25 @@ if [ -z "$script_path" ]; then
 fi
 script_dir="${script_path%/*}"
 
+# WHY: child agents share one native process/root session. Preserve only strict
+# namespace IDs across env-i; the wrapper independently observes the process
+# birth from /proc. An environment PID is never accepted as owner authority.
+owner_metadata=()
+for owner_key in CODEX_THREAD_ID CODEX_SESSION_ID; do
+  if [[ -v "$owner_key" ]]; then
+    if [[ ! ${!owner_key} =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+      /usr/bin/printf '%s\n' 'agent-browser: owner namespace metadata is invalid' >&2
+      exit 70
+    fi
+    owner_metadata+=("$owner_key=${!owner_key}")
+  fi
+done
+
+# With HOME/USER/LOGNAME absent, Node resolves the real OS identity. Keep private
+# default-account data in the owner-only configuration file, not this executable.
 exec /usr/bin/env -i \
-  HOME=/home/cabule \
-  USER=cabule \
-  LOGNAME=cabule \
+  "${owner_metadata[@]}" \
   PATH=/usr/bin:/bin \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
-  /usr/bin/node "$script_dir/agent-browser-wrapper.js" "$@"
+/usr/bin/node "$script_dir/agent-browser-admission.mjs" "$@"
