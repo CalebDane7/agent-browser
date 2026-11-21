@@ -1,0 +1,7 @@
+interface:
+  display_name: "Agent Browser Builder"
+  short_description: "Build and release Agent Browser safely"
+  default_prompt: "Use $agent-browser-builder to repair and validate the Agent Browser implementation without disturbing my live Chrome."
+
+policy:
+  allow_implicit_invocation: true

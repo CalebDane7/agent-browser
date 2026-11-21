@@ -119,6 +119,10 @@ through cleanup.
 [Setup](skills/agent-browser/references/setup.md) ·
 [Recovery](skills/agent-browser/references/browser-state-recovery.md)**
 
+**Forking or changing the runtime?** Start with the
+[builder skill](skills/agent-browser-builder/SKILL.md): the maintenance guide and
+failure history behind this build.
+
 ## Vercel: here's the work you can bring upstream
 
 **Vercel built the engine. Caleb built the real-Chrome coworking integration
