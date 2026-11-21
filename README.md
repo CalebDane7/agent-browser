@@ -123,6 +123,31 @@ through cleanup.
 [builder skill](skills/agent-browser-builder/SKILL.md): the maintenance guide and
 failure history behind this build.
 
+### Using a Mac?
+
+This build runs on Windows with WSL only. To use it on a Mac you have to port
+it. All the logic is here: the Chrome extension, the broker's tab ownership
+and the skills carry over. It needs to be wrapped correctly for macOS:
+
+- **Engine:** build the patched engine for macOS from the
+  [recipe](scripts/agent-browser-engine-build.md) and pin it the way the Linux
+  one is pinned. The wrapper accepts only a pinned binary.
+- **Chrome bridge:** replace the Windows native host with a small macOS host
+  that hands Chrome's connection to `scripts/agent-browser-extension-stdio.js`,
+  registered under
+  `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/`.
+- **Process identity and locking:** the wrapper, supervisor and broker read
+  `/proc` to tell agents and processes apart and use `flock`. Give those macOS
+  equivalents, and point the wrapper at the Mac Chrome path.
+- **Focus handoff:** bringing a tab forward for a password or 2FA and returning
+  afterwards uses Windows APIs. Port it or leave it out.
+
+Start from the [builder skill](skills/agent-browser-builder/SKILL.md) and test
+on a real Mac before relying on it; no Mac build has been made or tested here.
+Until one exists, upstream
+[Vercel Agent Browser](https://github.com/vercel-labs/agent-browser) runs on
+macOS, without this fork's real-Chrome sharing and tab ownership.
+
 ## Vercel: here's the work you can bring upstream
 
 **Vercel built the engine. Caleb built the real-Chrome coworking integration
