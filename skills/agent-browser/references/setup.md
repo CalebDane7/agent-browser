@@ -50,7 +50,9 @@ as_root() { /mnt/c/Windows/System32/wsl.exe -d "$WSL_DISTRO_NAME" -u root -- bas
 # The folder is permanent: Windows calls back into it on every connection.
 git clone https://github.com/CalebDane7/agent-browser.git "$HOME/agent-browser"
 cd "$HOME/agent-browser"
-npm install --omit=dev --ignore-scripts --no-audit --no-fund
+# The broker's only dependency (a full npm install is not needed).
+npm pack ws@8.21.0 --silent --pack-destination /tmp
+mkdir -p node_modules/ws && tar -xzf /tmp/ws-8.21.0.tgz -C node_modules/ws --strip-components=1
 
 # Engine: the wrapper accepts only this exact binary.
 install -D -m 500 engine/agent-browser-v0.36.0-linux-x64 \
