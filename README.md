@@ -89,13 +89,19 @@ and caller-identity integration depend on the agent host.
 
 ## Get started
 
-**Currently built for Windows Stable Chrome + WSL.** First-time setup is
-agent-assisted, with a transport extension and user-approved enrollment in each
-chosen profile. This is not a one-command npm installation; installing upstream
-Agent Browser or copying the skill alone does not install this integration.
+**Built for Windows Stable Chrome + WSL.** Your agent does the whole setup,
+including loading the Chrome extension and pairing your profile. Paste this to
+Claude Code or Codex running inside WSL:
 
-Give your agent the [setup and reuse guide](skills/agent-browser/references/setup.md).
-An already configured installation goes straight to work:
+> Install Agent Browser for me: clone https://github.com/CalebDane7/agent-browser
+> to ~/agent-browser and follow skills/agent-browser/references/setup.md from
+> start to finish. Do every step yourself, including the Chrome extension and
+> pairing steps, and don't ask me to click anything. When its final check
+> passes, use Agent Browser for my browser tasks.
+
+Installing upstream Agent Browser from npm, or copying the skill alone, does not
+install this integration. The [setup and reuse guide](skills/agent-browser/references/setup.md)
+has the exact steps. An already configured installation goes straight to work:
 
 ```bash
 agent-browser --account ACCOUNT --session TASK open https://example.com/

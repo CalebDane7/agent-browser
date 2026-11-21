@@ -77,7 +77,7 @@ function fixture(license = "fixture license\n") {
   return { archive, manifest, engine };
 }
 
-test("pin and all eight ordered patches cannot float to an upstream or different local artifact", async () => {
+test("pin and all ten ordered patches cannot float to an upstream or different local artifact", async () => {
   const manifest = JSON.parse(await readFile(join(ROOT, "scripts/pinned-agent-browser-engine.json")));
   validatePinnedManifest(manifest);
   const floated = structuredClone(manifest);
@@ -85,7 +85,7 @@ test("pin and all eight ordered patches cannot float to an upstream or different
   assert.throws(() => validatePinnedManifest(floated), { code: "pin_manifest_mismatch" });
   const patches = await Promise.all(EXPECTED_PIN.engine.localBuild.patches.map(({ path }) =>
     readFile(join(ROOT, "scripts", path))));
-  assert.equal(patches.length, 8);
+  assert.equal(patches.length, 10);
   verifyLocalBuildPatch(patches[0]); // Existing single-patch API remains first-patch scoped.
   verifyLocalBuildPatches(patches);
   for (let index = 0; index < patches.length; index += 1) {

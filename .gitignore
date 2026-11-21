@@ -1,2 +1,12 @@
 node_modules/
 package-lock.json
+
+# Local backups, markers and tool state (never published)
+*.backup-*
+*.bak*
+.release-transaction-firewall-*.artifact
+skills/**/backups/
+.ai-controller/
+.ai-project/
+.tldr/
+checks/

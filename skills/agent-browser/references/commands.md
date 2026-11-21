@@ -1,22 +1,23 @@
 # Authenticated Private-Route Command Reference
 
 This is the source-checked syntax subset for the installed private Agent Browser
-route, not a claim that every command has passed a live journey. The pinned
+route—not a claim that every command has passed a live journey. The pinned
 Vercel v0.36 engine exposes more commands, but its standalone `--help` does not
 prove that the authenticated page capability permits them.
 
 ## Mandatory Prefix
 
-Every invocation needs one globally unique task session. Generate it once and
-retain its exact value across tool calls; shell variables may not survive a new
-call. Reuse the same account/session on every command:
+Every invocation needs one globally unique task session. Generate it once for
+the workflow and retain its exact value across tool calls. Shell variables may
+not survive a new call. Reuse the same account/session on every command:
 
 ```bash
 IFS= read -r task_uuid </proc/sys/kernel/random/uuid
-# For examples with --account, set browser_account from the local mapping.
-# Otherwise omit --account consistently to use the runtime default.
+# Set browser_account to an exact enrolled handle from the local operator mapping.
+# To use the runtime default instead, omit --account consistently on every command.
+: "${browser_account:?Set the requested alias from the local operator mapping}"
 task_session="research-pricing-${task_uuid//-/}"
-agent-browser --session "$task_session" open https://example.com
+agent-browser --account "$browser_account" --session "$task_session" open https://example.com
 ```
 
 For a non-default profile, repeat the exact enrolled account handle on **every**
@@ -32,15 +33,12 @@ agent-browser --account "$browser_account" --session "$account_session" snapshot
 agent-browser --account "$browser_account" --session "$account_session" close
 ```
 
-For an explicitly invited current-tab session, repeat `--current-tab` as well:
-
-```bash
-IFS= read -r current_tab_uuid </proc/sys/kernel/random/uuid
-current_tab_session="current-help-${current_tab_uuid//-/}"
-agent-browser --session "$current_tab_session" --current-tab get url
-agent-browser --session "$current_tab_session" --current-tab snapshot -i --compact
-agent-browser --session "$current_tab_session" --current-tab close
-```
+For explicitly invited current-tab help, begin with `--current-tab get url`
+using the requested account and a fresh session while the intended Chrome tab
+is selected and foreground. Verify the URL before acting. Retain that flag and
+the original account/session on every command, including `close`, which
+detaches without closing the user's tab. After attachment Chrome may stay
+minimized. See [session management](session-management.md).
 
 Do not run two commands concurrently against the same session. Independent
 agents should use different semantic session names and may run concurrently,
@@ -51,58 +49,85 @@ including in the same profile. The current broker cap is 16 total live sessions.
 Use fresh snapshot refs after navigation or a material DOM change:
 
 ```bash
-agent-browser --session "$task_session" snapshot -i --compact
-agent-browser --session "$task_session" snapshot -i --compact -s "#main"
+agent-browser --account "$browser_account" --session "$task_session" snapshot -i --compact
+agent-browser --account "$browser_account" --session "$task_session" snapshot -i --compact -s "#main"
 
-agent-browser --session "$task_session" click @e1
-agent-browser --session "$task_session" dblclick @e1
-agent-browser --session "$task_session" fill @e2 "text"
-agent-browser --session "$task_session" type @e2 "text"
-agent-browser --session "$task_session" press Enter
-agent-browser --session "$task_session" hover @e1
-agent-browser --session "$task_session" check @e3
-agent-browser --session "$task_session" uncheck @e3
-agent-browser --session "$task_session" select @e4 "value"
-agent-browser --session "$task_session" scroll down 500
-agent-browser --session "$task_session" scrollintoview @e5
-agent-browser --session "$task_session" drag @e5 @e6
-agent-browser --session "$task_session" upload @e7 'C:\path\file.pdf'
+agent-browser --account "$browser_account" --session "$task_session" click @e1
+agent-browser --account "$browser_account" --session "$task_session" dblclick @e1
+agent-browser --account "$browser_account" --session "$task_session" fill @e2 "text"
+agent-browser --account "$browser_account" --session "$task_session" type @e2 "text"
+agent-browser --account "$browser_account" --session "$task_session" press Enter
+agent-browser --account "$browser_account" --session "$task_session" hover @e1
+agent-browser --account "$browser_account" --session "$task_session" check @e3
+agent-browser --account "$browser_account" --session "$task_session" uncheck @e3
+agent-browser --account "$browser_account" --session "$task_session" select @e4 "value"
+agent-browser --account "$browser_account" --session "$task_session" scroll down 500
+agent-browser --account "$browser_account" --session "$task_session" scrollintoview @e5
+agent-browser --account "$browser_account" --session "$task_session" drag @e5 @e6
+agent-browser --account "$browser_account" --session "$task_session" upload @e7 'C:\path\file.pdf'
 ```
 
-The installed engine (`6612815`) supports caller-relative uploads. A scoped
+The installed engine supports caller-relative uploads. A scoped
 Chrome check verified the selected file's contents in 58 ms. Use only an
 explicitly authorized file that Windows Chrome can access; this does not grant
 arbitrary filesystem access or justify transferring files to bypass a failure.
 Preserve the current profile's file-access permission boundary.
 
-Never put a password, token, seed phrase, private key, wallet vault, or one-time
-code in a command. User-only secrets are entered by the user in the retained
-exact task tab.
+Never put a secret value in tool-call text, literal command arguments or output.
+For an existing app login retrieved from the authorized deployment, use the
+private stdin route below. Only genuinely user-only secrets require input in
+the retained exact task tab.
+
+### Private App Login Input
+
+The pinned engine supports `eval --stdin`; the installed private wrapper forwards
+stdin. When normal `fill` would expose a recovered password in process arguments,
+generate the page expression inside a local process and send it directly on stdin:
+
+```bash
+agent-browser --account "$browser_account" --session "$task_session" eval --stdin
+```
+
+The caller supplies the expression through a pipe/subprocess input, not a literal
+password in a here-document or tool call. Capture only the needed value from the
+authorized server in memory, JSON-encode it, and validate the expected page origin
+and exact observed login field before setting it. Use the native input setter and
+normal input/change events, then submit the site's sign-in control separately.
+Return a fixed status only, catch page errors without echoing input, and keep the
+producer's output/errors redacted. Do not use `get value`, print the expression,
+or capture a populated secret field. This is ordinary login-form entry, not
+cookie extraction, token injection, extension access, or authentication bypass.
+
+Source boundary: pinned engine `eval --help` advertises `--stdin`; the private
+wrapper inherits stdin. Evaluation returns the expression's result and can
+surface exception text, so secrets must never be returned, logged or interpolated
+into an uncaught error. Recheck this contract if the installed engine/transport
+changes. Follow [authentication](authentication.md) for source/account authority.
 
 ## Navigation, Observation, And Waits
 
 ```bash
-agent-browser --session "$task_session" back
-agent-browser --session "$task_session" forward
-agent-browser --session "$task_session" reload
+agent-browser --account "$browser_account" --session "$task_session" back
+agent-browser --account "$browser_account" --session "$task_session" forward
+agent-browser --account "$browser_account" --session "$task_session" reload
 
-agent-browser --session "$task_session" get text @e1
-agent-browser --session "$task_session" get html @e1
-agent-browser --session "$task_session" get value @e1
-agent-browser --session "$task_session" get attr @e1 href
-agent-browser --session "$task_session" get title
-agent-browser --session "$task_session" get url
-agent-browser --session "$task_session" get count ".item"
-agent-browser --session "$task_session" get box @e1
-agent-browser --session "$task_session" is visible @e1
-agent-browser --session "$task_session" is enabled @e1
-agent-browser --session "$task_session" is checked @e1
+agent-browser --account "$browser_account" --session "$task_session" get text @e1
+agent-browser --account "$browser_account" --session "$task_session" get html @e1
+agent-browser --account "$browser_account" --session "$task_session" get value @e1
+agent-browser --account "$browser_account" --session "$task_session" get attr @e1 href
+agent-browser --account "$browser_account" --session "$task_session" get title
+agent-browser --account "$browser_account" --session "$task_session" get url
+agent-browser --account "$browser_account" --session "$task_session" get count ".item"
+agent-browser --account "$browser_account" --session "$task_session" get box @e1
+agent-browser --account "$browser_account" --session "$task_session" is visible @e1
+agent-browser --account "$browser_account" --session "$task_session" is enabled @e1
+agent-browser --account "$browser_account" --session "$task_session" is checked @e1
 
-agent-browser --session "$task_session" wait "#success"
-agent-browser --session "$task_session" wait --text "Success"
-agent-browser --session "$task_session" wait --url "**/dashboard"
-agent-browser --session "$task_session" wait --load networkidle
-agent-browser --session "$task_session" wait --fn "window.ready === true"
+agent-browser --account "$browser_account" --session "$task_session" wait "#success"
+agent-browser --account "$browser_account" --session "$task_session" wait --text "Success"
+agent-browser --account "$browser_account" --session "$task_session" wait --url "**/dashboard"
+agent-browser --account "$browser_account" --session "$task_session" wait --load networkidle
+agent-browser --account "$browser_account" --session "$task_session" wait --fn "window.ready === true"
 ```
 
 Prefer an observable wait over arbitrary milliseconds. Selector waits use CSS,
@@ -111,15 +136,15 @@ not `@ref`; this engine's wait path does not resolve snapshot references.
 ## Locators, Screenshots, And Page Diagnostics
 
 ```bash
-agent-browser --session "$task_session" find role button click --name "Submit"
-agent-browser --session "$task_session" find text "Sign In" click --exact
-agent-browser --session "$task_session" find label "Email" fill "user@example.com"
-agent-browser --session "$task_session" find placeholder "Search" fill "query"
+agent-browser --account "$browser_account" --session "$task_session" find role button click --name "Submit"
+agent-browser --account "$browser_account" --session "$task_session" find text "Sign In" click --exact
+agent-browser --account "$browser_account" --session "$task_session" find label "Email" fill "user@example.com"
+agent-browser --account "$browser_account" --session "$task_session" find placeholder "Search" fill "query"
 
-agent-browser --session "$task_session" screenshot "/tmp/${task_session}.png"
-agent-browser --session "$task_session" screenshot --full "/tmp/${task_session}-full.png"
-agent-browser --session "$task_session" console
-agent-browser --session "$task_session" errors
+agent-browser --account "$browser_account" --session "$task_session" screenshot "/tmp/${task_session}.png"
+agent-browser --account "$browser_account" --session "$task_session" screenshot --full "/tmp/${task_session}-full.png"
+agent-browser --account "$browser_account" --session "$task_session" console
+agent-browser --account "$browser_account" --session "$task_session" errors
 ```
 
 ### Structured Output
@@ -127,19 +152,20 @@ agent-browser --session "$task_session" errors
 Put output flags after the command, following the usual account/session prefix:
 
 ```bash
-agent-browser --session "$task_session" snapshot -i --compact -s "#main" --json
+agent-browser --account "$browser_account" --session "$task_session" snapshot -i --compact -s "#main" --json
 ```
 
 Check `success` and any `error` before using `data`; command exit alone is not
 proof of the requested page result. Scope snapshots/observations first and use
 `--max-output` to bound serialized data. JSON alone does not make output small.
-For an explicit-account workflow, include the same `--account` used to open it.
 
 ### Installed Functions
 
-Verified September 8, 2026: engine `6612815` is installed. The ordinary CLI,
-rollback and reapply passed real-Chrome checks. Use these functions through the
-normal command; the measurements below remain scoped to their tested cases.
+Verified September 8, 2026 on the maintainer's installation with engine build
+`6612815`; the pinned engine has since been rebuilt with later patches. The
+ordinary CLI, rollback and reapply passed real-Chrome checks at that time. Use
+these functions through the normal command; the measurements below remain
+scoped to their tested cases.
 
 | Function | Syntax after the account/session prefix | Important boundary |
 | --- | --- | --- |
@@ -168,20 +194,16 @@ With the user's permission at a genuine input boundary, bring only your existing
 task tab forward:
 
 ```bash
-: "${browser_account:?Set the requested alias from the local operator mapping}"
-: "${task_session:?Reuse the session already opened for this task}"
 agent-browser --account "$browser_account" --session "$task_session" foreground --input-boundary two-factor
-# After the user finishes, repeat this command's exact account/session/current-tab prefix:
+# After the user finishes, retain --current-tab too if the foreground command used it:
 agent-browser --account "$browser_account" --session "$task_session" background
 ```
 
-If this is an invited current-tab session, repeat `--current-tab` on both
-commands too. Allowed boundary values:
-`password`, `two-factor`, `hardware-key`, `captcha`, `file-picker`, `recovery`,
-`account-authority`. This wrapper command already returns JSON; do not append
-engine flags. It does not create a tab or retry an interrupted activation.
-`background` is conditional: it restores the saved prior app or tab only while
-the owner-bound handoff's focus history remains unchanged. `cancelled`, `denied`,
+Allowed boundary values: `password`, `two-factor`, `hardware-key`, `captcha`,
+`file-picker`, `recovery`, `account-authority`. This wrapper command already
+returns JSON; do not append engine flags. It does not create a tab or retry an
+interrupted activation. `background` is conditional: it restores the saved prior
+app or tab only while the handoff's focus history is unchanged. `cancelled`, `denied`,
 `unconfirmed`, or `no-handoff` does not promise where focus is. Do not retry or
 force focus.
 
@@ -196,15 +218,17 @@ focus, or command restrictions.
 ## Tabs And Cleanup
 
 ```bash
-agent-browser --session "$task_session" tab list
-agent-browser --session "$task_session" close
+agent-browser --account "$browser_account" --session "$task_session" tab list
+agent-browser --account "$browser_account" --session "$task_session" close
 ```
 
 Only `tab list` is supported; it shows this session's synthetic page entry, not
 all Chrome tabs. The private route rejects tab creation, switching,
 or closing by mutable index. Page-created opener descendants stay within their
-owning session and the matching session `close` retires them. A current-tab
-session detaches without closing the user's tab. `close --all` is rejected.
+owning session and the matching session `close` retires them. `close --all` is
+rejected. Close finished task tabs promptly, including after failure; retain a
+tab still being used with the user or awaiting genuine input. Never close a
+user's pre-existing tab. Wait for cleanup exit and report any failed close.
 
 ## Intentionally Rejected Surface
 

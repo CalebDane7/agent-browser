@@ -1,5 +1,12 @@
 # Selected local engine
 
+> **Current pin:** `pinned-agent-browser-engine.json` is authoritative. It lists
+> ten ordered patches and a 12,080,480-byte engine with SHA-256
+> `35c7b948a927b5e72284d562870feafea7543d6e27070c2a7b6652b38c372067`. That exact
+> binary ships in `engine/` with its license files, so setup needs no rebuild.
+> The walkthrough below was written for the earlier eight-patch build
+> (`6612815b...`); when rebuilding, apply all ten patches in the pin's order.
+
 The selected Linux engine is a supplied local build, not the executable in the
 upstream npm archive or GitHub release. Acquisition requires an absolute
 `--local-engine` path. It verifies all eight shipped patches in their pinned

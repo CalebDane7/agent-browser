@@ -11,10 +11,13 @@ cookies, credentials, MetaMask, wallets, USB, or hardware-wallet behavior.
   approval prompt as a real red. Do not create/import/reset anything to make the
   symptom disappear.
 - Keep Windows Stable Chrome's actual `User Data` root and exact enrolled profile
-  as authority. Never substitute `ChromeCDP`, a copied/temporary profile, or an
-  alternate `--user-data-dir`.
+  as authority. Never substitute a copied/temporary profile or an alternate
+  `--user-data-dir`.
 - Do not restart Chrome, WSL, the broker, or the extension merely to retry, and
-  do not repeat the same browser action without a causal evidence delta.
+  do not repeat the same browser action without a causal evidence delta. For a
+  lost transport connection—not missing wallet or login state—first use the
+  entrypoint's one authorized, normal close/reopen of the exact existing profile.
+  That recovery preserves stored state; it does not authorize resets or retry loops.
 - Never print, export, copy, or persist cookies, tokens, passwords, vaults, seed
   phrases, private keys, one-time codes, or recovery secrets.
 - Stop ordinary browser work and give a maintainer a separately authorized
