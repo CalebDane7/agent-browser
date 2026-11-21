@@ -366,10 +366,11 @@ async function resolveScopeBackendNodeIds(page, selector, scopeNodeId) {
 }
 
 /**
- * Adapted and materially changed from vercel-labs/agent-browser
- * 021d9255:cli/src/native/snapshot.rs (Apache-2.0). Restrict a full AX tree to nodes owned by one DOM subtree. A synthetic root
- * preserves the formatter contract without retaining out-of-scope ancestors.
- * Exported so deterministic fixtures can prove that scoping never widens.
+ * @agent-browser-donor-provenance {"schema":"agent-browser-donor-provenance.v1","repository":"https://github.com/vercel-labs/agent-browser","release":"v0.35.2","commit":"118af8eef1eebe21b949c3cf677d468330da7a46","tree":"d4f318b7089cffe15f854175f4b12bcff69db392","source":{"path":"cli/src/native/snapshot.rs","gitBlobSha1":"52a84860e6a5f4df6e5bc4786cae65c00c8a7104","sha256":"40e133e2da98e58fd0f9c93c36832d169324b925c630d0d64d505f41286485cf","regions":[{"symbol":"take_snapshot","lines":[231,299]},{"symbol":"take_snapshot","lines":[323,354]},{"symbol":"collect_backend_node_ids","lines":[1336,1356]}]},"local":{"symbols":["collectDomBackendNodeIds","resolveScopeBackendNodeIds","scopeAccessibilityNodes","getEnhancedSnapshot"],"modified":true,"modification":"The existing raw-CDP client and a synthetic AX root scope the selected subtree without importing donor runtime or retaining out-of-scope ancestors."},"license":{"spdx":"Apache-2.0","copyright":"Copyright 2025 Vercel Inc.","gitBlobSha1":"8226d363f88a734e52cc79ead7a5588cc55e76f7","sha256":"014bb31e83d5c2e76aea1cc6e82217346ab41362f32cb355ad0f5c10aa0aeaff"}}
+ * The donor contributes only selector-to-DOM/AX scoping.
+ * The synthetic root preserves the local formatter contract.
+ * Out-of-scope ancestors and refs remain excluded.
+ * Wrapper/broker ownership, focus, and cleanup stay local.
  */
 function scopeAccessibilityNodes(nodes, backendNodeIds) {
     if (!backendNodeIds)

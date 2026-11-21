@@ -331,10 +331,10 @@ const COMPACT_DIFF_CONTEXT_LINES = 3;
 const SMALL_DIFF_COMPAT_LINES = 24;
 
 /**
- * Adapted and materially changed from vercel-labs/agent-browser
- * 021d9255:cli/src/native/diff.rs (Apache-2.0). Keep legacy byte-for-byte diff
- * text for small snapshots. Larger snapshots use its three-line context radius, but
- * retain this daemon's existing line prefixes so current consumers keep working.
+ * @agent-browser-donor-provenance {"schema":"agent-browser-donor-provenance.v1","repository":"https://github.com/vercel-labs/agent-browser","release":"v0.35.2","commit":"118af8eef1eebe21b949c3cf677d468330da7a46","tree":"d4f318b7089cffe15f854175f4b12bcff69db392","source":{"path":"cli/src/native/diff.rs","gitBlobSha1":"251a39c52db8fc4243e8d5178ca4d6a052040741","sha256":"e3af32f8bdb1a50edde0b13a3f9f7a97bc160feb24b89b81e7c13adb179ffee9","regions":[{"symbol":"diff_snapshots","lines":[102,148]}]},"local":{"symbols":["myersDiff","diffSnapshots","compactDiff"],"modified":true,"modification":"The local bounded Myers implementation, existing line prefixes, and legacy small-diff bytes remain; only the identical fast path and three-line context policy are adapted."},"license":{"spdx":"Apache-2.0","copyright":"Copyright 2025 Vercel Inc.","gitBlobSha1":"8226d363f88a734e52cc79ead7a5588cc55e76f7","sha256":"014bb31e83d5c2e76aea1cc6e82217346ab41362f32cb355ad0f5c10aa0aeaff"}}
+ * The donor contributes only the identical fast path and three-line context policy.
+ * Local bounded Myers behavior, line prefixes, and legacy small-diff bytes remain authoritative.
+ * Wrapper/broker ownership, focus, and cleanup are untouched.
  */
 function compactDiff(edits, requestedContextLines, force = false) {
     if (!force && edits.length <= SMALL_DIFF_COMPAT_LINES) {

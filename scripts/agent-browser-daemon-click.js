@@ -29,9 +29,9 @@ const MAX_IDENTITY_BYTES = 8192;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 const EXPECTED_MANIFEST_SCHEMA = "agent-browser-canonical-dist.v1";
 const EXPECTED_MANIFEST_SHA256 =
-  "c70aa3a02b1fc00910e378b417739bfe42ac784726d130c2245c22c859bce194";
+  "968a4f83d8001c74c66b79d48dc344efa2bcb08db84a0a3942e54a880aa7a88d";
 const EXPECTED_GRAPH_SHA256 =
-  "4e3ba63ddd1a71f1e2996fdeea8a873453417c55bc2f1e1d5a1f236ecc5aedcf";
+  "787b124112d6cc638a0c5417dcf1c5d3f66de20cdbc67d92e69551a013a7aff6";
 const EXPECTED_GRAPH_FILES = [
   "dist/actions.js",
   "dist/browser.js",
@@ -455,11 +455,16 @@ function validateDaemonIdentity() {
   const daemonSource = lstatSync(daemonSourcePath, { bigint: true });
   const graph = validateCanonicalGraph();
 
+  // WHY: popup actions and transport renewal share one long-lived daemon.
+  // Accepting the old popup-only identity would authenticate bytes that cannot
+  // rebind after broker turnover; the exact ordered capability set is one
+  // versioned contract across daemon, wrapper, and popup client.
   if (
     schema !== "agent-browser-daemon-identity-v2" ||
     receiptRuntimeVersion !== runtimeVersion ||
     protocol !== "jsonl-command-v1" ||
-    capabilities !== "click-expect-popup-v1" ||
+    capabilities !==
+      "click-expect-popup-v1,transport-rebind-v1,session-inventory-v1" ||
     receiptSession !== session ||
     receiptPid !== pidText ||
     startTicks !== processStartTicks(daemonPid) ||

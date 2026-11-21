@@ -441,8 +441,8 @@ function makeFake({
   };
 }
 
-function deterministicCrypto() {
-  let cursor = 1;
+function deterministicCrypto(initialCursor = 1) {
+  let cursor = initialCursor;
   return {
     getRandomValues(bytes) {
       for (let index = 0; index < bytes.length; index += 1) {
@@ -776,7 +776,7 @@ fake.addTab({ id: 2001, windowId: 10, active: false, openerTabId: 1000, url: "ab
     expect(fake.storage.session.get(failureKey).entries[0]).toMatchObject({ stage: "debugger.detach", code: "TAB_DETACH_FAILED" });
   });
 
-  it.each(["debugger.attach", "Page.getFrameTree", "target.validate"])("retains bounded exact-owner adoption failure evidence at %s", async (stage) => {
+  it.each(["debugger.attach", "Page.getFrameTree", "target.validate"])("retains bounded failure evidence and cleanup-only child authority at %s", async (stage) => {
     const fake = makeFake();
     const { bridge, port, hello } = await boot(fake);
     const root = await request(bridge, port, hello, "tab.create", { session: "adoption-owner", url: "about:blank" });
@@ -811,9 +811,209 @@ fake.addTab({ id, windowId: 10, active: false, openerTabId: 1000, url: "about:bl
         stage, code: stage === "target.validate" ? "TARGET_DENIED" : "OPERATION_FAILED" });
     }
     expect(JSON.stringify(failures)).not.toMatch(/private|https:|chrome:/);
-    expect(bridge._test.inventory().sessions[0].tabIds).toEqual([root.result.tabId]);
+    // Failure diagnostics are bounded, but cleanup ownership must retain ALL
+    // source-proven children. Dropping a failed record allowed root-only close
+    // success while its physical popup survived; validation grants no execution.
+    const retained = clone(bridge._test.inventory().sessions[0]);
+    expect(retained.tabIds).toHaveLength(35);
+    const children = fake.storage.session.get(ownershipKey).tabs.filter((item) => !item.root);
+    expect(children).toHaveLength(34);
+    for (const child of children) {
+      expect(child).toMatchObject({ cleanupOnly: true, createdByExtension: true,
+        session: "adoption-owner", openerTabId: root.result.tabId, creationEpoch: hello.connectionEpoch });
+      expect(retained.tabIds).toContain(child.tabId);
+    }
+    expect(port.sent.filter((message) => message.method === "AgentBrowser.tabAdopted")).toHaveLength(34);
+    const child = children[0];
+    const attaches = fake.calls.debuggerAttach.length, sends = fake.calls.debuggerSend.length;
+    for (const [op, args] of [
+      ["command.begin", { command: "c".repeat(64) }],
+      ["cdp.send", { method: "Runtime.evaluate", params: { expression: "1" } }],
+      ["tab.foreground", { windowId: child.windowId, currentTab: false,
+        inputBoundary: "password", handoffToken: FOCUS_TOKEN }],
+    ]) {
+      expect(await request(bridge, port, hello, op, { session: retained.session, tabId: child.tabId, ...args }))
+        .toMatchObject({ ok: false, error: { code: "TARGET_CLEANUP_ONLY" } });
+    }
+    expect(fake.calls.debuggerAttach).toHaveLength(attaches);
+    expect(fake.calls.debuggerSend).toHaveLength(sends);
+    expect(await request(bridge, port, hello, "session.close", { session: retained.session, tabIds: [root.result.tabId] }))
+      .toMatchObject({ ok: false, error: { code: "OWNERSHIP_MISMATCH" } });
     expect(fake.calls.tabsRemove).toEqual([]);
-    expect(port.sent.filter((message) => message.method === "AgentBrowser.tabAdopted")).toEqual([]);
+    expect((await request(bridge, port, hello, "session.close", { session: retained.session, tabIds: retained.tabIds })).ok).toBe(true);
+    expect(fake.calls.tabsRemove).toHaveLength(35);
+    expect(fake.calls.tabsRemove.at(-1)).toBe(1000);
+    expect([...fake.state.tabs.keys()].sort((a, b) => a - b)).toEqual([1, 1999]);
+    expect(fake.calls.tabsUpdate).toEqual([]);
+    expect(fake.calls.windowsUpdate).toEqual([]);
+  });
+});
+
+describe("failed descendant cleanup-only ownership", () => {
+  async function fixture({ healthy = false, synchronousDetach = true } = {}) {
+    const fake = makeFake({ emitDetachSynchronously: synchronousDetach });
+    const { bridge, port, hello } = await boot(fake);
+    const root = (await request(bridge, port, hello, "tab.create", { session: "failed-child-owner", url: "about:blank" })).result;
+    const send = fake.chrome.debugger.sendCommand;
+    fake.chrome.debugger.sendCommand = async (target, method, params) => {
+      if (!healthy && target.tabId === 2001 && method === "Page.getFrameTree")
+        return { frameTree: { frame: { id: "child-frame", url: "chrome://settings/" } } };
+      return send(target, method, params);
+    };
+    const peer = { profile: { profileKey: hello.profileKey }, epoch: hello.connectionEpoch, stage: "ready", closed: false,
+      async request(op, args) {
+        const response = await request(bridge, port, hello, op, args);
+        if (!response.ok) throw Object.assign(new Error(response.error.code), { bridgeCode: response.error.code });
+        return response.result;
+      } };
+    const session = { name: "failed-child-owner", account: "fixture", profileKey: hello.profileKey,
+      epoch: hello.connectionEpoch, rootTabId: root.tabId, tabIds: new Set([root.tabId]),
+      cleanup: "fixture-cleanup", endpointToken: "fixture-endpoint", ws: { close: vi.fn() } };
+    const broker = Object.create(Broker.prototype);
+    broker.sessions = new Map([[session.name, session]]);
+    broker.pendingSessions = new Set();
+    broker.ownerRecords = new Map([[session.name, {}]]);
+    broker.endpoints = new Map([[session.endpointToken, session]]);
+    broker.peersByAccount = new Map([["fixture", peer]]);
+    broker.forgetOwner = vi.fn((name) => broker.ownerRecords.delete(name));
+    let cursor = port.sent.length;
+    const pumpEvents = () => {
+      for (const event of port.sent.slice(cursor)) if (event.type === "event") broker.extensionEvent(peer, event);
+      cursor = port.sent.length;
+    };
+    const addChild = async () => {
+      fake.addTab({ id: 2001, windowId: 10, active: false, url: "about:blank" }, true, 1000);
+      await bridge._test.settle(); await flush(30); pumpEvents();
+    };
+    return { fake, bridge, port, hello, root, broker, session, pumpEvents, addChild };
+  }
+
+  it("never reports broker close success with a failed-validation physical popup still live", async () => {
+    const f = await fixture(); await f.addChild();
+    expect(f.fake.state.tabs.has(2001)).toBe(true);
+    // WHY: exercise actual broker retirement before judging physical outcome.
+    // The rejected worker returned closed/root-gone with child still present.
+    expect(await f.broker.closeSession(f.session.cleanup)).toEqual({ status: "closed" });
+    expect({ rootGone: !f.fake.state.tabs.has(1000), childGone: !f.fake.state.tabs.has(2001),
+      userPreserved: f.fake.state.tabs.has(1) }).toEqual({ rootGone: true, childGone: true, userPreserved: true });
+    expect(f.fake.calls.tabsRemove).toEqual([2001, 1000]);
+  });
+
+  it("preserves cleanup-only authority after removal rejection and restart/rebind without reattaching the failed child", async () => {
+    const f = await fixture(); await f.addChild();
+    const retained = clone(f.bridge._test.inventory().sessions[0]);
+    const child = retained.tabIds.find((id) => id !== retained.rootTabId);
+    const remove = f.fake.chrome.tabs.remove;
+    f.fake.chrome.tabs.remove = async (id) => { if (id === 2001) throw new Error("private browser detail"); return remove(id); };
+    await expect(f.broker.closeSession(f.session.cleanup)).rejects.toMatchObject({ bridgeCode: "TAB_REMOVE_FAILED" });
+    expect(f.broker.sessions.get(f.session.name)).toBe(f.session);
+    expect(f.broker.ownerRecords.has(f.session.name)).toBe(true);
+    expect(f.broker.endpoints.get(f.session.endpointToken)).toBe(f.session);
+    expect(f.session.ws.close).not.toHaveBeenCalled();
+    expect(f.fake.calls.tabsRemove).toEqual([]);
+    expect(f.fake.state.tabs.has(1000)).toBe(true);
+    const fake = makeFake({ storage: f.fake.storage, windows: [...f.fake.state.windows.values()],
+      tabs: [...f.fake.state.tabs.values()], emitDetachSynchronously: true });
+    const next = await boot(fake);
+    const args = { session: retained.session, tabId: child, method: "Page.getFrameTree", params: {} };
+    expect(await request(next.bridge, next.port, next.hello, "cdp.send", args))
+      .toMatchObject({ ok: false, error: { code: "REBIND_REQUIRED" } });
+    expect((await request(next.bridge, next.port, next.hello, "session.rebind", {
+      session: retained.session, rootTabId: retained.rootTabId, tabIds: retained.tabIds })).ok).toBe(true);
+    expect(await request(next.bridge, next.port, next.hello, "cdp.send", args))
+      .toMatchObject({ ok: false, error: { code: "TARGET_CLEANUP_ONLY" } });
+    expect(fake.calls.debuggerAttach).toEqual([]);
+    expect((await request(next.bridge, next.port, next.hello, "session.close", {
+      session: retained.session, tabIds: retained.tabIds })).ok).toBe(true);
+    expect(fake.calls.tabsRemove).toEqual([2001, 1000]);
+    expect(fake.state.tabs.has(1)).toBe(true);
+  });
+
+  it("keeps cleanup-only provenance through delayed detach while healthy detach remains terminal", async () => {
+    const failed = await fixture({ synchronousDetach: false }); await failed.addChild();
+    const child = [...failed.session.tabIds].find((id) => id !== failed.root.tabId);
+    failed.fake.events.debuggerDetach.emit({ tabId: 2001 }, "canceled_by_user");
+    await failed.bridge._test.settle(); await flush(30); failed.pumpEvents();
+    expect(failed.session.tabIds.has(child)).toBe(true);
+    expect(failed.fake.storage.session.get("agentBrowserOwnershipV1").tabs.find((item) => item.chromeTabId === 2001).cleanupOnly).toBe(true);
+    await failed.broker.closeSession(failed.session.cleanup);
+    expect(failed.fake.calls.tabsRemove).toEqual([2001, 1000]);
+    const healthy = await fixture({ healthy: true, synchronousDetach: false }); await healthy.addChild();
+    const healthyChild = [...healthy.session.tabIds].find((id) => id !== healthy.root.tabId);
+    healthy.fake.events.debuggerDetach.emit({ tabId: 2001 }, "canceled_by_user");
+    await healthy.bridge._test.settle(); await flush(30); healthy.pumpEvents();
+    expect(healthy.session.tabIds.has(healthyChild)).toBe(false);
+    await healthy.broker.closeSession(healthy.session.cleanup);
+    expect(healthy.fake.calls.tabsRemove).toEqual([1000]);
+    expect(healthy.fake.state.tabs.has(2001)).toBe(true);
+  });
+
+  it("revokes moved cleanup-only child ownership without removing the moved physical popup", async () => {
+    const f = await fixture(); await f.addChild();
+    f.fake.state.windows.set(20, { id: 20, type: "normal", focused: false, state: "normal" });
+    f.fake.state.tabs.get(2001).windowId = 20;
+    f.fake.events.tabAttached.emit(2001, { newWindowId: 20, newPosition: 0 });
+    await f.bridge._test.settle(); await flush(40); f.pumpEvents();
+    expect([...f.session.tabIds]).toEqual([f.root.tabId]);
+    await f.broker.closeSession(f.session.cleanup);
+    expect(f.fake.calls.tabsRemove).toEqual([1000]);
+    expect(f.fake.state.tabs.has(2001)).toBe(true);
+    expect(f.fake.state.tabs.has(1)).toBe(true);
+  });
+
+  it.each(["session close", "root revocation"])("preempts a published pending attachment on %s without resurrection", async (mode) => {
+    const f = await fixture(); let release, entered = false;
+    const held = new Promise((resolve) => { release = resolve; });
+    const attach = f.fake.chrome.debugger.attach;
+    f.fake.chrome.debugger.attach = async (target, version) => {
+      if (target.tabId === 2001) { entered = true; await held; }
+      return attach(target, version);
+    };
+    f.fake.addTab({ id: 2001, windowId: 10, active: false, url: "about:blank" }, true, 1000);
+    await flush(80); expect(entered).toBe(true); f.pumpEvents();
+    expect(f.session.tabIds.size).toBe(2);
+    if (mode === "root revocation") {
+      await f.fake.chrome.tabs.remove(1000); await flush(50); f.pumpEvents(); await flush(100);
+    } else {
+      // Observe the teardown response without waiting for the held adoption in
+      // the test helper's settle(). The real separate lane must make progress.
+      const id = requestId();
+      f.port.receive({ schema: SCHEMA, type: "request", id, profileKey: f.hello.profileKey,
+        connectionEpoch: f.hello.connectionEpoch, op: "session.close",
+        args: { session: f.session.name, tabIds: [...f.session.tabIds] } });
+      await flush(100);
+      expect(f.port.sent.find((message) => message.id === id && message.type === "response")).toMatchObject({ ok: true });
+    }
+    expect(f.fake.state.tabs.has(2001)).toBe(false);
+    expect(f.fake.state.tabs.has(1000)).toBe(false);
+    release(); await f.bridge._test.settle(); await flush(50); f.pumpEvents();
+    expect(f.bridge._test.inventory()).toEqual({ sessions: [] });
+    expect(f.fake.state.tabs.has(1)).toBe(true);
+    if (mode === "root revocation") {
+      expect(f.broker.sessions.has(f.session.name)).toBe(false);
+      expect(f.broker.ownerRecords.has(f.session.name)).toBe(false);
+    }
+  });
+
+  it("refuses teardown during an unresolved source lookup rather than granting cleanup from a numeric tab", async () => {
+    const f = await fixture(); let release, entered = false;
+    const held = new Promise((resolve) => { release = resolve; });
+    const get = f.fake.chrome.tabs.get;
+    f.fake.chrome.tabs.get = async (id) => { if (id === 2001) { entered = true; await held; } return get(id); };
+    f.fake.addTab({ id: 2001, windowId: 10, active: false, url: "about:blank" }, true, 1000);
+    await flush(60); expect(entered).toBe(true); f.pumpEvents();
+    expect([...f.session.tabIds]).toEqual([f.root.tabId]);
+    const id = requestId();
+    f.port.receive({ schema: SCHEMA, type: "request", id, profileKey: f.hello.profileKey,
+      connectionEpoch: f.hello.connectionEpoch, op: "session.close",
+      args: { session: f.session.name, tabIds: [f.root.tabId] } });
+    await flush(80);
+    expect(f.port.sent.find((message) => message.id === id && message.type === "response"))
+      .toMatchObject({ ok: false, error: { code: "TARGET_BUSY" } });
+    expect(f.fake.calls.tabsRemove).toEqual([]);
+    release(); await f.bridge._test.settle(); await flush(30); f.pumpEvents();
+    await f.broker.closeSession(f.session.cleanup);
+    expect(f.fake.calls.tabsRemove).toEqual([2001, 1000]);
   });
 });
 
@@ -1827,6 +2027,51 @@ describe("private MV3 extension contract", () => {
     expect(fake.state.alarms.has(contract.constants.RECONNECT_ALARM_NAME)).toBe(
       false,
     );
+  });
+
+  it("never announces a newly generated profile key until Chrome stores it", async () => {
+    const fake = makeFake();
+    const originalSet = fake.chrome.storage.local.set;
+    let writeMode = "reject";
+    fake.chrome.storage.local.set = async (items) => {
+      if (writeMode === "reject" && Object.hasOwn(items, "profileKey")) {
+        throw new Error("profile storage unavailable");
+      }
+      if (writeMode === "no-op" && Object.hasOwn(items, "profileKey")) return;
+      return originalSet(items);
+    };
+    const contract = loadContract();
+    const timers = new FakeTimers();
+    const bridge = contract.createBridge(fake.chrome, {
+      crypto: deterministicCrypto(),
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
+      now: () => 1_000,
+    });
+
+    await bridge.ensureConnected().catch(() => undefined);
+    expect(fake.ports).toHaveLength(0);
+    expect(fake.storage.local.has("profileKey")).toBe(false);
+    expect(bridge._test.profileKey).toBeNull();
+
+    writeMode = "no-op";
+    await bridge.ensureConnected();
+    expect(fake.ports).toHaveLength(0);
+    expect(fake.storage.local.has("profileKey")).toBe(false);
+    expect(bridge._test.profileKey).toBeNull();
+
+    writeMode = "persist";
+    await bridge.ensureConnected();
+    const hello = fake.ports[0].sent[0];
+    expect(hello.profileKey).toBe(fake.storage.local.get("profileKey"));
+
+    const coldFake = makeFake({ storage: fake.storage });
+    const coldBridge = contract.createBridge(coldFake.chrome, {
+      crypto: deterministicCrypto(73),
+      now: () => 1_001,
+    });
+    await coldBridge.ensureConnected();
+    expect(coldFake.ports[0].sent[0].profileKey).toBe(hello.profileKey);
   });
 
   it("creates one inactive root in an exact user window and rebinds only exact retained state", async () => {
@@ -4120,6 +4365,133 @@ fake.addTab({
     ]);
     expect(fake.calls.tabsRemove).not.toContain(2_001);
     expect(fake.state.tabs.has(2_001)).toBe(true);
+  });
+
+  it("closes an extension-created root after unsafe error navigation but only detaches an invited user tab", async () => {
+    const createdFake = makeFake();
+    const created = await boot(createdFake);
+    const createdRoot = await request(created.bridge, created.port, created.hello, "tab.create", {
+      session: "error-root",
+      url: "https://example.test/",
+    });
+    createdFake.events.debuggerEvent.emit(
+      { tabId: 1_000 },
+      "Page.frameNavigated",
+      { frame: { id: "main", url: "chrome-error://chromewebdata/" } },
+    );
+    await flush(20);
+    await created.bridge._test.settle();
+    expect(createdFake.calls.tabsRemove).toContain(1_000);
+    expect(createdFake.state.tabs.has(1_000)).toBe(false);
+    expect(created.bridge._test.inventory()).toEqual({ sessions: [] });
+    expect(created.port.sent).toContainEqual(expect.objectContaining({
+      tabId: createdRoot.result.tabId,
+      method: "AgentBrowser.tabRevoked",
+      params: { reason: "target_denied" },
+    }));
+
+    const invitedFake = makeFake();
+    const invited = await boot(invitedFake);
+    await request(invited.bridge, invited.port, invited.hello, "focus.snapshot", {});
+    const claim = await request(invited.bridge, invited.port, invited.hello, "tab.claim-active", {
+      session: "invited-error",
+    });
+    invitedFake.events.debuggerEvent.emit(
+      { tabId: 1 },
+      "Page.frameNavigated",
+      { frame: { id: "main", url: "chrome-error://chromewebdata/" } },
+    );
+    await flush(20);
+    await invited.bridge._test.settle();
+    expect(invitedFake.calls.tabsRemove).not.toContain(1);
+    expect(invitedFake.state.tabs.has(1)).toBe(true);
+    expect(invitedFake.calls.debuggerDetach).toContainEqual({ tabId: 1 });
+    expect(invited.bridge._test.inventory()).toEqual({ sessions: [] });
+    expect(invited.port.sent).toContainEqual(expect.objectContaining({
+      tabId: claim.result.tabId,
+      method: "AgentBrowser.tabRevoked",
+      params: { reason: "target_denied" },
+    }));
+  });
+
+  it("retains exact unsafe ownership for a truthful retry when physical tab removal fails", async () => {
+    const fake = makeFake({ emitDetachSynchronously: true });
+    const { bridge, port, hello } = await boot(fake);
+    const root = await request(bridge, port, hello, "tab.create", {
+      session: "error-retry",
+      url: "https://example.test/",
+    });
+    const remove = fake.chrome.tabs.remove;
+    let rejectOnce = true;
+    fake.chrome.tabs.remove = async (...args) => {
+      if (rejectOnce) {
+        rejectOnce = false;
+        throw new Error("fixture removal denied");
+      }
+      return remove(...args);
+    };
+    fake.events.debuggerEvent.emit(
+      { tabId: 1_000 },
+      "Page.frameNavigated",
+      { frame: { id: "main", url: "chrome-error://chromewebdata/" } },
+    );
+    await flush(20);
+    await bridge._test.settle();
+    expect(fake.state.tabs.has(1_000)).toBe(true);
+    expect(fake.calls.debuggerDetach).toContainEqual({ tabId: 1_000 });
+    expect(bridge._test.inventory().sessions[0].tabIds).toEqual([root.result.tabId]);
+    const failures = fake.storage.session.get("agentBrowserOwnershipFailuresV1");
+    expect(failures.entries).toContainEqual(expect.objectContaining({
+      tabId: root.result.tabId,
+      chromeTabId: 1_000,
+      stage: "tabs.remove",
+      code: "TAB_REMOVE_FAILED",
+    }));
+    const closed = await request(bridge, port, hello, "session.close", {
+      session: "error-retry",
+      tabIds: [root.result.tabId],
+    });
+    expect(closed.ok).toBe(true);
+    expect(fake.state.tabs.has(1_000)).toBe(false);
+    expect(bridge._test.inventory()).toEqual({ sessions: [] });
+  });
+
+  it("revokes every invited participant after unsafe navigation without deleting the user tab", async () => {
+    const fake = makeFake({ emitDetachSynchronously: true });
+    const { bridge, port, hello } = await boot(fake);
+    await request(bridge, port, hello, "focus.snapshot", {});
+    const a = await request(bridge, port, hello, "tab.claim-active", { session: "unsafe-a" });
+    await request(bridge, port, hello, "focus.snapshot", {});
+    const b = await request(bridge, port, hello, "tab.claim-active", { session: "unsafe-b" });
+    expect(a.result.tabId).not.toBe(b.result.tabId);
+    expect(a.result.sharedUserTab).toBe(b.result.sharedUserTab);
+    expect(bridge._test.inventory().sessions).toHaveLength(2);
+
+    fake.events.debuggerEvent.emit(
+      { tabId: 1 },
+      "Page.frameNavigated",
+      { frame: { id: "main", url: "chrome-error://chromewebdata/" } },
+    );
+    await flush(20);
+    await bridge._test.settle();
+
+    expect(bridge._test.inventory()).toEqual({ sessions: [] });
+    expect(fake.calls.debuggerDetach).toEqual([{ tabId: 1 }]);
+    expect(fake.calls.tabsRemove).toEqual([]);
+    expect(fake.state.tabs.has(1)).toBe(true);
+    for (const participant of [a, b]) {
+      expect(port.sent).toContainEqual(expect.objectContaining({
+        tabId: participant.result.tabId,
+        method: "AgentBrowser.tabRevoked",
+        params: { reason: "target_denied" },
+      }));
+    }
+    const neighbor = await request(bridge, port, hello, "tab.create", {
+      session: "unsafe-neighbor",
+      url: "https://example.test/",
+    });
+    expect(neighbor.ok).toBe(true);
+    expect(bridge._test.inventory().sessions.map((item) => item.session)).toEqual(["unsafe-neighbor"]);
   });
 
   it("enforces the retained-state caps of 16 sessions and 64 tabs per session", async () => {

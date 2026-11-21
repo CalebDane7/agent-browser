@@ -25,7 +25,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
 const EX_USAGE = 64;
 const EX_DATAERR = 65;
@@ -33,11 +33,15 @@ const EX_UNAVAILABLE = 69;
 const EX_SOFTWARE = 70;
 const SOCKET_ROOT = "/tmp/agent-browser-raw";
 const FIXED_CONTROLLER_BIN = "/home/cabule/.ai-controller/bin/browser-runtime";
+// WHY: this authenticates the launcher bytes, not the Python implementation
+// that launcher pins. A launcher change must update this pin and its exact
+// binding guard before installation; otherwise every real action fails closed.
 const FIXED_CONTROLLER_SHA256 =
-  "c1865f356acc304ba54a2698a5bf50aca2252c6a648561eae3cf7215e34cda12";
+  "b9bf2c8cae6a1cc4b4a68851125c533e7250e1aad86c098be00763f607f065d0";
 const FIXED_CONTROLLER_STATE_ROOT = "";
 const ACCEPTED_TRANSPORT_HELPER_REVISIONS = Object.freeze([
   "agent-browser.transport-proof-helper.wsl-stable.v2",
+  "agent-browser.transport-proof-helper.wsl-stable.v3",
 ]);
 const EXPECTED_NATIVE_MANIFEST_SHA256 =
   "e04a9d1a92b1b00325f3483673bf860a15d0be8efe634164e3583ba56890a915";
@@ -45,12 +49,14 @@ const EXPECTED_NATIVE_SHA256 =
   "a34421a9f7c3e498ce30f6dec4780e53488de5e01f330f2f2abcf8e79a6955f4";
 const EXPECTED_NATIVE_EXECUTION = "elf";
 const EXPECTED_POPUP_CLIENT_SHA256 =
-  "0077709cd495775b8ab1a19eb1918d14499ba9f66db73ba7fde18438d3ae2b19";
+  "1fecbc748983b2eba152897650e27c720aac3fb72bf6c9098aebeab2bd5d7468";
+const EXPECTED_REBIND_CLIENT_SHA256 =
+  "c8671fbc24dacf084e264c7b03a883990e46740fc9332b99f27531d242274e7d";
 const EXPECTED_CANONICAL_DIST_SCHEMA = "agent-browser-canonical-dist.v1";
 const EXPECTED_CANONICAL_DIST_SHA256 =
-  "c70aa3a02b1fc00910e378b417739bfe42ac784726d130c2245c22c859bce194";
+  "968a4f83d8001c74c66b79d48dc344efa2bcb08db84a0a3942e54a880aa7a88d";
 const EXPECTED_CANONICAL_GRAPH_SHA256 =
-  "4e3ba63ddd1a71f1e2996fdeea8a873453417c55bc2f1e1d5a1f236ecc5aedcf";
+  "787b124112d6cc638a0c5417dcf1c5d3f66de20cdbc67d92e69551a013a7aff6";
 const EXPECTED_CANONICAL_GRAPH_FILES = Object.freeze([
   "dist/actions.js",
   "dist/browser.js",
@@ -68,13 +74,37 @@ const EXPECTED_NATIVE_CONFIG_SHA256 =
   "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356";
 const BROWSER_ATTESTATION_SCHEMA =
   "agent-browser.supported-existing-transport-attestation.v1";
-const TARGET_RECEIPT_SCHEMA = "agent-browser.target-lease.v1";
-const TARGET_CLAIM_ENVELOPE_SCHEMA = "agent-browser.target-claim-envelope.v2";
-const TARGET_METADATA_SCHEMA = "agent-browser.target-receipt-metadata.v1";
+const WARM_BROWSER_ATTESTATION_SCHEMA =
+  "agent-browser.supported-warm-transport-attestation.v1";
+const WARM_BROWSER_RECONCILIATION_SCHEMA =
+  "agent-browser.supported-warm-transport-reconciliation.v1";
+const WARM_BROWSER_ATTESTATION_MAX_AGE_MS = 5_000;
+const TARGET_RECEIPT_SCHEMA = "agent-browser.target-lease.v2";
+const TARGET_CLAIM_ENVELOPE_SCHEMA = "agent-browser.target-claim-envelope.v3";
+const TARGET_METADATA_SCHEMA = "agent-browser.target-receipt-metadata.v2";
+const TASK_LEASE_SCHEMA = "agent-browser.task-lease.v7";
+const LEGACY_OWNERLESS_TASK_LEASE_SCHEMA = "agent-browser.task-lease.v6";
+const SESSION_RELEASE_SCHEMA = "agent-browser.session-release-result.v3";
+const TASK_ROOT_RELEASE_SCHEMA = "agent-browser.task-root-release-result.v2";
+const TARGET_LEASE_ABORT_SCHEMA = "agent-browser.target-lease-abort-result.v1";
+const ANCHOR_RETIREMENT_RESULT_SCHEMA =
+  "agent-browser.anchor-retirement-result.v1";
+const SESSION_TRANSPORT_RENEWAL_SCHEMA =
+  "agent-browser.session-transport-renewal.v1";
+const DAEMON_TRANSPORT_REBIND_REQUEST_SCHEMA =
+  "agent-browser.daemon-transport-rebind-request.v1";
+const DAEMON_TRANSPORT_REBIND_RESULT_SCHEMA =
+  "agent-browser.daemon-transport-rebind-result.v1";
+const DAEMON_TRANSPORT_REBIND_CAPABILITIES =
+  "click-expect-popup-v1,transport-rebind-v1,session-inventory-v1";
+const WORKSPACE_ENSURE_SCHEMA = "agent-browser.workspace-ensure-result.v1";
+const TASK_ROOT_TARGET_KIND = "agent-task-root";
+const TASK_ROOT_LEASE_KIND = "task-root";
 const BROKER_HEALTH_SCHEMA = "agent-browser.cdp-broker-health.v1";
-const SUPPORTED_CHROME_DEBUGGING_PORT = 9222;
 const BROKER_HEALTH_LIMIT_KEYS = Object.freeze([
   "maxClients",
+  "maxTaskClients",
+  "maxControllerClients",
   "maxFrameBytes",
   "maxHeaderBytes",
   "maxHeaders",
@@ -94,11 +124,15 @@ const BROKER_HEALTH_LIMIT_KEYS = Object.freeze([
 ]);
 const TARGET_MAX_TTL_MS = 30_000;
 const TARGET_FUTURE_SKEW_MS = 5_000;
-// A broker task lease is bounded to one hour. Reacquire a persistent workspace
-// before a worst-case native action can cross that boundary; extending the
-// bearer token would leave the already-connected daemon on stale authority.
+// A broker task lease is bounded to one hour. Renew its transport authorization
+// before a worst-case native action can cross that boundary. The exact daemon
+// and controller-created task root stay live; only transport-bound authority
+// may rotate, and a browser-generation change fails closed.
 const BROKER_CAPABILITY_REACQUIRE_MARGIN_MS = 3 * 60 * 1000;
 const MAX_FILE_BYTES = 64 * 1024;
+const NATIVE_RECEIPT_PUBLICATION_SETTLE_MS = 250;
+const EXACT_EXPIRED_RELEASE_HEALTH_DRIFT =
+  "broker_reconnect_blocked; Broker authenticated health identity changed";
 
 const scriptPath = realpathSync(fileURLToPath(import.meta.url));
 const scriptDir = dirname(scriptPath);
@@ -116,6 +150,11 @@ const popupClientPath = join(
   repoRoot,
   "scripts",
   "agent-browser-daemon-click.js",
+);
+const rebindClientPath = join(
+  repoRoot,
+  "scripts",
+  "agent-browser-daemon-rebind.js",
 );
 const canonicalDistManifestPath = join(
   repoRoot,
@@ -192,6 +231,107 @@ function exactKeys(value, expected) {
     !Array.isArray(value) &&
     Object.keys(value).sort().join("\0") === [...expected].sort().join("\0")
   );
+}
+
+export function validateAnchorDisposition(
+  value,
+  expectedAnchorTargetId,
+  expectedAccount = "",
+  expectedProfileBinding = "",
+  expectedBrowserGeneration = "",
+) {
+  const countFields = [
+    "taskLeaseCount",
+    "legacyLeaseCount",
+    "adoptionReservationCount",
+    "creationJournalCount",
+  ];
+  if (
+    !exactKeys(value, [
+      "schema",
+      "status",
+      "account",
+      "anchorTargetId",
+      "profileBinding",
+      "browserGeneration",
+      "consumerRecordCount",
+      ...countFields,
+      "anchorRetired",
+      "registrationRetired",
+      "profileBindingReceiptRetired",
+      "userTargetsPreserved",
+      "focusPreserved",
+      "brokerPreserved",
+    ]) ||
+    value.schema !== ANCHOR_RETIREMENT_RESULT_SCHEMA ||
+    !["retired-last-consumer", "preserved-active-consumers"].includes(
+      value.status,
+    ) ||
+    !/^(?:caleb|erebora|profile-[0-9a-f]{64})$/.test(value.account) ||
+    (expectedAccount && value.account !== expectedAccount) ||
+    typeof value.anchorTargetId !== "string" ||
+    !value.anchorTargetId ||
+    value.anchorTargetId.length > 160 ||
+    (expectedAnchorTargetId &&
+      value.anchorTargetId !== expectedAnchorTargetId) ||
+    !/^[0-9a-f]{64}$/.test(value.profileBinding) ||
+    (expectedProfileBinding &&
+      value.profileBinding !== expectedProfileBinding) ||
+    !/^[0-9a-f]{64}$/.test(value.browserGeneration) ||
+    (expectedBrowserGeneration &&
+      value.browserGeneration !== expectedBrowserGeneration) ||
+    !Number.isSafeInteger(value.consumerRecordCount) ||
+    value.consumerRecordCount < 0 ||
+    value.consumerRecordCount > 4 * 256 ||
+    countFields.some(
+      (field) =>
+        !Number.isSafeInteger(value[field]) ||
+        value[field] < 0 ||
+        value[field] > 256,
+    ) ||
+    countFields.reduce((sum, field) => sum + value[field], 0) !==
+      value.consumerRecordCount ||
+    value.userTargetsPreserved !== true ||
+    value.focusPreserved !== true ||
+    value.brokerPreserved !== true
+  ) {
+    fail("controller returned an invalid anchor disposition", EX_DATAERR);
+  }
+  const retired = value.status === "retired-last-consumer";
+  if (
+    (retired && value.consumerRecordCount !== 0) ||
+    (!retired && value.consumerRecordCount === 0) ||
+    value.anchorRetired !== retired ||
+    value.registrationRetired !== retired ||
+    value.profileBindingReceiptRetired !== retired
+  ) {
+    fail("controller returned an incoherent anchor disposition", EX_DATAERR);
+  }
+  return value;
+}
+
+export function validateReleaseAnchorDisposition(
+  value,
+  targetKind,
+  expectedAnchorTargetId,
+  expectedAccount = "",
+  expectedProfileBinding = "",
+  expectedBrowserGeneration = "",
+) {
+  if (
+    targetKind === TASK_ROOT_TARGET_KIND ||
+    targetKind === "agent-workspace"
+  ) {
+    return validateAnchorDisposition(
+      value,
+      expectedAnchorTargetId,
+      expectedAccount,
+      expectedProfileBinding,
+      expectedBrowserGeneration,
+    );
+  }
+  if (targetKind === "user-collaboration" && value === null) return null;
+  fail("controller returned an invalid release anchor disposition", EX_DATAERR);
 }
 
 function sanitize(value) {
@@ -343,7 +483,15 @@ class SecureDir {
     }
   }
 
-  openFile(name, maxBytes, mode = 0o600, { allowMissing = false } = {}) {
+  openFile(
+    name,
+    maxBytes,
+    mode = 0o600,
+    {
+      allowMissing = false,
+      settleNativeReceiptPublication = false,
+    } = {},
+  ) {
     const path = this.entryPath(name);
     let fd;
     try {
@@ -353,7 +501,44 @@ class SecureDir {
           (constants.O_CLOEXEC ?? 0) |
           (constants.O_NOFOLLOW ?? 0),
       );
-      const info = fstatSync(fd, { bigint: true });
+      let info = fstatSync(fd, { bigint: true });
+      if (
+        settleNativeReceiptPublication &&
+        name === "native-revision.receipt" &&
+        info.nlink === 2n
+      ) {
+        // WHY: exclusive publication links the fully fsynced temporary inode
+        // to its final name before removing the temporary link. A simultaneous
+        // safe first-use reader can therefore observe exactly two links for a
+        // few milliseconds. Wait only on this non-authority cache receipt and
+        // only while the already-open inode remains exact; never weaken the
+        // one-link rule for leases, credentials, or any other state file.
+        const expectedDev = info.dev;
+        const expectedIno = info.ino;
+        const deadline = Date.now() + NATIVE_RECEIPT_PUBLICATION_SETTLE_MS;
+        while (info.nlink === 2n && Date.now() < deadline) {
+          sleepSync(2);
+          info = fstatSync(fd, { bigint: true });
+          if (info.dev !== expectedDev || info.ino !== expectedIno) {
+            fail("native revision receipt inode changed during publication", EX_SOFTWARE);
+          }
+        }
+        let published;
+        try {
+          published = lstatSync(path, { bigint: true });
+        } catch {
+          fail("native revision receipt changed during publication", EX_SOFTWARE);
+        }
+        if (
+          info.nlink !== 1n ||
+          !published.isFile() ||
+          published.dev !== expectedDev ||
+          published.ino !== expectedIno ||
+          published.nlink !== 1n
+        ) {
+          fail("native revision receipt publication did not settle exactly", EX_SOFTWARE);
+        }
+      }
       if (
         !info.isFile() ||
         info.nlink !== 1n ||
@@ -445,6 +630,71 @@ class SecureDir {
     return true;
   }
 
+  replaceOwned(name, expectedRaw, value) {
+    const raw = Buffer.isBuffer(value) ? value : Buffer.from(String(value));
+    if (
+      !Buffer.isBuffer(expectedRaw) ||
+      expectedRaw.length === 0 ||
+      raw.length === 0 ||
+      raw.length > MAX_FILE_BYTES
+    ) {
+      fail("secure state replacement payload is invalid", EX_SOFTWARE);
+    }
+    const current = this.openFile(name, MAX_FILE_BYTES, 0o600, {
+      allowMissing: true,
+    });
+    if (!current || !current.raw.equals(expectedRaw)) {
+      closeOpened(current);
+      fail("secure state changed before replacement", EX_SOFTWARE);
+    }
+    closeOpened(current);
+
+    const tempName = `.tmp-${process.pid}-${randomBytes(12).toString("hex")}`;
+    const tempPath = this.entryPath(tempName);
+    let fd;
+    try {
+      fd = openSync(
+        tempPath,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          (constants.O_CLOEXEC ?? 0) |
+          (constants.O_NOFOLLOW ?? 0),
+        0o600,
+      );
+      writeFileSync(fd, raw);
+      fsyncSync(fd);
+      const info = fstatSync(fd, { bigint: true });
+      if (
+        !info.isFile() ||
+        info.nlink !== 1n ||
+        Number(info.uid) !== uid ||
+        Number(info.mode & 0o777n) !== 0o600
+      ) {
+        fail("secure state replacement is unsafe", EX_SOFTWARE);
+      }
+      closeSync(fd);
+      fd = undefined;
+      const unchanged = this.openFile(name, MAX_FILE_BYTES, 0o600, {
+        allowMissing: true,
+      });
+      if (!unchanged || !unchanged.raw.equals(expectedRaw)) {
+        closeOpened(unchanged);
+        fail("secure state changed during replacement", EX_SOFTWARE);
+      }
+      closeOpened(unchanged);
+      renameSync(tempPath, this.entryPath(name));
+      fsyncSync(this.fd);
+    } catch (error) {
+      if (fd !== undefined) closeSync(fd);
+      try {
+        unlinkSync(tempPath);
+      } catch {}
+      if (error instanceof WrapperError) throw error;
+      fail("secure state replacement failed", EX_UNAVAILABLE);
+    }
+  }
+
   removeOwned(name, expectedRaw = null) {
     const existing = this.openFile(name, MAX_FILE_BYTES, 0o600, {
       allowMissing: true,
@@ -527,17 +777,22 @@ function showHelp() {
     .write(`agent-browser - authenticated real Windows Chrome automation
 
 Usage:
-  agent-browser [--account caleb|erebora] --session TASK open URL
+  agent-browser [--account ALIAS|PROFILE_DIRECTORY|EMAIL] --session TASK open URL
+  agent-browser [--account ALIAS|PROFILE_DIRECTORY|EMAIL] --session TASK --current-tab snapshot
   agent-browser --session TASK --target-lease CONTROLLER_PATH open URL
   agent-browser --session TASK snapshot -i --compact
   agent-browser --session TASK click SELECTOR --expect-popup
+  agent-browser --session TASK foreground --input-boundary KIND
+  agent-browser --session TASK background
   agent-browser --session TASK close|doctor
 
 Only explicit nonempty sessions and HTTP(S) navigation are accepted. Caleb is
-the default; Erebora must be selected explicitly. A cold ordinary session asks
-the controller for its registered workspace lease. An existing user tab is
-accepted only through an explicit exact --target-lease. The controller, not
-this wrapper, supplies the supported Stable broker and Chrome consent state.
+the default; Erebora or another exact existing Stable profile must be selected
+explicitly. A cold ordinary session asks
+the controller for a distinct registered task root. An existing user tab is
+accepted only through an explicit exact --target-lease or the cold-bootstrap
+--current-tab invitation. The controller, not this wrapper, selects and leases
+the unique foreground tab in the exact profile context without activating it.
 `);
 }
 
@@ -592,6 +847,7 @@ const COMMANDS = new Set([
   "session",
   "foreground",
   "background",
+  "recover-metamask-vault",
   "doctor",
   "install",
   "connect",
@@ -625,6 +881,16 @@ const FLAG_GLOBALS = new Set([
   "--debug",
 ]);
 
+const HUMAN_INPUT_BOUNDARIES = new Set([
+  "password",
+  "two-factor",
+  "hardware-key",
+  "captcha",
+  "file-picker",
+  "recovery",
+  "account-authority",
+]);
+
 function takeArg(argv, index, option) {
   if (index + 1 >= argv.length || argv[index + 1] === "") {
     fail(`${option} requires a nonempty value`, EX_USAGE);
@@ -639,6 +905,7 @@ function parseArgs(argv) {
   let account = "";
   let session = "";
   let targetLease = "";
+  let currentTab = false;
   let json = false;
   let command = "";
   let commandArgs = [];
@@ -654,7 +921,7 @@ function parseArgs(argv) {
       if (arg === "") fail("empty command token is not allowed", EX_USAGE);
       if (arg === "--")
         fail("a leading option sentinel is not allowed", EX_USAGE);
-      if (/^--(?:session|account|target-lease|json)=/.test(arg)) {
+      if (/^--(?:session|account|target-lease|current-tab|json)=/.test(arg)) {
         fail(`noncanonical option form '${arg.split("=")[0]}'`, EX_USAGE);
       }
       if (
@@ -686,6 +953,10 @@ function parseArgs(argv) {
         case "--target-lease":
           targetLease = takeArg(argv, index, arg);
           index += 1;
+          break;
+        case "--current-tab":
+          if (currentTab) fail("duplicate --current-tab", EX_USAGE);
+          currentTab = true;
           break;
         case "--json":
           if (json) fail("duplicate --json", EX_USAGE);
@@ -719,7 +990,10 @@ function parseArgs(argv) {
       commandArgs.push(arg);
       continue;
     }
-    if (!literal && /^--(?:session|account|target-lease)(?:=|$)/.test(arg)) {
+    if (
+      !literal &&
+      /^--(?:session|account|target-lease|current-tab)(?:=|$)/.test(arg)
+    ) {
       fail(
         `routing option '${arg.split("=")[0]}' must precede the command`,
         EX_USAGE,
@@ -778,29 +1052,77 @@ function parseArgs(argv) {
       EX_USAGE,
     );
   }
-  if (account && !normalizeAccount(account)) {
-    fail(
-      "only caleb (Default) and erebora (Profile 1) are available",
-      EX_USAGE,
-    );
-  }
+  if (account) validateAccountSelector(account);
   if (["connect", "install"].includes(command)) {
     fail(
       `${command} is disabled on the authenticated persistent profile route`,
       EX_USAGE,
     );
   }
+  if (command === "recover-metamask-vault") {
+    // WHY: wallet recovery is one controller-owned action with no caller-
+    // selectable profile, target, extension, or payload path. The exact Caleb
+    // workspace and MetaMask origin are proven again inside the controller;
+    // the wrapper contributes only its canonical socket environment and the
+    // caller's already-open private stdin descriptor.
+    if (
+      session !== "metamask-recovery" ||
+      (account && !isCalebAccountAlias(account)) ||
+      targetLease ||
+      currentTab ||
+      !json ||
+      nativeGlobals.length > 0 ||
+      expectPopup ||
+      commandArgs.length !== 2 ||
+      commandArgs[0] !== "--expected-sha256" ||
+      !/^[0-9a-f]{64}$/.test(commandArgs[1])
+    ) {
+      fail(
+        "recover-metamask-vault requires Caleb session 'metamask-recovery', --json, and one lowercase --expected-sha256 digest; payload bytes must arrive only on stdin",
+        EX_USAGE,
+      );
+    }
+  }
   if (
-    ["foreground", "background"].includes(command) &&
+    command === "background" &&
     (commandArgs.length > 0 || nativeGlobals.length > 0)
   ) {
-    fail(`${command} accepts no browser action arguments`, EX_USAGE);
+    fail("background accepts no browser action arguments", EX_USAGE);
+  }
+  if (command === "foreground") {
+    // WHY: navigation, screenshots, automated clicks, popups, and storage work
+    // are background-safe. Requiring a narrow user-only boundary makes focus
+    // acquisition an explicit exception instead of an easy accidental screen
+    // takeover. The controller still binds the exact HWND/tab and restores the
+    // previous workspace on background/close.
+    if (
+      nativeGlobals.length > 0 ||
+      commandArgs.length !== 2 ||
+      commandArgs[0] !== "--input-boundary" ||
+      !HUMAN_INPUT_BOUNDARIES.has(commandArgs[1])
+    ) {
+      fail(
+        "foreground requires --input-boundary password|two-factor|hardware-key|captcha|file-picker|recovery|account-authority after the exact pending user-only input is observed",
+        EX_USAGE,
+      );
+    }
   }
   if (
     targetLease &&
     ["close", "session", "doctor", "foreground", "background"].includes(command)
   ) {
     fail("--target-lease is not valid for lifecycle commands", EX_USAGE);
+  }
+  if (
+    currentTab &&
+    ["close", "session", "doctor", "foreground", "background"].includes(
+      command,
+    )
+  ) {
+    fail("--current-tab is valid only for cold-bootstrap browser actions", EX_USAGE);
+  }
+  if (currentTab && targetLease) {
+    fail("--current-tab cannot be combined with --target-lease", EX_USAGE);
   }
   if (targetLease) {
     const expected = new RegExp(
@@ -816,6 +1138,9 @@ function parseArgs(argv) {
   if (expectPopup && targetLease) {
     fail("--expect-popup requires an already-live session", EX_USAGE);
   }
+  if (expectPopup && currentTab) {
+    fail("--expect-popup requires an already-live session", EX_USAGE);
+  }
   if (["open", "navigate"].includes(command)) validateNavigation(commandArgs);
   if (
     command === "session" &&
@@ -825,10 +1150,11 @@ function parseArgs(argv) {
   }
 
   return {
-    account: normalizeAccount(account) || "",
+    account,
     session,
     targetLease,
     targetLeaseSupplied: Boolean(targetLease),
+    currentTab,
     json,
     command,
     commandArgs,
@@ -837,33 +1163,87 @@ function parseArgs(argv) {
   };
 }
 
-function normalizeAccount(value) {
-  switch (String(value).toLowerCase()) {
-    case "caleb":
-    case "default":
-    case "calebdanemusic":
-    case "calebdanemusic@gmail.com":
-      return "caleb";
-    case "erebora":
-    case "erebora-crew":
-    case "ereboracrew":
-    case "ereboreacrew":
-    case "ereboracrew@gmail.com":
-    case "ereboreacrew@gmail.com":
-      return "erebora";
-    default:
-      return "";
+function validateAccountSelector(value) {
+  const selector = String(value);
+  if (
+    selector !== selector.trim() ||
+    Buffer.byteLength(selector, "utf8") > 320 ||
+    /[\u0000-\u001f\u007f]/.test(selector)
+  ) {
+    fail("--account must be one bounded exact Stable profile selector", EX_USAGE);
   }
+  return selector;
 }
 
-function accountIdentity(account) {
-  return account === "erebora"
-    ? { account, email: "ereboracrew@gmail.com", profile: "Profile 1" }
-    : {
-        account: "caleb",
-        email: "calebdanemusic@gmail.com",
-        profile: "Default",
-      };
+function isCalebAccountAlias(value) {
+  return [
+    "caleb",
+    "default",
+    "calebdanemusic",
+    "calebdanemusic@gmail.com",
+  ].includes(String(value).toLowerCase());
+}
+
+const accountIdentityCache = new Map();
+
+function accountIdentity(selector = "") {
+  const exactSelector = validateAccountSelector(selector);
+  if (accountIdentityCache.has(exactSelector)) {
+    return accountIdentityCache.get(exactSelector);
+  }
+  const args = ["resolve-stable-profile"];
+  if (exactSelector) args.push("--account", exactSelector);
+  args.push("--json");
+  const data = parseControllerJsonLine(
+    runController(args),
+    "controller Stable profile selection",
+    "PROFILE_SELECTION_FAILED; pinned controller did not resolve one exact existing Stable profile",
+  ).data;
+  if (
+    !exactKeys(data, [
+      "schema",
+      "ok",
+      "status",
+      "account",
+      "profileDirectory",
+      "profileEmail",
+      "selectorKind",
+    ]) ||
+    data.schema !== "agent-browser.stable-profile-selection.v1" ||
+    data.ok !== true ||
+    data.status !== "resolved" ||
+    !/^(?:caleb|erebora|profile-[0-9a-f]{64})$/.test(data.account) ||
+    typeof data.profileDirectory !== "string" ||
+    !data.profileDirectory ||
+    Buffer.byteLength(data.profileDirectory, "utf8") > 128 ||
+    [".", ".."].includes(data.profileDirectory) ||
+    /[\\/\u0000-\u001f\u007f]/.test(data.profileDirectory) ||
+    typeof data.profileEmail !== "string" ||
+    data.profileEmail !== data.profileEmail.trim().toLowerCase() ||
+    Buffer.byteLength(data.profileEmail, "utf8") > 254 ||
+    (data.profileEmail !== "" && !/^[^\s@]+@[^\s@]+$/.test(data.profileEmail)) ||
+    !/^(?:default|alias|directory|email|account-key)(?:\+(?:directory|email|account-key))*$/.test(
+      data.selectorKind,
+    )
+  ) {
+    fail("controller returned an invalid Stable profile selection", EX_DATAERR);
+  }
+  const identity = {
+    account: data.account,
+    email: data.profileEmail,
+    profile: data.profileDirectory,
+  };
+  accountIdentityCache.set(exactSelector, identity);
+  accountIdentityCache.set(identity.account, identity);
+  return identity;
+}
+
+function accountIdentityForBinding(binding) {
+  const identity = accountIdentity(binding.account);
+  if (identity.profile !== binding.profile) {
+    fail("session account binding no longer matches Stable Local State", EX_DATAERR);
+  }
+  return identity;
 }
 
 function validateNavigation(commandArgs) {
@@ -1084,6 +1464,20 @@ function expectedControllerEndpointId(port) {
   return `${port}-${sha256(Buffer.from(normalizedEndpoint, "utf8")).slice(0, 20)}`;
 }
 
+function controllerEndpointPort(endpointId) {
+  const match = /^([1-9][0-9]{0,4})-[0-9a-f]{20}$/.exec(endpointId);
+  const port = match ? Number(match[1]) : 0;
+  if (
+    !Number.isSafeInteger(port) ||
+    port < 1 ||
+    port > 65535 ||
+    endpointId !== expectedControllerEndpointId(port)
+  ) {
+    fail("controller endpoint identity is invalid", EX_DATAERR);
+  }
+  return port;
+}
+
 function probeBrokerHealth(authority, authorization) {
   const result = spawnSync(
     "/usr/bin/curl",
@@ -1153,6 +1547,7 @@ function probeBrokerHealth(authority, authorization) {
       "pendingClientRequests",
       "pendingInternalRequests",
       "configuredClientLeases",
+      "configuredClientLeasesSha256",
       "limits",
     ]) ||
     data.schema !== BROKER_HEALTH_SCHEMA ||
@@ -1164,6 +1559,7 @@ function probeBrokerHealth(authority, authorization) {
     data.browserGeneration !== authority.browserGeneration ||
     data.consentGeneration !== authority.data.consent_generation ||
     data.transportGeneration !== authority.transportGeneration ||
+    !/^[0-9a-f]{64}$/.test(data.configuredClientLeasesSha256) ||
     !exactKeys(data.limits, BROKER_HEALTH_LIMIT_KEYS) ||
     ![
       data.uptimeMs,
@@ -1184,7 +1580,12 @@ function probeBrokerHealth(authority, authorization) {
   return data;
 }
 
-function openTrustedSnapshot(path, expectedHash, controllerEndpointId) {
+function openTrustedSnapshotOnce(
+  path,
+  expectedHash,
+  controllerEndpointId,
+  supportedChromePort,
+) {
   const expectedPath = join(
     productionControllerStateRoot(),
     "endpoints",
@@ -1245,7 +1646,7 @@ function openTrustedSnapshot(path, expectedHash, controllerEndpointId) {
     data.chrome.pid <= 0 ||
     !exactKeys(data.chrome.listener, ["address", "port", "owningPid"]) ||
     data.chrome.listener.address !== "127.0.0.1" ||
-    data.chrome.listener.port !== SUPPORTED_CHROME_DEBUGGING_PORT ||
+    data.chrome.listener.port !== supportedChromePort ||
     data.chrome.listener.owningPid !== data.chrome.pid ||
     !/^[0-9a-f]{64}$/.test(data.chrome.executableSha256) ||
     !/^[0-9a-f]{64}$/.test(data.chrome.browserGeneration) ||
@@ -1281,9 +1682,9 @@ function openTrustedSnapshot(path, expectedHash, controllerEndpointId) {
     data.portproxy.adapter.prefixLength > 32 ||
     data.portproxy.adapter.scope !== "wsl-hyper-v-internal" ||
     data.portproxy.listen.address !== data.portproxy.adapter.address ||
-    data.portproxy.listen.port !== SUPPORTED_CHROME_DEBUGGING_PORT ||
+    data.portproxy.listen.port !== supportedChromePort ||
     data.portproxy.connect.address !== "127.0.0.1" ||
-    data.portproxy.connect.port !== SUPPORTED_CHROME_DEBUGGING_PORT ||
+    data.portproxy.connect.port !== supportedChromePort ||
     !exactKeys(data.socat, [
       "observation",
       "pid",
@@ -1301,7 +1702,7 @@ function openTrustedSnapshot(path, expectedHash, controllerEndpointId) {
     !exactKeys(data.socat.listen, ["address", "port"]) ||
     !exactKeys(data.socat.connect, ["address", "port"]) ||
     data.socat.listen.address !== "127.0.0.1" ||
-    data.socat.listen.port !== SUPPORTED_CHROME_DEBUGGING_PORT ||
+    data.socat.listen.port !== supportedChromePort ||
     data.socat.connect.address !== data.portproxy.listen.address ||
     data.socat.connect.port !== data.portproxy.listen.port ||
     !exactKeys(data.broker, [
@@ -1378,7 +1779,178 @@ function openTrustedSnapshot(path, expectedHash, controllerEndpointId) {
       EX_DATAERR,
     );
   }
+  Object.defineProperties(data, {
+    trustedProofSha256: { value: expectedHash, enumerable: false },
+    trustedProofObservedAtMs: {
+      value: data.observedAtMs,
+      enumerable: false,
+    },
+  });
   return data;
+}
+
+function currentTrustedProofBinding(
+  controllerEndpointId,
+  supportedChromePort,
+) {
+  const profileAttestationRoot = join(
+    productionControllerStateRoot(),
+    "endpoints",
+    controllerEndpointId,
+    "profile-attestation",
+  );
+  const proofPath = join(
+    profileAttestationRoot,
+    "transport-proof-state.v1.json",
+  );
+  const opened = openStaticFile(
+    join(profileAttestationRoot, "stable-chrome.v2.json"),
+    16 * 1024,
+    0o600,
+  );
+  const data = parseJson(opened.raw, "current Stable profile attestation");
+  closeOpened(opened);
+  if (
+    !exactKeys(data, [
+      "schema",
+      "profile_kind",
+      "profile_root",
+      "cdp_http_url",
+      "browser_generation",
+      "broker_generation",
+      "consent_generation",
+      "transport_generation",
+      "transport_proof_state_path",
+      "transport_proof_state_sha256",
+      "helper_revision",
+      "issued_at",
+      "expires_at",
+      "browser_ownership",
+    ]) ||
+    data.schema !== "agent-browser.profile-attestation.v2" ||
+    data.profile_kind !== "windows-stable" ||
+    data.profile_root !==
+      "C:\\Users\\Kaleeb\\AppData\\Local\\Google\\Chrome\\User Data" ||
+    data.cdp_http_url !== `http://127.0.0.1:${supportedChromePort}` ||
+    data.transport_proof_state_path !== proofPath ||
+    ![
+      data.browser_generation,
+      data.broker_generation,
+      data.consent_generation,
+      data.transport_generation,
+      data.transport_proof_state_sha256,
+    ].every((value) => /^[0-9a-f]{64}$/.test(value)) ||
+    !ACCEPTED_TRANSPORT_HELPER_REVISIONS.includes(data.helper_revision) ||
+    data.browser_ownership !== "external-user-stable"
+  ) {
+    fail(
+      "NEEDS_TRANSPORT_PROCESS_PROOF; current controller proof binding is invalid",
+      EX_DATAERR,
+    );
+  }
+  const issuedAtMs = parseUtcRfc3339(
+    data.issued_at,
+    "current Stable profile attestation issued_at",
+  );
+  const expiresAtMs = parseUtcRfc3339(
+    data.expires_at,
+    "current Stable profile attestation expires_at",
+  );
+  const now = Date.now();
+  if (
+    issuedAtMs > now + 1000 ||
+    expiresAtMs <= now ||
+    expiresAtMs <= issuedAtMs ||
+    expiresAtMs - issuedAtMs > 120_000
+  ) {
+    fail(
+      "NEEDS_TRANSPORT_PROCESS_PROOF; current controller proof binding is stale",
+      EX_UNAVAILABLE,
+    );
+  }
+  return {
+    path: proofPath,
+    sha256: data.transport_proof_state_sha256,
+    observedAtMs: issuedAtMs,
+  };
+}
+
+function openTrustedSnapshot(
+  path,
+  expectedHash,
+  controllerEndpointId,
+  supportedChromePort,
+  expectedObservedAtMs,
+) {
+  let selectedPath = path;
+  let selectedHash = expectedHash;
+  let minimumObservedAtMs =
+    Number.isSafeInteger(expectedObservedAtMs) && expectedObservedAtMs > 0
+      ? expectedObservedAtMs
+      : 0;
+  // WHY: proof and attestation are two independently atomic names. Another
+  // cold session can publish the same four-owner generation after a pinned
+  // controller response but before this process opens its proof. Select only
+  // a coherent exact current pair, monotonically and with a hard attempt cap;
+  // arbitrary hashes, changed owners, stale state, and unbounded retries stay
+  // rejected by this function and its caller's full identity comparison.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const snapshot = openTrustedSnapshotOnce(
+        selectedPath,
+        selectedHash,
+        controllerEndpointId,
+        supportedChromePort,
+      );
+      if (snapshot.observedAtMs < minimumObservedAtMs) {
+        fail(
+          "NEEDS_TRANSPORT_PROCESS_PROOF; controller proof observation regressed",
+          EX_DATAERR,
+        );
+      }
+      return snapshot;
+    } catch (error) {
+      if (
+        !(error instanceof WrapperError) ||
+        error.code !== EX_DATAERR ||
+        error.message !==
+          "NEEDS_TRANSPORT_PROCESS_PROOF; trusted controller proof hash mismatched" ||
+        attempt === 3
+      ) {
+        throw error;
+      }
+      const current = currentTrustedProofBinding(
+        controllerEndpointId,
+        supportedChromePort,
+      );
+      if (
+        minimumObservedAtMs <= 0 ||
+        current.observedAtMs <= minimumObservedAtMs
+      ) {
+        throw error;
+      }
+      minimumObservedAtMs = Math.max(
+        minimumObservedAtMs,
+        current.observedAtMs,
+      );
+      selectedPath = current.path;
+      selectedHash = current.sha256;
+    }
+  }
+  fail(
+    "NEEDS_TRANSPORT_PROCESS_PROOF; controller proof publication did not stabilize",
+    EX_UNAVAILABLE,
+  );
+}
+
+function trustedSnapshotMatchesControllerPublication(
+  snapshot,
+  expectedHash,
+  expectedObservedAtMs,
+) {
+  return snapshot.trustedProofSha256 === expectedHash
+    ? snapshot.observedAtMs === expectedObservedAtMs
+    : snapshot.observedAtMs > expectedObservedAtMs;
 }
 
 function parseControllerJsonLine(
@@ -1440,25 +2012,329 @@ function parseControllerJsonLine(
   };
 }
 
-function loadTransportAuthority(session = "") {
-  if (ACCEPTED_TRANSPORT_HELPER_REVISIONS.length === 0) {
+function parseMetaMaskRecoveryControllerResult(result) {
+  const canonicalLine = (value) =>
+    typeof value === "string" &&
+    value.length > 0 &&
+    Buffer.byteLength(value) <= 2 * 1024 &&
+    value.endsWith("\n") &&
+    !value.slice(0, -1).includes("\n");
+  const success =
+    result.status === 0 &&
+    !result.signal &&
+    result.stderr === "" &&
+    canonicalLine(result.stdout);
+  const failure =
+    result.status === 1 &&
+    !result.signal &&
+    result.stdout === "" &&
+    canonicalLine(result.stderr);
+  if (!success && !failure) {
     fail(
-      "NEEDS_SUPPORTED_TRANSPORT_CONTROLLER; no audited broker producer is installed",
+      "METAMASK_RECOVERY_FAILURE; pinned controller did not return one bounded canonical result",
       EX_UNAVAILABLE,
     );
   }
-  const controllerArgs = [
-    "ensure-supported-existing-transport",
-    "--broker-source-path",
-    brokerSourcePath,
+  const raw = success ? result.stdout : result.stderr;
+  let data;
+  try {
+    data = JSON.parse(raw.slice(0, -1));
+  } catch {
+    fail(
+      "METAMASK_RECOVERY_FAILURE; pinned controller returned invalid JSON",
+      EX_UNAVAILABLE,
+    );
+  }
+  const allowed = new Set([
+    "ok",
+    "status",
+    "noWrite",
+    "vaultPresent",
+    "defaultWorldProof",
+    "protectedStorageMatchesPreflight",
+    "rollbackPerformed",
+    "rollbackCompareMatched",
+    "cleanupComplete",
+  ]);
+  const safeSuccessStatuses = new Set([
+    "already_initialized",
+    "vault_restored_locked",
+  ]);
+  if (
+    !data ||
+    typeof data !== "object" ||
+    Array.isArray(data) ||
+    Object.keys(data).some((key) => !allowed.has(key)) ||
+    typeof data.ok !== "boolean" ||
+    typeof data.status !== "string" ||
+    !/^[A-Za-z0-9._-]{1,80}$/.test(data.status) ||
+    Object.entries(data).some(
+      ([key, value]) =>
+        key !== "status" && key !== "ok" && typeof value !== "boolean",
+    ) ||
+    data.ok !== success ||
+    (data.ok === true) !== safeSuccessStatuses.has(data.status) ||
+    raw !== canonicalJson(data) + "\n"
+  ) {
+    fail(
+      "METAMASK_RECOVERY_FAILURE; pinned controller result was not the safe recovery schema",
+      EX_UNAVAILABLE,
+    );
+  }
+  return data;
+}
+
+const WARM_TRANSPORT_ATTESTATION_KEYS = Object.freeze([
+  "schema",
+  "ok",
+  "status",
+  "session",
+  "account",
+  "profileDirectory",
+  "profileEmail",
+  "anchorTargetId",
+  "targetId",
+  "targetKind",
+  "browserContextId",
+  "profileBinding",
+  "receiptNonce",
+  "controllerEndpointId",
+  "browserGeneration",
+  "brokerGeneration",
+  "consentGeneration",
+  "transportGeneration",
+  "brokerCdpWebSocketUrl",
+  "brokerHealthUrl",
+  "brokerProducerContractPath",
+  "brokerProducerContractSha256",
+  "brokerOwnerReceiptPath",
+  "brokerOwnerReceiptSha256",
+  "brokerValidationReceiptPath",
+  "brokerValidationReceiptSha256",
+  "brokerUpstreamAuthorityPath",
+  "brokerUpstreamAuthoritySha256",
+  "brokerAuthorizationLeaseId",
+  "brokerAuthorizationPath",
+  "brokerAuthorizationSha256",
+  "brokerCapabilityExpiresAt",
+  "upstreamExpiresAtMs",
+  "validatedAtMs",
+]);
+
+function warmTransportAuthorityFromData(
+  data,
+  raw,
+  session,
+  lease,
+  {
+    schema = WARM_BROWSER_ATTESTATION_SCHEMA,
+    status = "warm-attested",
+    extraKeys = [],
+  } = {},
+) {
+  if (
+    !data ||
+    typeof data !== "object" ||
+    Array.isArray(data) ||
+    !exactKeys(data, [...WARM_TRANSPORT_ATTESTATION_KEYS, ...extraKeys]) ||
+    data.schema !== schema ||
+    data.ok !== true ||
+    data.status !== status ||
+    !/^(?:caleb|erebora|profile-[0-9a-f]{64})$/.test(data.account) ||
+    typeof data.profileDirectory !== "string" ||
+    !data.profileDirectory ||
+    Buffer.byteLength(data.profileDirectory, "utf8") > 128 ||
+    [".", ".."].includes(data.profileDirectory) ||
+    /[\\/\u0000-\u001f\u007f]/.test(data.profileDirectory) ||
+    typeof data.profileEmail !== "string" ||
+    data.profileEmail !== data.profileEmail.trim().toLowerCase() ||
+    Buffer.byteLength(data.profileEmail, "utf8") > 254 ||
+    (data.profileEmail !== "" && !/^[^\s@]+@[^\s@]+$/.test(data.profileEmail)) ||
+    !validControllerTargetId(data.anchorTargetId) ||
+    !validControllerTargetId(data.targetId) ||
+    !validControllerTargetId(data.browserContextId)
+  ) {
+    return null;
+  }
+  const digestFields = [
+    data.profileBinding,
+    data.receiptNonce,
+    data.browserGeneration,
+    data.brokerGeneration,
+    data.consentGeneration,
+    data.transportGeneration,
+    data.brokerProducerContractSha256,
+    data.brokerOwnerReceiptSha256,
+    data.brokerValidationReceiptSha256,
+    data.brokerUpstreamAuthoritySha256,
+    data.brokerAuthorizationLeaseId,
+    data.brokerAuthorizationSha256,
   ];
-  if (session) controllerArgs.push("--session", session);
-  controllerArgs.push("--json");
-  const response = parseControllerJsonLine(
-    runController(controllerArgs),
-    "controller transport attestation",
+  if (!digestFields.every((value) => /^[0-9a-f]{64}$/.test(value))) {
+    return null;
+  }
+  const supportedChromePort = controllerEndpointPort(
+    data.controllerEndpointId,
   );
-  const data = response.data;
+  const endpointRoot = join(
+    productionControllerStateRoot(),
+    "endpoints",
+    data.controllerEndpointId,
+  );
+  const brokerRoot = join(endpointRoot, "broker-authority");
+  const now = Date.now();
+  const capabilityExpiresAtMs = canonicalRfc3339Milliseconds(
+    data.brokerCapabilityExpiresAt,
+  );
+  if (
+    data.session === session &&
+    data.account === lease.data.account &&
+    data.profileDirectory === lease.data.profile &&
+    data.anchorTargetId === lease.data.anchorTargetId &&
+    data.targetId === lease.data.targetId &&
+    data.receiptNonce === lease.data.receiptNonce &&
+    data.browserGeneration !== lease.data.browserGeneration
+  ) {
+    fail(
+      "BROWSER_GENERATION_CHANGED; the exact task root cannot cross a browser restart",
+      EX_UNAVAILABLE,
+    );
+  }
+  if (
+    data.session !== session ||
+    data.account !== lease.data.account ||
+    data.profileDirectory !== lease.data.profile ||
+    data.anchorTargetId !== lease.data.anchorTargetId ||
+    data.targetId !== lease.data.targetId ||
+    data.targetKind !== lease.data.targetKind ||
+    data.browserContextId !== lease.data.browserContextId ||
+    data.profileBinding !== lease.data.profileBinding ||
+    data.receiptNonce !== lease.data.receiptNonce ||
+    data.controllerEndpointId !== lease.data.controllerEndpointId ||
+    data.browserGeneration !== lease.data.browserGeneration ||
+    data.brokerGeneration !== lease.data.brokerGeneration ||
+    data.transportGeneration !== lease.data.transportGeneration ||
+    data.brokerAuthorizationLeaseId !==
+      lease.data.brokerAuthorizationLeaseId ||
+    data.brokerAuthorizationPath !== lease.data.brokerAuthorizationPath ||
+    data.brokerAuthorizationSha256 !==
+      lease.data.brokerAuthorizationSha256 ||
+    data.brokerCapabilityExpiresAt !==
+      lease.data.brokerCapabilityExpiresAt ||
+    data.brokerAuthorizationPath !==
+      expectedBrokerAuthorizationPath(
+        data.controllerEndpointId,
+        data.brokerAuthorizationLeaseId,
+      ) ||
+    data.brokerProducerContractPath !==
+      join(brokerRoot, "producer-contract.json") ||
+    data.brokerOwnerReceiptPath !==
+      join(brokerRoot, "controller-broker-owner.json") ||
+    data.brokerValidationReceiptPath !==
+      join(brokerRoot, "producer-validation.json") ||
+    data.brokerUpstreamAuthorityPath !==
+      join(brokerRoot, "upstream-authority.json") ||
+    capabilityExpiresAtMs === null ||
+    capabilityExpiresAtMs <= now ||
+    !Number.isSafeInteger(data.upstreamExpiresAtMs) ||
+    data.upstreamExpiresAtMs <= now ||
+    !Number.isSafeInteger(data.validatedAtMs) ||
+    data.validatedAtMs > now + 1_000 ||
+    data.validatedAtMs < now - WARM_BROWSER_ATTESTATION_MAX_AGE_MS
+  ) {
+    return null;
+  }
+  const broker = parseBrokerRoutes(data);
+  const expiresMs = Math.min(
+    data.validatedAtMs + WARM_BROWSER_ATTESTATION_MAX_AGE_MS,
+    capabilityExpiresAtMs,
+    data.upstreamExpiresAtMs,
+  );
+  if (expiresMs <= now) return null;
+  const normalizedData = {
+    ...data,
+    controller_endpoint_id: data.controllerEndpointId,
+    broker_generation: data.brokerGeneration,
+    consent_generation: data.consentGeneration,
+  };
+  return {
+    data: normalizedData,
+    attestation: data,
+    profileIdentity: {
+      account: data.account,
+      email: data.profileEmail,
+      profile: data.profileDirectory,
+    },
+    snapshot: null,
+    webSocketUrl: broker.webSocketUrl,
+    healthUrl: broker.healthUrl,
+    port: broker.port,
+    upstreamPort: supportedChromePort,
+    browserGeneration: data.browserGeneration,
+    transportGeneration: data.transportGeneration,
+    authorization: null,
+    authorizationBinding: null,
+    health: null,
+    issuedMs: data.validatedAtMs,
+    expiresMs,
+    rawHash: sha256(raw),
+    warm: true,
+  };
+}
+
+function tryLoadWarmTransportAuthority(session, lease) {
+  if (!session || !lease?.data) return null;
+  try {
+    const response = parseControllerJsonLine(
+      runController([
+        "attest-supported-warm-transport",
+        "--broker-source-path",
+        brokerSourcePath,
+        "--session",
+        session,
+        "--controller-endpoint-id",
+        lease.data.controllerEndpointId,
+        "--json",
+      ]),
+      "controller warm transport attestation",
+      "TRANSPORT_FAILURE; pinned controller did not return a canonical warm attestation",
+      true,
+    );
+    if (response.controllerFailure) return null;
+    return warmTransportAuthorityFromData(
+      response.data,
+      response.raw,
+      session,
+      lease,
+    );
+  } catch (error) {
+    if (
+      error instanceof WrapperError &&
+      error.message.startsWith("BROWSER_GENERATION_CHANGED;")
+    ) {
+      throw error;
+    }
+    // Warm evidence never broadens authority. Any malformed, stale, or
+    // unavailable local proof falls through to the existing full ensure.
+    return null;
+  }
+}
+
+function transportAuthorityFromControllerResult(
+  controllerResult,
+  label = "controller transport attestation",
+  failure =
+    "TRANSPORT_FAILURE; pinned controller did not return a canonical attestation",
+  allowControllerFailure = false,
+) {
+  const response = parseControllerJsonLine(
+    controllerResult,
+    label,
+    failure,
+    allowControllerFailure,
+  );
+  if (response.controllerFailure) return null;
+  let data = response.data;
   if (
     !data ||
     typeof data !== "object" ||
@@ -1507,6 +2383,7 @@ function loadTransportAuthority(session = "") {
     "transportProofStatePath",
     "transportProofStateSha256",
     "transportProofObservedAtMs",
+    "transportProofIdentitySha256",
   ];
   if (
     !exactKeys(data, expectedKeys) ||
@@ -1520,6 +2397,7 @@ function loadTransportAuthority(session = "") {
       data.transportGeneration,
       data.brokerProducerContractSha256,
       data.transportProofStateSha256,
+      data.transportProofIdentitySha256,
     ].every((value) => /^[0-9a-f]{64}$/.test(value)) ||
     !Number.isSafeInteger(data.transportProofObservedAtMs) ||
     data.transportProofObservedAtMs <= 0
@@ -1530,12 +2408,13 @@ function loadTransportAuthority(session = "") {
     );
   }
   const broker = parseBrokerRoutes(data);
-  if (
-    data.controllerEndpointId !==
-    expectedControllerEndpointId(SUPPORTED_CHROME_DEBUGGING_PORT)
-  ) {
-    fail("controller endpoint identity is invalid", EX_DATAERR);
-  }
+  // Chrome's supported existing-profile mode owns a dynamic DevToolsActivePort.
+  // The endpoint ID cryptographically binds that exact port; hard-coding 9222
+  // rejects the genuine controller after Chrome has already approved the one
+  // broker and can strand a fresh prompt. Derive the port only from the exact
+  // endpoint identity, then require every attested Chrome/portproxy/socat owner
+  // and later target receipt to agree with it.
+  const supportedChromePort = controllerEndpointPort(data.controllerEndpointId);
   const endpointRoot = join(
     productionControllerStateRoot(),
     "endpoints",
@@ -1551,10 +2430,16 @@ function loadTransportAuthority(session = "") {
     data.transportProofStatePath,
     data.transportProofStateSha256,
     data.controllerEndpointId,
+    supportedChromePort,
+    data.transportProofObservedAtMs,
   );
   if (
+    !trustedSnapshotMatchesControllerPublication(
+      snapshot,
+      data.transportProofStateSha256,
+      data.transportProofObservedAtMs,
+    ) ||
     !ACCEPTED_TRANSPORT_HELPER_REVISIONS.includes(snapshot.helperRevision) ||
-    snapshot.observedAtMs !== data.transportProofObservedAtMs ||
     snapshot.broker.listen.port !== broker.port ||
     snapshot.broker.browserGeneration !== data.browserGeneration ||
     snapshot.broker.brokerGeneration !== data.brokerGeneration ||
@@ -1566,7 +2451,9 @@ function loadTransportAuthority(session = "") {
     snapshot.chrome.executablePath !==
       "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" ||
     snapshot.chrome.userDataRoot !==
-      "C:\\Users\\Kaleeb\\AppData\\Local\\Google\\Chrome\\User Data"
+      "C:\\Users\\Kaleeb\\AppData\\Local\\Google\\Chrome\\User Data" ||
+    transportProofIdentitySha256(snapshot) !==
+      data.transportProofIdentitySha256
   ) {
     fail(
       "NEEDS_TRANSPORT_PROCESS_PROOF; controller process snapshot mismatched",
@@ -1577,6 +2464,11 @@ function loadTransportAuthority(session = "") {
   if (browserGeneration !== data.browserGeneration) {
     fail("controller browser generation is invalid", EX_DATAERR);
   }
+  data = {
+    ...data,
+    transportProofStateSha256: snapshot.trustedProofSha256,
+    transportProofObservedAtMs: snapshot.observedAtMs,
+  };
   const normalizedData = {
     ...data,
     controller_endpoint_id: data.controllerEndpointId,
@@ -1590,6 +2482,7 @@ function loadTransportAuthority(session = "") {
     webSocketUrl: broker.webSocketUrl,
     healthUrl: broker.healthUrl,
     port: broker.port,
+    upstreamPort: supportedChromePort,
     browserGeneration,
     transportGeneration: data.transportGeneration,
     authorization: null,
@@ -1601,6 +2494,165 @@ function loadTransportAuthority(session = "") {
   };
 }
 
+function tryLoadCachedTransportAuthority(timeoutOverrideMs = null) {
+  try {
+    return transportAuthorityFromControllerResult(
+      runController(
+        ["attest-supported-existing-transport", "--json"],
+        timeoutOverrideMs,
+      ),
+      "controller cached transport attestation",
+      "TRANSPORT_FAILURE; pinned controller did not return a canonical cached attestation",
+      true,
+    );
+  } catch {
+    // Cached evidence authorizes no mutation.  Timeout, malformed, stale, or
+    // mismatched proof falls through exactly once to the stronger full ensure.
+    return null;
+  }
+}
+
+function sameTransportAuthorityIdentity(prior, current) {
+  if (!prior || !current) return false;
+  const { observedAtMs: _priorObservedAtMs, ...priorSnapshotIdentity } =
+    prior.snapshot;
+  const { observedAtMs: _currentObservedAtMs, ...currentSnapshotIdentity } =
+    current.snapshot;
+  return (
+    prior.data.controller_endpoint_id === current.data.controller_endpoint_id &&
+    prior.browserGeneration === current.browserGeneration &&
+    prior.data.broker_generation === current.data.broker_generation &&
+    prior.data.consent_generation === current.data.consent_generation &&
+    prior.transportGeneration === current.transportGeneration &&
+    prior.webSocketUrl === current.webSocketUrl &&
+    prior.healthUrl === current.healthUrl &&
+    prior.attestation.brokerProducerContractPath ===
+      current.attestation.brokerProducerContractPath &&
+    prior.attestation.brokerProducerContractSha256 ===
+      current.attestation.brokerProducerContractSha256 &&
+    canonicalJson(priorSnapshotIdentity) ===
+      canonicalJson(currentSnapshotIdentity)
+  );
+}
+
+function waitForCachedTransportAuthority({
+  verify = null,
+  expected = null,
+  timeoutMs = 50_000,
+} = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (verify) verify();
+    const remaining = deadline - Date.now();
+    const current = tryLoadCachedTransportAuthority(
+      Math.max(100, Math.min(5000, remaining)),
+    );
+    if (verify) verify();
+    if (current) {
+      if (expected && !sameTransportAuthorityIdentity(expected, current)) {
+        fail(
+          "supported browser or broker generation changed during concurrent transport convergence",
+          EX_DATAERR,
+        );
+      }
+      return current;
+    }
+    if (Date.now() >= deadline) break;
+    sleepSync(Math.min(25, deadline - Date.now()));
+  }
+  return null;
+}
+
+function loadTransportAuthority(
+  session = "",
+  warmLease = null,
+  upstreamPort = null,
+  coldBootstrap = null,
+) {
+  if (ACCEPTED_TRANSPORT_HELPER_REVISIONS.length === 0) {
+    fail(
+      "NEEDS_SUPPORTED_TRANSPORT_CONTROLLER; no audited broker producer is installed",
+      EX_UNAVAILABLE,
+    );
+  }
+  const warm = tryLoadWarmTransportAuthority(session, warmLease);
+  if (warm) return warm;
+  const controllerArgs = [
+    "ensure-supported-existing-transport",
+    "--broker-source-path",
+    brokerSourcePath,
+  ];
+  if (session) controllerArgs.push("--session", session);
+  if (Number.isSafeInteger(upstreamPort) && upstreamPort > 0) {
+    controllerArgs.push("--port", String(upstreamPort));
+  }
+  if (coldBootstrap !== null) {
+    if (
+      typeof coldBootstrap !== "object" ||
+      Array.isArray(coldBootstrap) ||
+      !exactKeys(coldBootstrap, [
+        "account",
+        "requestId",
+        "requesterPid",
+        "requesterStartTicks",
+        "verify",
+      ]) ||
+      !/^(?:caleb|erebora|profile-[0-9a-f]{64})$/.test(
+        coldBootstrap.account,
+      ) ||
+      !/^[0-9a-f]{64}$/.test(coldBootstrap.requestId) ||
+      !Number.isSafeInteger(coldBootstrap.requesterPid) ||
+      coldBootstrap.requesterPid <= 1 ||
+      !/^[0-9]+$/.test(coldBootstrap.requesterStartTicks) ||
+      typeof coldBootstrap.verify !== "function"
+    ) {
+      fail("cold Chrome bootstrap authority is invalid", EX_DATAERR);
+    }
+    controllerArgs.push(
+      "--account",
+      coldBootstrap.account,
+      "--bootstrap-request-id",
+      coldBootstrap.requestId,
+      "--requester-pid",
+      String(coldBootstrap.requesterPid),
+      "--requester-start-ticks",
+      coldBootstrap.requesterStartTicks,
+    );
+  }
+  controllerArgs.push("--json");
+  if (coldBootstrap !== null) {
+    const cached = tryLoadCachedTransportAuthority();
+    // Requester loss must fail closed and must never be swallowed by the
+    // optional cache or enter the approval-capable full ensure.
+    coldBootstrap.verify();
+    if (cached !== null) return cached;
+  }
+  const controllerResult = runController(controllerArgs);
+  if (coldBootstrap !== null) coldBootstrap.verify();
+  const parsedControllerResult = parseControllerJsonLine(
+    controllerResult,
+    "controller transport attestation",
+    "TRANSPORT_FAILURE; pinned controller did not return a canonical attestation",
+    true,
+  );
+  if (
+    parsedControllerResult.controllerFailure &&
+    parsedControllerResult.data.status === "profile_operation_busy"
+  ) {
+    // WHY: a follower that merely arrived behind the one exclusive
+    // launch/reconnect/approval owner must converge on that owner's fresh
+    // cached publication. Re-entering full ensure creates a lock convoy and a
+    // second approval-capable path. This loop performs only bounded read-only
+    // attestation and revalidates the exact cold requester around every wait.
+    const converged = waitForCachedTransportAuthority({
+      verify: coldBootstrap?.verify ?? null,
+      timeoutMs: 50_000,
+    });
+    if (converged) return converged;
+  }
+  return transportAuthorityFromControllerResult(controllerResult);
+}
+
 function bindTransportAuthorization(authority, binding) {
   if (
     !binding ||
@@ -1610,7 +2662,11 @@ function bindTransportAuthorization(authority, binding) {
     fail("broker authorization lease binding is invalid", EX_DATAERR);
   }
   const authorization = openBrokerAuthorization(authority, binding);
-  const health = probeBrokerHealth(authority, authorization);
+  // WHY: this Bearer capability is scoped to /cdp only. The broker's /healthz
+  // route intentionally accepts a separate controller-owned BrokerHealth
+  // credential, so probing health with the task credential returns 401 and
+  // rejects every valid new session. load/refreshTransportAuthority already
+  // carries the controller's fresh authenticated broker-health attestation.
   return {
     ...authority,
     authorization,
@@ -1619,12 +2675,16 @@ function bindTransportAuthorization(authority, binding) {
       brokerAuthorizationPath: binding.brokerAuthorizationPath,
       brokerAuthorizationSha256: binding.brokerAuthorizationSha256,
     },
-    health,
+    health: null,
   };
 }
 
-function refreshTransportAuthority(authority, session = "") {
-  const current = loadTransportAuthority(session);
+function refreshTransportAuthority(authority, session = "", warmLease = null) {
+  const current = loadTransportAuthority(
+    session,
+    warmLease,
+    authority.upstreamPort,
+  );
   if (
     current.browserGeneration !== authority.browserGeneration ||
     current.transportGeneration !== authority.transportGeneration ||
@@ -1640,14 +2700,228 @@ function refreshTransportAuthority(authority, session = "") {
   return current;
 }
 
-function revalidateTransportAuthority(authority, session = "") {
+function revalidateTransportAuthority(authority, session = "", warmLease = null) {
   if (!authority.authorizationBinding) {
     fail("task transport authorization is unavailable", EX_DATAERR);
   }
   return bindTransportAuthorization(
-    refreshTransportAuthority(authority, session),
+    refreshTransportAuthority(authority, session, warmLease),
     authority.authorizationBinding,
   );
+}
+
+function freshTransportProofArgs(authority) {
+  const hash = authority?.attestation?.transportProofStateSha256;
+  const observedAt = authority?.attestation?.transportProofObservedAtMs;
+  const identitySha256 = transportProofIdentitySha256(authority?.snapshot);
+  if (
+    authority?.warm ||
+    !/^[0-9a-f]{64}$/.test(hash ?? "") ||
+    !/^[0-9a-f]{64}$/.test(identitySha256 ?? "") ||
+    !Number.isSafeInteger(observedAt) ||
+    observedAt <= 0
+  ) {
+    fail("fresh transport proof binding is unavailable", EX_DATAERR);
+  }
+  return [
+    "--fresh-transport-proof-sha256",
+    hash,
+    "--fresh-transport-proof-observed-at-ms",
+    String(observedAt),
+    "--fresh-transport-proof-identity-sha256",
+    identitySha256,
+  ];
+}
+
+function transportProofIdentitySha256(snapshot) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    return "";
+  }
+  const chrome = snapshot.chrome ?? {};
+  const portproxy = snapshot.portproxy ?? {};
+  const portproxyListen = portproxy.listen ?? {};
+  const portproxyConnect = portproxy.connect ?? {};
+  const socat = snapshot.socat ?? {};
+  const broker = snapshot.broker ?? {};
+  return sha256(
+    canonicalJson([
+      String(chrome.browserGeneration ?? ""),
+      String(portproxy.pid ?? ""),
+      String(portproxy.startedAtUtc ?? ""),
+      String(portproxyListen.address ?? ""),
+      String(portproxyListen.port ?? ""),
+      String(portproxyConnect.address ?? ""),
+      String(portproxyConnect.port ?? ""),
+      String(socat.pid ?? ""),
+      String(socat.startTicks ?? ""),
+      String(broker.pid ?? ""),
+      String(broker.startTicks ?? ""),
+      String(broker.brokerGeneration ?? ""),
+      String(broker.consentGeneration ?? ""),
+      String(broker.transportGeneration ?? ""),
+      String(broker.producerContractSha256 ?? ""),
+    ]),
+  );
+}
+
+function adoptAcquiredTransportProof(authority, location) {
+  const proofSha256 = location?.transportProofStateSha256;
+  const observedAtMs = location?.transportProofObservedAtMs;
+  if (
+    !/^[0-9a-f]{64}$/.test(proofSha256 ?? "") ||
+    !Number.isSafeInteger(observedAtMs) ||
+    observedAtMs <= 0
+  ) {
+    fail(
+      "NEEDS_TRANSPORT_PROCESS_PROOF; acquired transport proof binding is invalid",
+      EX_UNAVAILABLE,
+    );
+  }
+  const snapshot = openTrustedSnapshot(
+    authority.attestation.transportProofStatePath,
+    proofSha256,
+    authority.data.controller_endpoint_id,
+    authority.upstreamPort,
+    observedAtMs,
+  );
+  const { observedAtMs: priorObservedAtMs, ...priorIdentity } =
+    authority.snapshot;
+  const { observedAtMs: renewedObservedAtMs, ...renewedIdentity } = snapshot;
+  if (
+    !trustedSnapshotMatchesControllerPublication(
+      snapshot,
+      proofSha256,
+      observedAtMs,
+    ) ||
+    renewedObservedAtMs < priorObservedAtMs ||
+    canonicalJson(renewedIdentity) !== canonicalJson(priorIdentity) ||
+    snapshot.broker.browserGeneration !== authority.browserGeneration ||
+    snapshot.broker.brokerGeneration !== authority.data.broker_generation ||
+    snapshot.broker.consentGeneration !== authority.data.consent_generation ||
+    snapshot.broker.transportGeneration !== authority.transportGeneration ||
+    snapshot.broker.producerContractPath !==
+      authority.attestation.brokerProducerContractPath ||
+    snapshot.broker.producerContractSha256 !==
+      authority.attestation.brokerProducerContractSha256
+  ) {
+    fail(
+      "NEEDS_TRANSPORT_PROCESS_PROOF; acquired transport proof identity changed",
+      EX_UNAVAILABLE,
+    );
+  }
+  return {
+    ...authority,
+    attestation: {
+      ...authority.attestation,
+      transportProofStateSha256: snapshot.trustedProofSha256,
+      transportProofObservedAtMs: snapshot.observedAtMs,
+    },
+    snapshot,
+    issuedMs: snapshot.observedAtMs,
+    expiresMs: snapshot.observedAtMs + snapshot.maxAgeMs,
+  };
+}
+
+function tryAttestAndReconcileWarmTransportAuthority(
+  authority,
+  session,
+  lease,
+) {
+  if (!authority?.authorizationBinding || !lease?.data) {
+    return null;
+  }
+  try {
+    const response = parseControllerJsonLine(
+      runController([
+        "attest-and-reconcile-supported-warm-transport",
+        "--broker-source-path",
+        brokerSourcePath,
+        "--session",
+        session,
+        "--controller-endpoint-id",
+        lease.data.controllerEndpointId,
+        "--anchor-target-id",
+        lease.data.anchorTargetId,
+        "--root-target-id",
+        lease.data.targetId,
+        "--receipt-nonce",
+        lease.data.receiptNonce,
+        "--json",
+      ]),
+      "controller warm transport reconciliation",
+      "TRANSPORT_FAILURE; pinned controller did not return a canonical warm reconciliation",
+      true,
+    );
+    if (response.controllerFailure) return null;
+    const extraKeys = [
+      "discoveredTargetIds",
+      "registeredTargetIds",
+      "truncated",
+      "reconciledAt",
+    ];
+    const current = warmTransportAuthorityFromData(
+      response.data,
+      response.raw,
+      session,
+      lease,
+      {
+        schema: WARM_BROWSER_RECONCILIATION_SCHEMA,
+        status: "warm-attested-reconciled",
+        extraKeys,
+      },
+    );
+    if (!current) return null;
+    const data = response.data;
+    const stableFields = authority.warm
+      ? WARM_TRANSPORT_ATTESTATION_KEYS.filter(
+          (key) => !["schema", "status", "validatedAtMs"].includes(key),
+        )
+      : [
+          "controllerEndpointId",
+          "browserGeneration",
+          "brokerGeneration",
+          "consentGeneration",
+          "transportGeneration",
+          "brokerCdpWebSocketUrl",
+          "brokerHealthUrl",
+          "brokerProducerContractPath",
+          "brokerProducerContractSha256",
+        ];
+    const now = Date.now();
+    if (
+      stableFields.some(
+        (key) => data[key] !== authority.attestation?.[key],
+      ) ||
+      ![data.discoveredTargetIds, data.registeredTargetIds].every(
+        (values) =>
+          Array.isArray(values) &&
+          values.length <= 20 &&
+          new Set(values).size === values.length &&
+          values.every(validControllerTargetId),
+      ) ||
+      data.registeredTargetIds.some(
+        (targetId) => !data.discoveredTargetIds.includes(targetId),
+      ) ||
+      data.truncated !== false ||
+      !Number.isSafeInteger(data.reconciledAt) ||
+      data.reconciledAt > now + 1_000 ||
+      data.reconciledAt < now - WARM_BROWSER_ATTESTATION_MAX_AGE_MS
+    ) {
+      return null;
+    }
+    return bindTransportAuthorization(
+      current,
+      authority.authorizationBinding,
+    );
+  } catch (error) {
+    if (
+      error instanceof WrapperError &&
+      error.message.startsWith("BROWSER_GENERATION_CHANGED;")
+    ) {
+      throw error;
+    }
+    return null;
+  }
 }
 
 function packageVersion() {
@@ -1835,8 +3109,10 @@ function nativeStatRecord(info) {
 function spawnVerifiedFd(opened, args, options = {}) {
   const capture = options.capture ?? false;
   const env = { ...BASE_CHILD_ENV, ...(options.env ?? {}) };
+  const stdin =
+    capture && options.inheritStdin !== true ? "ignore" : "inherit";
   const stdio = capture
-    ? ["ignore", "pipe", "pipe", opened.fd]
+    ? [stdin, "pipe", "pipe", opened.fd]
     : ["inherit", "inherit", "inherit", opened.fd];
   if (options.config) stdio.push(options.config.fd);
   const executable =
@@ -1891,6 +3167,7 @@ class NativeRuntime {
     }
     const existing = this.root.openFile(this.receiptName, 4096, 0o600, {
       allowMissing: true,
+      settleNativeReceiptPublication: true,
     });
     const stat = nativeStatRecord(this.opened.info);
     if (existing) {
@@ -1925,7 +3202,9 @@ class NativeRuntime {
     if (
       !this.root.writeAtomic(this.receiptName, receipt, { exclusive: true })
     ) {
-      const winner = this.root.openFile(this.receiptName, 4096, 0o600);
+      const winner = this.root.openFile(this.receiptName, 4096, 0o600, {
+        settleNativeReceiptPublication: true,
+      });
       this.validateReceipt(winner, stat);
     }
   }
@@ -1978,26 +3257,39 @@ function openPinnedTool(path, expectedHash) {
   return opened;
 }
 
-function runController(args, timeoutOverrideMs = null) {
+function runController(args, timeoutOverrideMs = null, options = {}) {
   const opened = openPinnedTool(FIXED_CONTROLLER_BIN, FIXED_CONTROLLER_SHA256);
-  const defaultTimeout = [
-    "acquire-focus",
-    // Existing-profile target proof, exact lease consumption/registration,
-    // and exact abort can exceed five seconds on a healthy real Chrome
-    // profile; keep them bounded without killing a valid lifecycle transition.
-    "acquire-registered-workspace-target-lease",
-    "consume-target-receipt",
-    "discover-owned-descendants",
-    "ensure-supported-existing-transport",
-    "proof-state",
-    "register-session",
-    "release-focus",
-    "release-session",
-    "release-target-lease",
-    "release-workspace",
-  ].includes(args[0])
-    ? 25_000
-    : 5000;
+  // WHY: transport setup includes a bounded 30-second native Windows owner
+  // observation plus exact Chrome approval and broker-contract proof.  Its
+  // parent deadline must outlive those child bounds; otherwise the wrapper
+  // kills a healthy controller mid-approval and strands a dead broker receipt
+  // with an orphan native prompt.  Other lifecycle calls keep the tighter cap.
+  const defaultTimeout =
+    args[0] === "ensure-supported-existing-transport" &&
+    args.includes("--bootstrap-request-id")
+      ? 120_000
+      : ["ensure-supported-existing-transport", "ensure-workspace"].includes(args[0])
+      ? 60_000
+      : args[0] === "recover-metamask-vault"
+        ? 60_000
+      : [
+          "acquire-focus",
+          // Existing-profile target proof, exact lease consumption/registration,
+          // and exact abort can exceed five seconds on a healthy real Chrome
+          // profile; keep them bounded without killing a valid lifecycle transition.
+          "acquire-session-task-root-lease",
+          "consume-target-receipt",
+          "discover-owned-descendants",
+          "proof-state",
+          "register-session",
+          "release-focus",
+          "release-session",
+          "release-task-root",
+          "release-target-lease",
+          "renew-session-transport",
+        ].includes(args[0])
+        ? 25_000
+        : 5000;
   const timeout =
     Number.isSafeInteger(timeoutOverrideMs) && timeoutOverrideMs >= 100
       ? Math.min(defaultTimeout, timeoutOverrideMs)
@@ -2007,9 +3299,34 @@ function runController(args, timeoutOverrideMs = null) {
     execution: "fixture-script",
     timeout,
     maxBuffer: 12 * 1024,
+    inheritStdin: options.inheritStdin === true,
   });
   closeOpened(opened);
   return result;
+}
+
+function runMetaMaskVaultRecovery(parsed) {
+  // WHY: the process-bound Stable-profile receipt intentionally expires after
+  // two minutes.  Recovery can be invoked long after the task daemon started,
+  // so using only its warm broker proof makes a valid persistent connection
+  // fail generically and invites retries.  Force the normal controller-owned
+  // transport attestation here; it reuses the approved broker while refreshing
+  // the short-lived profile receipt before any private payload reaches Python.
+  loadTransportAuthority(parsed.session);
+  const result = runController(
+    [
+      "recover-metamask-vault",
+      "--expected-sha256",
+      parsed.commandArgs[1],
+      "--json",
+    ],
+    60_000,
+    { inheritStdin: true },
+  );
+  const data = parseMetaMaskRecoveryControllerResult(result);
+  const stream = data.ok === true ? process.stdout : process.stderr;
+  stream.write(canonicalJson(data) + "\n");
+  return data.ok === true ? 0 : 1;
 }
 
 function bindingName(session) {
@@ -2040,8 +3357,11 @@ function loadBinding(root, session) {
   if (
     !exactKeys(values, ["schema", "account", "profile"]) ||
     values.schema !== "agent-browser-session-account-v1" ||
-    accountIdentity(values.account).profile !== values.profile ||
-    !["caleb", "erebora"].includes(values.account)
+    !/^(?:caleb|erebora|profile-[0-9a-f]{64})$/.test(values.account) ||
+    !values.profile ||
+    Buffer.byteLength(values.profile, "utf8") > 128 ||
+    [".", ".."].includes(values.profile) ||
+    /[\\/\u0000-\u001f\u007f]/.test(values.profile)
   ) {
     fail("session account binding is invalid", EX_DATAERR);
   }
@@ -2069,21 +3389,97 @@ function processStatIdentity(pid) {
   return { state: fields[0], startTicks: fields[19] };
 }
 
+function processAncestorIdentity(pid) {
+  const identity = processStatIdentity(pid);
+  const raw = readProcBounded(`/proc/${pid}/stat`, 4096).toString("utf8");
+  const end = raw.lastIndexOf(")");
+  const fields = end < 0 ? [] : raw.slice(end + 2).trim().split(/\s+/);
+  const parentPid = Number(fields[1]);
+  if (!Number.isSafeInteger(parentPid) || parentPid < 0) {
+    fail("agent owner process ancestry is invalid", EX_DATAERR);
+  }
+  let executable = "";
+  let argv = [];
+  try {
+    executable = readlinkSync(`/proc/${pid}/exe`);
+    argv = readProcBounded(`/proc/${pid}/cmdline`, 64 * 1024)
+      .toString("utf8")
+      .split("\0")
+      .filter(Boolean)
+      .slice(0, 8);
+  } catch {}
+  return { ...identity, pid, parentPid, executable, argv };
+}
+
+function recognizedAgentProcess(identity) {
+  const names = [
+    basename(identity.executable || ""),
+    ...identity.argv.slice(0, 4).map((value) => basename(value)),
+  ].map((value) => value.toLowerCase().replace(/\.exe$/, ""));
+  return names.some((value) => ["codex", "claude", "gemini"].includes(value));
+}
+
+function invokingAgentIdentity() {
+  // WHY: the daemon outlives the short wrapper and shell command. Binding it
+  // only to the daemon lets another Codex/Claude process silently reuse the
+  // same tab. Walk the observed parent chain once, select the nearest known
+  // agent process (or the immediate caller for ordinary CLI use), then re-read
+  // its birth identity so PID reuse cannot transfer ownership.
+  const chain = [];
+  let pid = process.ppid;
+  for (let depth = 0; depth < 16 && pid > 1; depth += 1) {
+    const identity = processAncestorIdentity(pid);
+    chain.push(identity);
+    if (identity.parentPid === pid || identity.parentPid < 1) break;
+    pid = identity.parentPid;
+  }
+  if (chain.length === 0) {
+    fail("agent owner process ancestry is unavailable", EX_UNAVAILABLE);
+  }
+  const selected = chain.find(recognizedAgentProcess) ?? chain[0];
+  const current = processAncestorIdentity(selected.pid);
+  if (
+    current.startTicks !== selected.startTicks ||
+    current.parentPid !== selected.parentPid ||
+    ["Z", "X", "x"].includes(current.state)
+  ) {
+    fail("agent owner process changed during attribution", EX_UNAVAILABLE);
+  }
+  return { pid: selected.pid, startTicks: selected.startTicks };
+}
+
 function processStartTicks(pid) {
   return processStatIdentity(pid).startTicks;
 }
 
-function processIdentityIsLive(pid, expectedStartTicks = null) {
+// WHY: ownerless retirement needs proof of death, not merely failure to observe
+// a process. Permission, parsing, and transient /proc errors remain ambiguous;
+// only absence, a terminal state, or another birth at the PID proves death.
+function processIdentityStatus(pid, expectedStartTicks = null) {
   try {
     process.kill(pid, 0);
-    const identity = processStatIdentity(pid);
-    return (
-      !["Z", "X", "x"].includes(identity.state) &&
-      (expectedStartTicks === null || identity.startTicks === expectedStartTicks)
-    );
-  } catch {
-    return false;
+  } catch (error) {
+    return error?.code === "ESRCH" ? "dead" : "ambiguous";
   }
+  let identity;
+  try {
+    identity = processStatIdentity(pid);
+  } catch (error) {
+    return ["ENOENT", "ESRCH"].includes(error?.code) ? "dead" : "ambiguous";
+  }
+  if (["Z", "X", "x"].includes(identity.state)) return "dead";
+  if (expectedStartTicks !== null && identity.startTicks !== expectedStartTicks) {
+    return "dead";
+  }
+  return "live";
+}
+
+function processIdentityIsLive(pid, expectedStartTicks = null) {
+  return processIdentityStatus(pid, expectedStartTicks) === "live";
+}
+
+function processIdentityIsDefinitelyDead(pid, expectedStartTicks) {
+  return processIdentityStatus(pid, expectedStartTicks) === "dead";
 }
 
 function readProcBounded(path, maxBytes) {
@@ -2152,6 +3548,27 @@ function processOwnsSocket(pid, expectedSocketPath) {
     });
   } catch {
     return false;
+  }
+}
+
+function socketPathHasLiveKernelEndpoint(expectedSocketPath) {
+  try {
+    const table = readProcBounded("/proc/net/unix", 1024 * 1024).toString(
+      "utf8",
+    );
+    return table
+      .split("\n")
+      .slice(1)
+      .some((line) => {
+        const fields = line.trim().split(/\s+/);
+        return (
+          fields.length >= 8 && fields.slice(7).join(" ") === expectedSocketPath
+        );
+      });
+  } catch {
+    // An unavailable kernel ownership observation is ambiguous, not proof that
+    // an old endpoint is dead.
+    return true;
   }
 }
 
@@ -2224,7 +3641,7 @@ function validateDaemonIdentity(root, session, state, graph) {
     schema !== "agent-browser-daemon-identity-v2" ||
     runtimeVersion !== packageVersion() ||
     protocol !== "jsonl-command-v1" ||
-    capabilities !== "click-expect-popup-v1" ||
+    capabilities !== DAEMON_TRANSPORT_REBIND_CAPABILITIES ||
     receiptSession !== session ||
     receiptPid !== String(state.pid) ||
     receiptStartTicks !== state.startTicks ||
@@ -2327,6 +3744,41 @@ function readSessionState(root, session) {
   return { kind: "closed" };
 }
 
+const LEGACY_OWNERLESS_TASK_LEASE_KEYS = Object.freeze([
+  "schema",
+  "session",
+  "account",
+  "profile",
+  "controllerEndpointId",
+  "browserGeneration",
+  "brokerGeneration",
+  "transportGeneration",
+  "registrationReceiptSha256",
+  "profileBinding",
+  "browserContextId",
+  "anchorTargetId",
+  "targetId",
+  "targetKind",
+  "receiptNonce",
+  "targetLeaseKind",
+  "brokerAuthorizationLeaseId",
+  "brokerAuthorizationPath",
+  "brokerAuthorizationSha256",
+  "brokerCapabilityExpiresAt",
+  "pid",
+  "startTicks",
+  "socketDev",
+  "socketIno",
+  "leaseId",
+  "createdAt",
+]);
+
+const TASK_LEASE_KEYS = Object.freeze([
+  ...LEGACY_OWNERLESS_TASK_LEASE_KEYS,
+  "agentPid",
+  "agentStartTicks",
+]);
+
 function loadTaskLease(root, session) {
   const opened = root.openFile(taskLeaseName(session), 4096, 0o600, {
     allowMissing: true,
@@ -2335,38 +3787,25 @@ function loadTaskLease(root, session) {
   const data = parseJson(opened.raw, "task ownership lease");
   const raw = opened.raw;
   closeOpened(opened);
+  const legacyOwnerless = data.schema === LEGACY_OWNERLESS_TASK_LEASE_SCHEMA;
   if (
-    !exactKeys(data, [
-      "schema",
-      "session",
-      "account",
-      "profile",
-      "controllerEndpointId",
-      "browserGeneration",
-      "brokerGeneration",
-      "transportGeneration",
-      "registrationReceiptSha256",
-      "profileBinding",
-      "browserContextId",
-      "targetId",
-      "targetKind",
-      "receiptNonce",
-      "targetLeaseKind",
-      "brokerAuthorizationLeaseId",
-      "brokerAuthorizationPath",
-      "brokerAuthorizationSha256",
-      "brokerCapabilityExpiresAt",
-      "pid",
-      "startTicks",
-      "socketDev",
-      "socketIno",
-      "leaseId",
-      "createdAt",
-    ]) ||
-    data.schema !== "agent-browser.task-lease.v5" ||
+    !exactKeys(
+      data,
+      legacyOwnerless ? LEGACY_OWNERLESS_TASK_LEASE_KEYS : TASK_LEASE_KEYS,
+    ) ||
+    (!legacyOwnerless && data.schema !== TASK_LEASE_SCHEMA) ||
     data.session !== session ||
-    !["caleb", "erebora"].includes(data.account) ||
-    accountIdentity(data.account).profile !== data.profile ||
+    (legacyOwnerless
+      ? !(
+          (data.account === "caleb" && data.profile === "Default") ||
+          (data.account === "erebora" && data.profile === "Profile 1")
+        )
+      : !/^(?:caleb|erebora|profile-[0-9a-f]{64})$/.test(data.account)) ||
+    typeof data.profile !== "string" ||
+    !data.profile ||
+    Buffer.byteLength(data.profile, "utf8") > 128 ||
+    [".", ".."].includes(data.profile) ||
+    /[\\/\u0000-\u001f\u007f]/.test(data.profile) ||
     !/^[a-z0-9][a-z0-9-]{0,127}$/.test(data.controllerEndpointId) ||
     !/^[0-9a-f]{64}$/.test(data.browserGeneration) ||
     !/^[0-9a-f]{64}$/.test(data.brokerGeneration) ||
@@ -2377,15 +3816,19 @@ function loadTaskLease(root, session) {
     !data.browserContextId ||
     data.browserContextId.length > 256 ||
     /[\u0000-\u001f\u007f]/.test(data.browserContextId) ||
+    typeof data.anchorTargetId !== "string" ||
+    !data.anchorTargetId ||
+    data.anchorTargetId.length > 256 ||
+    /[\u0000-\u001f\u007f]/.test(data.anchorTargetId) ||
     typeof data.targetId !== "string" ||
     !data.targetId ||
     data.targetId.length > 256 ||
     /[\u0000-\u001f\u007f]/.test(data.targetId) ||
-    !["agent-workspace", "user-collaboration"].includes(data.targetKind) ||
+    ![TASK_ROOT_TARGET_KIND, "user-collaboration"].includes(data.targetKind) ||
     !/^[0-9a-f]{64}$/.test(data.receiptNonce) ||
-    !["persistent-workspace", "user-adopted"].includes(data.targetLeaseKind) ||
-    (data.targetKind === "agent-workspace"
-      ? data.targetLeaseKind !== "persistent-workspace"
+    ![TASK_ROOT_LEASE_KIND, "user-adopted"].includes(data.targetLeaseKind) ||
+    (data.targetKind === TASK_ROOT_TARGET_KIND
+      ? data.targetLeaseKind !== TASK_ROOT_LEASE_KIND
       : data.targetLeaseKind !== "user-adopted") ||
     !/^[0-9a-f]{64}$/.test(data.brokerAuthorizationLeaseId) ||
     data.brokerAuthorizationPath !==
@@ -2395,6 +3838,10 @@ function loadTaskLease(root, session) {
       ) ||
     !/^[0-9a-f]{64}$/.test(data.brokerAuthorizationSha256) ||
     canonicalRfc3339Milliseconds(data.brokerCapabilityExpiresAt) === null ||
+    (!legacyOwnerless &&
+      (!Number.isSafeInteger(data.agentPid) ||
+        data.agentPid <= 1 ||
+        !/^[0-9]+$/.test(data.agentStartTicks))) ||
     !Number.isSafeInteger(data.pid) ||
     data.pid <= 0 ||
     !/^[0-9]+$/.test(data.startTicks) ||
@@ -2405,10 +3852,139 @@ function loadTaskLease(root, session) {
   ) {
     fail("task ownership lease is invalid", EX_DATAERR);
   }
-  return { data, raw };
+  return {
+    data,
+    raw,
+    ownership: legacyOwnerless ? "legacy-ownerless" : "agent",
+  };
 }
 
-function validateTaskLease(lease, state, identity, authority) {
+function validateAgentOwner(lease, owner, { allowDeadOwner = false } = {}) {
+  if (lease?.ownership === "legacy-ownerless") {
+    // WHY: v6 predates exact agent PID/start ownership. The current caller is
+    // not evidence of the original owner, so a live v6 namespace must never be
+    // adopted, renewed, dispatched, or routed through generic dead-owner reuse.
+    fail(
+      "LEGACY_SESSION_OWNER_UNKNOWN; the exact legacy session is preserved until its daemon and socket are proven dead",
+      EX_UNAVAILABLE,
+    );
+  }
+  if (
+    !lease ||
+    !owner ||
+    !Number.isSafeInteger(owner.pid) ||
+    owner.pid <= 1 ||
+    !/^[0-9]+$/.test(owner.startTicks)
+  ) {
+    fail("session agent owner is not authenticated", EX_DATAERR);
+  }
+  const ownerMatches =
+    lease.data.agentPid === owner.pid &&
+    lease.data.agentStartTicks === owner.startTicks;
+  if (ownerMatches) return "owned";
+  const recordedOwnerLive = processIdentityIsLive(
+    lease.data.agentPid,
+    lease.data.agentStartTicks,
+  );
+  if (!allowDeadOwner || recordedOwnerLive) {
+    fail(
+      recordedOwnerLive
+        ? "session belongs to another live agent owner"
+        : "session agent owner is dead; exact cleanup is required",
+      EX_DATAERR,
+    );
+  }
+  return "dead-owner";
+}
+
+function requireLegacyOwnerlessRetirement(root, session, state, lease) {
+  if (lease?.ownership !== "legacy-ownerless") return false;
+  const socketPath = join(SOCKET_ROOT, `${session}.sock`);
+  if (
+    !processIdentityIsDefinitelyDead(lease.data.pid, lease.data.startTicks) ||
+    socketPathHasLiveKernelEndpoint(socketPath) ||
+    !["closed", "stale"].includes(state.kind)
+  ) {
+    fail(
+      "LEGACY_SESSION_OWNER_UNKNOWN; the exact legacy session remains preserved while daemon or socket ownership is live or ambiguous",
+      EX_UNAVAILABLE,
+    );
+  }
+  if (state.kind === "stale") {
+    validateStaleOwnership(root, session, state, lease.data);
+  }
+  return true;
+}
+
+function sameRetirementEntry(left, right) {
+  if (!left || !right) return left === right;
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.uid === right.uid &&
+    left.nlink === right.nlink &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
+}
+
+function sameLegacyRetirementState(left, right) {
+  return (
+    left.kind === right.kind &&
+    (left.pid ?? null) === (right.pid ?? null) &&
+    ((!left.pidRaw && !right.pidRaw) ||
+      Boolean(left.pidRaw && right.pidRaw && left.pidRaw.equals(right.pidRaw))) &&
+    sameRetirementEntry(left.socketInfo, right.socketInfo) &&
+    sameRetirementEntry(left.streamInfo, right.streamInfo) &&
+    sameRetirementEntry(left.portInfo, right.portInfo) &&
+    sameRetirementEntry(left.identityInfo, right.identityInfo)
+  );
+}
+
+function requireCloseMetadataPair(binding, lease, stateKind) {
+  if (
+    !binding ||
+    !lease ||
+    binding.account !== lease.data.account ||
+    binding.profile !== lease.data.profile
+  ) {
+    fail(
+      `${stateKind} session ownership is incomplete; cleanup evidence is preserved`,
+      EX_DATAERR,
+    );
+  }
+}
+
+function requireUnchangedLegacyMetadata(root, session, binding, lease) {
+  const currentBinding = loadBinding(root, session);
+  const currentLease = loadTaskLease(root, session);
+  if (
+    !currentBinding ||
+    !currentLease ||
+    currentLease.ownership !== "legacy-ownerless" ||
+    !currentBinding.raw.equals(binding.raw) ||
+    !currentLease.raw.equals(lease.raw) ||
+    currentBinding.account !== currentLease.data.account ||
+    currentBinding.profile !== currentLease.data.profile
+  ) {
+    fail(
+      "legacy session ownership changed during exact retirement",
+      EX_UNAVAILABLE,
+    );
+  }
+}
+
+function validateTaskLease(
+  lease,
+  state,
+  identity,
+  authority,
+  owner,
+  options = {},
+) {
+  validateAgentOwner(lease, owner, options);
   if (
     !lease ||
     state.kind !== "live" ||
@@ -2427,7 +4003,14 @@ function validateTaskLease(lease, state, identity, authority) {
   }
 }
 
-function validateLocalTaskOwnership(lease, state, identity) {
+function validateLocalTaskOwnership(
+  lease,
+  state,
+  identity,
+  owner,
+  options = {},
+) {
+  validateAgentOwner(lease, owner, options);
   if (
     !lease ||
     state.kind !== "live" ||
@@ -2500,10 +4083,17 @@ function cleanupExactStaleSession(root, session, state, ownership) {
   }
 }
 
-function taskLeasePayload(session, identity, authority, state, registration) {
+function taskLeasePayload(
+  session,
+  identity,
+  authority,
+  state,
+  registration,
+  owner,
+) {
   return Buffer.from(
     `${canonicalJson({
-      schema: "agent-browser.task-lease.v5",
+      schema: TASK_LEASE_SCHEMA,
       session,
       account: identity.account,
       profile: identity.profile,
@@ -2514,6 +4104,7 @@ function taskLeasePayload(session, identity, authority, state, registration) {
       registrationReceiptSha256: registration.registrationReceiptSha256,
       profileBinding: registration.profileBinding,
       browserContextId: registration.browserContextId,
+      anchorTargetId: registration.anchorTargetId,
       targetId: registration.targetId,
       targetKind: registration.targetKind,
       receiptNonce: registration.receiptNonce,
@@ -2522,6 +4113,8 @@ function taskLeasePayload(session, identity, authority, state, registration) {
       brokerAuthorizationPath: registration.brokerAuthorizationPath,
       brokerAuthorizationSha256: registration.brokerAuthorizationSha256,
       brokerCapabilityExpiresAt: registration.brokerCapabilityExpiresAt,
+      agentPid: owner.pid,
+      agentStartTicks: owner.startTicks,
       pid: state.pid,
       startTicks: state.startTicks,
       socketDev: state.socketInfo.dev.toString(),
@@ -2544,6 +4137,7 @@ function validatePublicTargetReceipt(
     !exactKeys(receipt, [
       "schema",
       "session",
+      "anchorTargetId",
       "targetId",
       "targetKind",
       "browserContextId",
@@ -2562,11 +4156,18 @@ function validatePublicTargetReceipt(
     receipt.session !== session ||
     receipt.nonce !== nonce ||
     !/^[0-9a-f]{64}$/.test(receipt.nonce) ||
+    typeof receipt.anchorTargetId !== "string" ||
+    !receipt.anchorTargetId ||
+    receipt.anchorTargetId.length > 256 ||
+    /[\u0000-\u001f\u007f]/.test(receipt.anchorTargetId) ||
     typeof receipt.targetId !== "string" ||
     !receipt.targetId ||
     receipt.targetId.length > 256 ||
     /[\u0000-\u001f\u007f]/.test(receipt.targetId) ||
-    !["agent-workspace", "user-collaboration"].includes(receipt.targetKind) ||
+    receipt.anchorTargetId === receipt.targetId ||
+    ![TASK_ROOT_TARGET_KIND, "user-collaboration"].includes(
+      receipt.targetKind,
+    ) ||
     typeof receipt.browserContextId !== "string" ||
     !receipt.browserContextId ||
     receipt.browserContextId.length > 256 ||
@@ -2578,16 +4179,16 @@ function validatePublicTargetReceipt(
     receipt.profileDirectory !== receipt.profileDirectory.trim() ||
     /[\u0000-\u001f\u007f]/.test(receipt.profileDirectory) ||
     typeof receipt.accountEmail !== "string" ||
-    !receipt.accountEmail.includes("@") ||
+    (receipt.accountEmail !== "" && !receipt.accountEmail.includes("@")) ||
     receipt.accountEmail.length > 320 ||
     receipt.accountEmail !== receipt.accountEmail.trim() ||
     /[\u0000-\u001f\u007f]/.test(receipt.accountEmail) ||
     !/^[0-9a-f]{64}$/.test(receipt.browserGeneration) ||
     !/^[0-9a-f]{64}$/.test(receipt.transportGeneration) ||
     !/^[0-9a-f]{64}$/.test(receipt.leaseId) ||
-    (receipt.targetKind === "agent-workspace"
+    (receipt.targetKind === TASK_ROOT_TARGET_KIND
       ? typeof receipt.workspaceMarkerUrl !== "string" ||
-        !/^about:blank#agent-browser-workspace-[0-9a-f]{64}$/.test(
+        !/^about:blank#agent-browser-task-[0-9a-f]{64}$/.test(
           receipt.workspaceMarkerUrl,
         )
       : receipt.workspaceMarkerUrl !== null) ||
@@ -2638,9 +4239,11 @@ function validateTargetClaim(
       "transportGeneration",
       "provenanceKey",
       "controllerIdentity",
+      "ownershipKind",
       "claimKind",
       "account",
       "profileDirectory",
+      "anchorTargetId",
       "browserContextId",
       "profileBinding",
       "brokerLeaseId",
@@ -2654,15 +4257,17 @@ function validateTargetClaim(
     ]) ||
     metadata.schema !== TARGET_METADATA_SCHEMA ||
     canonicalJson(metadata.receipt) !== canonicalJson(receipt) ||
-    metadata.port !== SUPPORTED_CHROME_DEBUGGING_PORT ||
+    metadata.port !== authority.upstreamPort ||
     !/^[0-9a-f]{64}$/.test(metadata.runtimeFingerprint) ||
     metadata.browserGeneration !== receipt.browserGeneration ||
     metadata.transportGeneration !== receipt.transportGeneration ||
     !/^[0-9a-f]{64}$/.test(metadata.provenanceKey) ||
     !/^[0-9a-f]{64}$/.test(metadata.controllerIdentity) ||
-    !["persistent-workspace", "user-adopted"].includes(metadata.claimKind) ||
+    !["workspace-task", "user-adopted"].includes(metadata.ownershipKind) ||
+    ![TASK_ROOT_LEASE_KIND, "user-adopted"].includes(metadata.claimKind) ||
     metadata.account !== identity.account ||
     metadata.profileDirectory !== receipt.profileDirectory ||
+    metadata.anchorTargetId !== receipt.anchorTargetId ||
     metadata.browserContextId !== receipt.browserContextId ||
     metadata.profileBinding !== receipt.profileBinding ||
     metadata.brokerLeaseId !== receipt.leaseId ||
@@ -2681,9 +4286,11 @@ function validateTargetClaim(
     canonicalRfc3339Milliseconds(metadata.brokerCapabilityExpiresAt) === null ||
     canonicalRfc3339Milliseconds(metadata.brokerCapabilityExpiresAt) <
       receipt.expiresAt ||
-    (receipt.targetKind === "agent-workspace"
-      ? metadata.claimKind !== "persistent-workspace"
-      : metadata.claimKind !== "user-adopted")
+    (receipt.targetKind === TASK_ROOT_TARGET_KIND
+      ? metadata.claimKind !== TASK_ROOT_LEASE_KIND ||
+        metadata.ownershipKind !== "workspace-task"
+      : metadata.claimKind !== "user-adopted" ||
+        metadata.ownershipKind !== "user-adopted")
   ) {
     fail("controller target lease binding is invalid", EX_DATAERR);
   }
@@ -2695,6 +4302,7 @@ function validateTargetClaim(
     account: metadata.account,
     profile: receipt.profileDirectory,
     accountEmail: receipt.accountEmail,
+    anchorTargetId: receipt.anchorTargetId,
     browserContextId: receipt.browserContextId,
     targetKind: receipt.targetKind,
     profileBinding: receipt.profileBinding,
@@ -2710,18 +4318,87 @@ function validateTargetClaim(
   };
 }
 
-function acquireRegisteredWorkspaceTargetLease(
+function ensureSessionWorkspace(identity, authority) {
+  const result = parseControllerJsonLine(
+    runController([
+      "ensure-workspace",
+      "--account",
+      identity.account,
+      "--port",
+      String(authority.upstreamPort),
+      "--json",
+    ]),
+    "controller lazy workspace",
+    "TARGET_REPROVISION_REQUIRED; controller could not establish the exact profile workspace",
+  ).data;
+  const markerId = result.markerId;
+  if (
+    !exactKeys(result, [
+      "schema",
+      "ok",
+      "status",
+      "action",
+      "account",
+      "profileDirectory",
+      "profileEmail",
+      "targetId",
+      "tabTargetId",
+      "windowId",
+      "windowDisposition",
+      "browserContextId",
+      "profileDiscriminatorKind",
+      "profileBinding",
+      "browserGeneration",
+      "transportGeneration",
+      "markerId",
+      "markerUrl",
+      "workspaceStatus",
+      "activate",
+    ]) ||
+    result.schema !== WORKSPACE_ENSURE_SCHEMA ||
+    result.ok !== true ||
+    result.status !== "ready" ||
+    !["existing", "provisioned", "recovered"].includes(result.action) ||
+    result.account !== identity.account ||
+    result.profileDirectory !== identity.profile ||
+    result.profileEmail !== identity.email ||
+    !validControllerTargetId(result.targetId) ||
+    !validControllerTargetId(result.tabTargetId) ||
+    !Number.isSafeInteger(result.windowId) ||
+    result.windowId < 0 ||
+    ![
+      "reused-existing-window",
+      "temporary-profile-window",
+    ].includes(result.windowDisposition) ||
+    !validControllerTargetId(result.browserContextId) ||
+    result.profileDiscriminatorKind !== "browser-context-id" ||
+    !/^[0-9a-f]{64}$/.test(result.profileBinding) ||
+    result.browserGeneration !== authority.browserGeneration ||
+    result.transportGeneration !== authority.transportGeneration ||
+    !/^[0-9a-f]{64}$/.test(markerId) ||
+    result.markerUrl !== `about:blank#agent-browser-workspace-${markerId}` ||
+    !["ready", "leased"].includes(result.workspaceStatus) ||
+    result.activate !== false
+  ) {
+    fail("controller returned a mismatched lazy workspace", EX_DATAERR);
+  }
+  return result;
+}
+
+function acquireSessionTaskRootLease(
   parsed,
   identity,
   authority,
   verifyRecoveryOwnership,
 ) {
   let response;
-  let recoveredWorkspace = null;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  let recoveredTaskRoot = null;
+  let workspaceEnsured = false;
+  let taskRootRecovered = false;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     response = parseControllerJsonLine(
       runController([
-        "acquire-registered-workspace-target-lease",
+        "acquire-session-task-root-lease",
         "--session",
         parsed.session,
         "--account",
@@ -2731,23 +4408,37 @@ function acquireRegisteredWorkspaceTargetLease(
         // before the daemon gets its one chance to claim it.
         "--ttl-ms",
         String(TARGET_MAX_TTL_MS),
+        "--port",
+        String(authority.upstreamPort),
+        ...freshTransportProofArgs(authority),
         "--json",
       ]),
-      "controller workspace target lease location",
-      "TARGET_REPROVISION_REQUIRED; registered workspace target is unavailable",
+      "controller task-root lease location",
+      "TARGET_REPROVISION_REQUIRED; controller-created task root is unavailable",
       true,
     );
     if (!response.controllerFailure) break;
     if (
-      attempt === 0 &&
-      response.data.status === "workspace_lease_recovery_required"
+      !workspaceEnsured &&
+      ["workspace_not_registered", "TARGET_REPROVISION_REQUIRED"].includes(
+        response.data.status,
+      )
     ) {
-      // WHY: a controller lease can be issued before transport reproof assigns
-      // a local claim. The held bootstrap lock plus a closed local namespace
-      // permits exactly one same-session retirement; a foreign session remains
-      // a structured conflict and can never be stolen.
+      ensureSessionWorkspace(identity, authority);
+      workspaceEnsured = true;
+      continue;
+    }
+    if (
+      !taskRootRecovered &&
+      response.data.status === "task_root_lease_recovery_required"
+    ) {
+      // WHY: a controller-created task root can be issued before transport
+      // reproof assigns a local claim. The held bootstrap lock plus a closed
+      // local namespace permits exactly one same-session retirement; a foreign
+      // session remains a structured conflict and can never be stolen.
       verifyRecoveryOwnership();
-      recoveredWorkspace = releasePendingWorkspaceLease(parsed, identity);
+      recoveredTaskRoot = releasePendingTaskRootLease(parsed, identity);
+      taskRootRecovered = true;
       continue;
     }
     fail(
@@ -2757,7 +4448,7 @@ function acquireRegisteredWorkspaceTargetLease(
   }
   if (!response || response.controllerFailure) {
     fail(
-      "TARGET_REPROVISION_REQUIRED; registered workspace target is unavailable",
+      "TARGET_REPROVISION_REQUIRED; controller-created task root is unavailable",
       EX_UNAVAILABLE,
     );
   }
@@ -2778,15 +4469,20 @@ function acquireRegisteredWorkspaceTargetLease(
       "consentGeneration",
       "brokerProducerContractSha256",
       "brokerCapabilityExpiresAt",
+      "transportProofStateSha256",
+      "transportProofObservedAtMs",
       "activate",
     ]) ||
     result.schema !== "agent-browser.target-lease-location.v1" ||
     result.ok !== true ||
     result.status !== "issued" ||
     result.controllerEndpointId !== authority.data.controller_endpoint_id ||
+    !/^[0-9a-f]{64}$/.test(result.transportProofStateSha256) ||
+    !Number.isSafeInteger(result.transportProofObservedAtMs) ||
+    result.transportProofObservedAtMs <= 0 ||
     result.activate !== false
   ) {
-    fail("controller returned a mismatched workspace target lease", EX_DATAERR);
+    fail("controller returned a mismatched task-root lease", EX_DATAERR);
   }
   validatePublicTargetReceipt(
     result.receipt,
@@ -2796,7 +4492,7 @@ function acquireRegisteredWorkspaceTargetLease(
     authority,
   );
   if (
-    result.receipt.targetKind !== "agent-workspace" ||
+    result.receipt.targetKind !== TASK_ROOT_TARGET_KIND ||
     result.path !==
       join(
         productionControllerStateRoot(),
@@ -2830,22 +4526,23 @@ function acquireRegisteredWorkspaceTargetLease(
     canonicalRfc3339Milliseconds(result.brokerCapabilityExpiresAt) <
       result.receipt.expiresAt
   ) {
-    fail("controller returned a mismatched workspace target lease", EX_DATAERR);
+    fail("controller returned a mismatched task-root lease", EX_DATAERR);
   }
   if (
-    recoveredWorkspace &&
-    (recoveredWorkspace.targetId !== result.receipt.targetId ||
-      recoveredWorkspace.browserContextId !==
+    recoveredTaskRoot &&
+    (recoveredTaskRoot.anchorTargetId !== result.receipt.anchorTargetId ||
+      recoveredTaskRoot.targetId === result.receipt.targetId ||
+      recoveredTaskRoot.browserContextId !==
         result.receipt.browserContextId ||
-      recoveredWorkspace.profileBinding !== result.receipt.profileBinding ||
-      recoveredWorkspace.browserGeneration !==
+      recoveredTaskRoot.profileBinding !== result.receipt.profileBinding ||
+      recoveredTaskRoot.browserGeneration !==
         result.receipt.browserGeneration ||
-      recoveredWorkspace.transportGeneration !==
+      recoveredTaskRoot.transportGeneration !==
         result.receipt.transportGeneration ||
-      recoveredWorkspace.markerUrl !== result.receipt.workspaceMarkerUrl)
+      recoveredTaskRoot.markerUrl === result.receipt.workspaceMarkerUrl)
   ) {
     fail(
-      "recovered workspace identity changed during bounded reacquisition",
+      "bounded reacquisition did not retain the anchor while replacing the released task root",
       EX_DATAERR,
     );
   }
@@ -2853,7 +4550,103 @@ function acquireRegisteredWorkspaceTargetLease(
   return result;
 }
 
-function releasePendingWorkspaceLease(
+function acquireCurrentTabTargetLease(parsed, identity, authority) {
+  const response = parseControllerJsonLine(
+    runController([
+      "mint-current-tab-adoption-receipt",
+      "--session",
+      parsed.session,
+      "--account",
+      identity.account,
+      "--ttl-ms",
+      String(TARGET_MAX_TTL_MS),
+      "--port",
+      String(authority.upstreamPort),
+      "--json",
+    ]),
+    "controller current-tab lease location",
+    "CURRENT_TAB_INVITATION_FAILED; no unique foreground tab was leased",
+    true,
+  );
+  if (response.controllerFailure) {
+    fail(`${response.data.status}; ${response.data.reason}`, EX_UNAVAILABLE);
+  }
+  const result = response.data;
+  if (
+    !exactKeys(result, [
+      "schema",
+      "ok",
+      "status",
+      "controllerEndpointId",
+      "path",
+      "metadataPath",
+      "receipt",
+      "brokerAuthFilePath",
+      "brokerAuthFileSha256",
+      "brokerCdpWebSocketUrl",
+      "brokerHealthUrl",
+      "consentGeneration",
+      "brokerProducerContractSha256",
+      "brokerCapabilityExpiresAt",
+      "activate",
+    ]) ||
+    result.schema !== "agent-browser.target-lease-location.v1" ||
+    result.ok !== true ||
+    result.status !== "issued" ||
+    result.controllerEndpointId !== authority.data.controller_endpoint_id ||
+    result.activate !== false
+  ) {
+    fail("controller returned a mismatched current-tab lease", EX_DATAERR);
+  }
+  validatePublicTargetReceipt(
+    result.receipt,
+    parsed.session,
+    result.receipt?.nonce,
+    identity,
+    authority,
+  );
+  if (
+    result.receipt.targetKind !== "user-collaboration" ||
+    result.path !==
+      join(
+        productionControllerStateRoot(),
+        "endpoints",
+        authority.data.controller_endpoint_id,
+        "target-leases",
+        "pending",
+        `${result.receipt.nonce}.json`,
+      ) ||
+    result.metadataPath !==
+      join(
+        productionControllerStateRoot(),
+        "endpoints",
+        authority.data.controller_endpoint_id,
+        "target-leases",
+        "controller-metadata",
+        `${result.receipt.nonce}.json`,
+      ) ||
+    result.brokerAuthFilePath !==
+      expectedBrokerAuthorizationPath(
+        authority.data.controller_endpoint_id,
+        result.receipt.leaseId,
+      ) ||
+    !/^[0-9a-f]{64}$/.test(result.brokerAuthFileSha256) ||
+    result.brokerCdpWebSocketUrl !== authority.webSocketUrl ||
+    result.brokerHealthUrl !== authority.healthUrl ||
+    result.consentGeneration !== authority.data.consent_generation ||
+    result.brokerProducerContractSha256 !==
+      authority.snapshot.broker.producerContractSha256 ||
+    canonicalRfc3339Milliseconds(result.brokerCapabilityExpiresAt) === null ||
+    canonicalRfc3339Milliseconds(result.brokerCapabilityExpiresAt) <
+      result.receipt.expiresAt
+  ) {
+    fail("controller returned a mismatched current-tab lease", EX_DATAERR);
+  }
+  parsed.targetLease = result.path;
+  return result;
+}
+
+function releasePendingTaskRootLease(
   parsed,
   identity,
   expectedReceipt = null,
@@ -2862,7 +4655,7 @@ function releasePendingWorkspaceLease(
   const response = parseControllerJsonLine(
     runController(
       [
-        "release-workspace",
+        "release-task-root",
         "--account",
         identity.account,
         "--session",
@@ -2871,20 +4664,29 @@ function releasePendingWorkspaceLease(
       ],
       options.timeoutMs ?? null,
     ),
-    "controller pending workspace release",
-    "WORKSPACE_RELEASE_FAILED; exact pre-claim workspace lease remains controller-owned",
+    "controller pending task-root release",
+    "TASK_ROOT_RELEASE_FAILED; exact pre-claim task root remains controller-owned",
     options.allowControllerFailure === true,
   );
   if (response.controllerFailure) return response.data;
   const result = response.data;
+  const anchorDisposition = validateAnchorDisposition(
+    result.anchorDisposition,
+    result.anchorTargetId,
+    identity.account,
+    expectedReceipt?.profileBinding ?? result.profileBinding,
+    expectedReceipt?.browserGeneration ?? result.browserGeneration,
+  );
   if (
     !exactKeys(result, [
+      "schema",
       "ok",
       "status",
       "session",
       "account",
       "profileDirectory",
       "profileEmail",
+      "anchorTargetId",
       "targetId",
       "tabTargetId",
       "windowId",
@@ -2895,9 +4697,13 @@ function releasePendingWorkspaceLease(
       "transportGeneration",
       "markerId",
       "markerUrl",
-      "targetPreserved",
+      "taskRootClosed",
+      "anchorReady",
+      "anchorDisposition",
+      "brokerCapabilityRevoked",
       "brokerPreserved",
     ]) ||
+    result.schema !== TASK_ROOT_RELEASE_SCHEMA ||
     result.ok !== true ||
     result.status !== "released" ||
     result.session !== parsed.session ||
@@ -2910,16 +4716,19 @@ function releasePendingWorkspaceLease(
     !/^[0-9a-f]{64}$/.test(result.browserGeneration) ||
     !/^[0-9a-f]{64}$/.test(result.transportGeneration) ||
     !/^[0-9a-f]{64}$/.test(result.markerId) ||
-    result.markerUrl !== `about:blank#agent-browser-workspace-${result.markerId}` ||
-    result.targetPreserved !== true ||
+    result.markerUrl !== `about:blank#agent-browser-task-${result.markerId}` ||
+    result.taskRootClosed !== true ||
+    result.anchorReady !== !anchorDisposition.anchorRetired ||
+    result.brokerCapabilityRevoked !== true ||
     result.brokerPreserved !== true
   ) {
-    fail("controller returned a mismatched pending workspace release", EX_DATAERR);
+    fail("controller returned a mismatched pending task-root release", EX_DATAERR);
   }
   for (const [value, label, maximum] of [
-    [result.targetId, "released workspace targetId", 160],
-    [result.tabTargetId, "released workspace tabTargetId", 160],
-    [result.browserContextId, "released workspace browserContextId", 160],
+    [result.anchorTargetId, "workspace anchor targetId", 160],
+    [result.targetId, "released task-root targetId", 160],
+    [result.tabTargetId, "released task-root tabTargetId", 160],
+    [result.browserContextId, "released task-root browserContextId", 160],
     [
       result.profileDiscriminatorKind,
       "released workspace profile discriminator",
@@ -2930,21 +4739,22 @@ function releasePendingWorkspaceLease(
   }
   if (
     expectedReceipt &&
-    (result.targetId !== expectedReceipt.targetId ||
+    (result.anchorTargetId !== expectedReceipt.anchorTargetId ||
+      result.targetId !== expectedReceipt.targetId ||
       result.browserContextId !== expectedReceipt.browserContextId ||
       result.profileBinding !== expectedReceipt.profileBinding ||
       result.browserGeneration !== expectedReceipt.browserGeneration ||
       result.transportGeneration !== expectedReceipt.transportGeneration ||
       result.markerUrl !== expectedReceipt.workspaceMarkerUrl)
   ) {
-    fail("pending workspace release identity changed", EX_DATAERR);
+    fail("pending task-root release identity changed", EX_DATAERR);
   }
   return result;
 }
 
-function releaseFailedPendingWorkspaceLease(parsed, identity, expectedReceipt) {
+function releaseFailedPendingTaskRootLease(parsed, identity, expectedReceipt) {
   try {
-    const result = releasePendingWorkspaceLease(
+    const result = releasePendingTaskRootLease(
       parsed,
       identity,
       expectedReceipt,
@@ -2955,8 +4765,8 @@ function releaseFailedPendingWorkspaceLease(parsed, identity, expectedReceipt) {
       : cleanupFailure(result.status, result.reason);
   } catch (error) {
     return cleanupFailure(
-      "workspace_release_transport_failed",
-      error?.message || "Controller pending workspace release failed",
+      "task_root_release_transport_failed",
+      error?.message || "Controller pending task-root release failed",
     );
   }
 }
@@ -2974,7 +4784,7 @@ function openTargetLeaseTree(authority) {
   const pendingLeases = leases.openChild("pending", { mode: 0o700 });
   const consumedLeases = leases.openChild("consumed", { mode: 0o700 });
   // WHY: this directory is private controller authority; guessing a generic
-  // metadata sibling rejects otherwise exact controller-issued workspace leases.
+  // metadata sibling rejects otherwise exact controller-issued task-root leases.
   const metadata = leases.openChild("controller-metadata", { mode: 0o700 });
   const daemonConsumed = leases.openChild("daemon-consumed", { mode: 0o700 });
   if (!pendingLeases || !consumedLeases || !metadata || !daemonConsumed) {
@@ -3045,7 +4855,7 @@ function preflightTargetLease(
     });
     if (!pending) {
       fail(
-        "TARGET_REPROVISION_REQUIRED; pending workspace target lease is missing or replayed",
+        "TARGET_REPROVISION_REQUIRED; pending task-root lease is missing or replayed",
         EX_UNAVAILABLE,
       );
     }
@@ -3069,8 +4879,11 @@ function preflightTargetLease(
       authority,
     );
     if (autoLocation) {
+      const expectedLeaseKind = parsed.currentTab
+        ? "user-adopted"
+        : TASK_ROOT_LEASE_KIND;
       if (
-        lease.leaseKind !== "persistent-workspace" ||
+        lease.leaseKind !== expectedLeaseKind ||
         autoLocation.path !== parsed.targetLease ||
         autoLocation.metadataPath !==
           join(
@@ -3094,7 +4907,7 @@ function preflightTargetLease(
           metadata.brokerCapabilityExpiresAt
       ) {
         fail(
-          "controller workspace acquisition did not match its exact target metadata",
+          "controller bootstrap acquisition did not match its exact target metadata",
           EX_DATAERR,
         );
       }
@@ -3153,7 +4966,7 @@ function consumeTargetLease(parsed, identity, authority, preflight) {
     });
     if (!pending)
       fail(
-        "TARGET_REPROVISION_REQUIRED; pending workspace target lease is missing or replayed",
+        "TARGET_REPROVISION_REQUIRED; pending task-root lease is missing or replayed",
         EX_UNAVAILABLE,
       );
     metadataFile = tree.metadata.openFile(`${nonce}.json`, 16 * 1024, 0o600, {
@@ -3197,6 +5010,9 @@ function consumeTargetLease(parsed, identity, authority, preflight) {
       parsed.targetLease,
       "--session",
       parsed.session,
+      "--port",
+      String(authority.upstreamPort),
+      ...freshTransportProofArgs(authority),
       "--json",
     ]);
     if (
@@ -3311,55 +5127,127 @@ function verifyTargetClaimed(claim) {
   claim.tree = null;
 }
 
-function releaseConsumedTargetLease(parsed, claim) {
+function releaseUserTargetLease(parsed, expected) {
   const result = parseControllerJsonLine(
     runController([
       "release-target-lease",
       "--session",
       parsed.session,
+      "--anchor-target-id",
+      expected.anchorTargetId,
       "--target-id",
-      claim.lease.receipt.targetId,
+      expected.targetId,
       "--receipt-nonce",
-      claim.nonce,
+      expected.nonce,
       "--json",
     ]),
     "controller target lease abort",
     "TARGET_LEASE_ABORT_FAILED; consumed target and client authorization remain controller-owned",
   ).data;
+  const anchorDisposition = validateReleaseAnchorDisposition(
+    result.anchorDisposition,
+    result.targetKind,
+    expected.anchorTargetId,
+    expected.account,
+    expected.profileBinding,
+    expected.browserGeneration,
+  );
   if (
     !exactKeys(result, [
+      "schema",
       "ok",
       "status",
       "session",
+      "anchorTargetId",
       "targetId",
       "targetKind",
-      "targetPreserved",
+      "taskRootClosed",
+      "userTargetPreserved",
+      "anchorReady",
+      "anchorDisposition",
       "brokerCapabilityRevoked",
     ]) ||
+    result.schema !== TARGET_LEASE_ABORT_SCHEMA ||
     result.ok !== true ||
-    !["aborted", "TARGET_REPROVISION_REQUIRED"].includes(result.status) ||
+    result.status !== "aborted" ||
     result.session !== parsed.session ||
-    result.targetId !== claim.lease.receipt.targetId ||
-    result.targetKind !== claim.lease.targetKind ||
-    (result.status === "aborted"
-      ? result.targetPreserved !== true
-      : result.targetPreserved !== false) ||
+    result.anchorTargetId !== expected.anchorTargetId ||
+    result.targetId !== expected.targetId ||
+    result.targetKind !== expected.targetKind ||
+    !["agent-workspace", "user-collaboration"].includes(result.targetKind) ||
+    (result.targetKind === "agent-workspace"
+      ? result.taskRootClosed !== null ||
+        result.userTargetPreserved !== null ||
+        result.anchorReady !== !anchorDisposition.anchorRetired
+      : result.taskRootClosed !== null ||
+        result.userTargetPreserved !== true ||
+        result.anchorReady !== null ||
+        anchorDisposition !== null) ||
     result.brokerCapabilityRevoked !== true
   ) {
     fail("controller returned a mismatched target lease abort", EX_DATAERR);
   }
+  return result;
 }
 
-function registerTaskSession(parsed, identity, authority, state, claim) {
+function releaseConsumedTargetLease(parsed, identity, claim) {
+  if (claim.lease.targetKind === TASK_ROOT_TARGET_KIND) {
+    // A consumed-but-unregistered task root still belongs to the controller's
+    // workspace-task lifecycle. Its exact release closes that created tab and
+    // descendants, then retires only an idle account anchor; the generic
+    // non-owned abort deliberately preserves user collaboration targets and is
+    // not semantically interchangeable.
+    releasePendingTaskRootLease(parsed, identity, claim.lease.receipt);
+    return;
+  }
+  releaseUserTargetLease(parsed, {
+    account: identity.account,
+    profileBinding: claim.lease.profileBinding,
+    browserGeneration: claim.lease.browserGeneration,
+    anchorTargetId: claim.lease.anchorTargetId,
+    targetId: claim.lease.receipt.targetId,
+    targetKind: claim.lease.targetKind,
+    nonce: claim.nonce,
+  });
+}
+
+function releaseFailedPendingCurrentTabLease(parsed, identity, location) {
+  const receipt = location?.receipt;
+  try {
+    return releaseUserTargetLease(parsed, {
+      account: identity.account,
+      profileBinding: receipt?.profileBinding,
+      browserGeneration: receipt?.browserGeneration,
+      anchorTargetId: receipt?.anchorTargetId,
+      targetId: receipt?.targetId,
+      targetKind: receipt?.targetKind,
+      nonce: receipt?.nonce,
+    });
+  } catch (error) {
+    return cleanupFailure(
+      "current_tab_lease_abort_failed",
+      error?.message ||
+        "Exact current-tab lease abort did not prove user-target preservation",
+    );
+  }
+}
+
+function registerTaskSession(parsed, identity, authority, state, claim, owner) {
   const response = parseControllerJsonLine(
     runController([
       "register-session",
       "--session",
       parsed.session,
+      "--anchor-target-id",
+      claim.lease.anchorTargetId,
       "--target-id",
       claim.lease.receipt.targetId,
       "--pid",
       String(state.pid),
+      "--agent-pid",
+      String(owner.pid),
+      "--agent-start-ticks",
+      owner.startTicks,
       "--socket",
       join(SOCKET_ROOT, `${parsed.session}.sock`),
       "--receipt-nonce",
@@ -3396,10 +5284,13 @@ function registerTaskSession(parsed, identity, authority, state, claim) {
       claim.lease.brokerProducerContractSha256,
       "--broker-capability-expires-at",
       claim.lease.brokerCapabilityExpiresAt,
+      "--port",
+      String(authority.upstreamPort),
+      ...freshTransportProofArgs(authority),
       "--json",
     ]),
     "controller session registration",
-    "SESSION_REGISTRATION_FAILED; controller did not register the exact attached workspace",
+    "SESSION_REGISTRATION_FAILED; controller did not register the exact attached task root",
   );
   const result = response.data;
   if (
@@ -3407,6 +5298,7 @@ function registerTaskSession(parsed, identity, authority, state, claim) {
       "ok",
       "status",
       "session",
+      "anchorTargetId",
       "targetId",
       "targetKind",
       "account",
@@ -3419,6 +5311,8 @@ function registerTaskSession(parsed, identity, authority, state, claim) {
       "receiptNonce",
       "daemonPid",
       "daemonStartTicks",
+      "agentPid",
+      "agentStartTicks",
       "socketDev",
       "socketIno",
       "brokerLeaseId",
@@ -3433,6 +5327,7 @@ function registerTaskSession(parsed, identity, authority, state, claim) {
     result.ok !== true ||
     result.status !== "registered" ||
     result.session !== parsed.session ||
+    result.anchorTargetId !== claim.lease.anchorTargetId ||
     result.targetId !== claim.lease.receipt.targetId ||
     result.targetKind !== claim.lease.targetKind ||
     result.account !== identity.account ||
@@ -3445,6 +5340,8 @@ function registerTaskSession(parsed, identity, authority, state, claim) {
     result.receiptNonce !== claim.nonce ||
     result.daemonPid !== state.pid ||
     result.daemonStartTicks !== state.startTicks ||
+    result.agentPid !== owner.pid ||
+    result.agentStartTicks !== owner.startTicks ||
     result.socketDev !== state.socketInfo.dev.toString() ||
     result.socketIno !== state.socketInfo.ino.toString() ||
     result.brokerLeaseId !== claim.lease.brokerAuthorizationLeaseId ||
@@ -3483,10 +5380,15 @@ function validateRegisteredSessionProof(
       "proof-state",
       "--session",
       parsed.session,
+      "--anchor-target-id",
+      claim.lease.anchorTargetId,
       "--target-id",
       claim.lease.receipt.targetId,
       "--receipt-nonce",
       claim.nonce,
+      "--port",
+      String(authority.upstreamPort),
+      ...freshTransportProofArgs(authority),
       "--json",
     ]),
     "controller registered session proof",
@@ -3498,6 +5400,7 @@ function validateRegisteredSessionProof(
       "ok",
       "status",
       "session",
+      "anchorTargetId",
       "targetId",
       "targetKind",
       "browserContextId",
@@ -3528,6 +5431,7 @@ function validateRegisteredSessionProof(
     result.ok !== true ||
     result.status !== "ready" ||
     result.session !== parsed.session ||
+    result.anchorTargetId !== claim.lease.anchorTargetId ||
     result.targetId !== claim.lease.receipt.targetId ||
     result.targetKind !== claim.lease.targetKind ||
     result.browserContextId !== claim.lease.browserContextId ||
@@ -3568,13 +5472,19 @@ function validateRegisteredSessionProof(
     result.transportProofStatePath,
     result.transportProofStateSha256,
     authority.data.controller_endpoint_id,
+    authority.upstreamPort,
+    result.transportProofObservedAtMs,
   );
   const { observedAtMs: priorObservedAtMs, ...priorSnapshotIdentity } =
     authority.snapshot;
   const { observedAtMs: refreshedObservedAtMs, ...refreshedSnapshotIdentity } =
     snapshot;
   if (
-    snapshot.observedAtMs !== result.transportProofObservedAtMs ||
+    !trustedSnapshotMatchesControllerPublication(
+      snapshot,
+      result.transportProofStateSha256,
+      result.transportProofObservedAtMs,
+    ) ||
     refreshedObservedAtMs < priorObservedAtMs ||
     canonicalJson(refreshedSnapshotIdentity) !==
       canonicalJson(priorSnapshotIdentity) ||
@@ -3593,59 +5503,113 @@ function validateRegisteredSessionProof(
 
 function releaseTaskRegistration(
   session,
+  anchorTargetId,
   targetId,
   targetKind,
   receiptNonce,
   options = {},
 ) {
+  const controllerArgs = [
+    "release-session",
+    "--session",
+    session,
+    "--anchor-target-id",
+    anchorTargetId,
+    "--target-id",
+    targetId,
+    "--receipt-nonce",
+    receiptNonce,
+  ];
+  if (Number.isSafeInteger(options.port) && options.port > 0) {
+    controllerArgs.push("--port", String(options.port));
+  }
+  if (
+    [
+      options.browserGeneration,
+      options.transportGeneration,
+      options.brokerAuthorizationLeaseId,
+    ].every((value) => /^[0-9a-f]{64}$/.test(value ?? ""))
+  ) {
+    controllerArgs.push(
+      "--browser-generation",
+      options.browserGeneration,
+      "--transport-generation",
+      options.transportGeneration,
+      "--broker-lease-id",
+      options.brokerAuthorizationLeaseId,
+      "--broker-source-path",
+      brokerSourcePath,
+    );
+    if (/^[0-9a-f]{64}$/.test(options.brokerProducerContractSha256 ?? "")) {
+      controllerArgs.push(
+        "--broker-producer-contract-sha256",
+        options.brokerProducerContractSha256,
+      );
+    }
+  }
+  controllerArgs.push("--json");
   const response = parseControllerJsonLine(
-    runController([
-      "release-session",
-      "--session",
-      session,
-      "--target-id",
-      targetId,
-      "--receipt-nonce",
-      receiptNonce,
-      "--json",
-    ], options.timeoutMs ?? null),
+    runController(controllerArgs, options.timeoutMs ?? null),
     "controller session release",
     "SESSION_RELEASE_FAILED; exact controller registration remains owned",
     options.allowControllerFailure === true,
   );
   if (response.controllerFailure) return response.data;
   const result = response.data;
+  const anchorDisposition = validateReleaseAnchorDisposition(
+    result.anchorDisposition,
+    result.targetKind,
+    anchorTargetId,
+    options.account ?? "",
+    options.profileBinding ?? "",
+    options.browserGeneration ?? "",
+  );
   if (
     !exactKeys(result, [
       "schema",
       "ok",
       "status",
       "session",
+      "anchorTargetId",
       "targetId",
       "targetKind",
       "receiptNonce",
       "descendantsClosed",
-      "targetPreserved",
-      "workspaceReady",
+      "taskRootClosed",
+      "userTargetPreserved",
+      "anchorReady",
+      "anchorDisposition",
       "brokerCapabilityRevoked",
       "focusDisposition",
       "releasedAt",
     ]) ||
-    result.schema !== "agent-browser.session-release-result.v1" ||
+    result.schema !== SESSION_RELEASE_SCHEMA ||
     result.ok !== true ||
-    !["released", "TARGET_REPROVISION_REQUIRED"].includes(result.status) ||
+    result.status !== "released" ||
     result.session !== session ||
+    result.anchorTargetId !== anchorTargetId ||
     result.targetId !== targetId ||
     result.targetKind !== targetKind ||
     result.receiptNonce !== receiptNonce ||
     !Number.isSafeInteger(result.descendantsClosed) ||
     result.descendantsClosed < 0 ||
-    (result.status === "released"
-      ? result.targetPreserved !== true
-      : result.targetPreserved !== false) ||
-    (targetKind === "agent-workspace"
-      ? result.workspaceReady !== (result.status === "released")
-      : result.workspaceReady !== null) ||
+    ![
+      TASK_ROOT_TARGET_KIND,
+      "agent-workspace",
+      "user-collaboration",
+    ].includes(targetKind) ||
+    (targetKind === TASK_ROOT_TARGET_KIND
+      ? result.taskRootClosed !== true ||
+        result.userTargetPreserved !== null ||
+        result.anchorReady !== !anchorDisposition.anchorRetired
+      : targetKind === "agent-workspace"
+        ? result.taskRootClosed !== null ||
+          result.userTargetPreserved !== null ||
+          result.anchorReady !== !anchorDisposition.anchorRetired
+        : result.taskRootClosed !== null ||
+        result.userTargetPreserved !== true ||
+        result.anchorReady !== null ||
+        anchorDisposition !== null) ||
     result.brokerCapabilityRevoked !== true ||
     !["none", "restored", "skipped-concurrent-change"].includes(
       result.focusDisposition,
@@ -3655,6 +5619,19 @@ function releaseTaskRegistration(
     fail("controller returned a mismatched session release", EX_DATAERR);
   }
   return result;
+}
+
+function releaseLocalOptions(lease, overrides = {}) {
+  const data = lease?.data ?? {};
+  return {
+    port: controllerEndpointPort(data.controllerEndpointId),
+    account: data.account,
+    profileBinding: data.profileBinding,
+    browserGeneration: data.browserGeneration,
+    transportGeneration: data.transportGeneration,
+    brokerAuthorizationLeaseId: data.brokerAuthorizationLeaseId,
+    ...overrides,
+  };
 }
 
 function cleanupFailure(status, reason) {
@@ -3670,9 +5647,15 @@ function cleanupFailure(status, reason) {
 
 function releaseFailedTaskRegistration(
   session,
+  anchorTargetId,
   targetId,
   targetKind,
   receiptNonce,
+  account,
+  profileBinding,
+  browserGeneration,
+  port = null,
+  localOptions = {},
 ) {
   const deadline = Date.now() + 15_000;
   const transientStatuses = new Set([
@@ -3690,12 +5673,19 @@ function releaseFailedTaskRegistration(
     try {
       result = releaseTaskRegistration(
         session,
+        anchorTargetId,
         targetId,
         targetKind,
         receiptNonce,
         {
+          ...localOptions,
           allowControllerFailure: true,
           timeoutMs: remaining,
+          port: localOptions.port ?? port,
+          account: localOptions.account ?? account,
+          profileBinding: localOptions.profileBinding ?? profileBinding,
+          browserGeneration:
+            localOptions.browserGeneration ?? browserGeneration,
         },
       );
     } catch (error) {
@@ -3707,15 +5697,23 @@ function releaseFailedTaskRegistration(
     if (result.ok === true) {
       if (
         result.status !== "released" ||
-        result.targetPreserved !== true ||
-        result.workspaceReady !==
-          (targetKind === "agent-workspace" ? true : null) ||
+        (targetKind === TASK_ROOT_TARGET_KIND
+          ? result.taskRootClosed !== true ||
+            result.userTargetPreserved !== null ||
+            result.anchorReady !== !result.anchorDisposition.anchorRetired
+          : targetKind === "agent-workspace"
+            ? result.taskRootClosed !== null ||
+              result.userTargetPreserved !== null ||
+              result.anchorReady !== !result.anchorDisposition.anchorRetired
+            : result.taskRootClosed !== null ||
+            result.userTargetPreserved !== true ||
+            result.anchorReady !== null) ||
         result.brokerCapabilityRevoked !== true ||
         result.focusDisposition !== "none"
       ) {
         return cleanupFailure(
           "session_release_result_invalid",
-          "Failed-session release changed the target, workspace, or focus disposition",
+          "Failed-session release did not prove the exact root disposition, anchor state, or focus disposition",
         );
       }
       return { ok: true, status: "released", reason: "" };
@@ -3725,6 +5723,39 @@ function releaseFailedTaskRegistration(
     sleepSync(Math.min(100 * 2 ** attempt, Math.max(1, deadline - Date.now())));
   }
   return lastFailure;
+}
+
+function releaseFailedExplicitClose(root, parsed, binding, lease) {
+  // WHY: native close can terminate the exact daemon and still return nonzero
+  // or throw. Once ownership is proven, retire only that controller session;
+  // its controller-created task root and owned descendants must close while
+  // the broker, user tabs, and unrelated sessions remain; an idle account
+  // anchor retires separately.
+  // Local ownership evidence survives until bounded release proves that exact
+  // root disposition and broker-capability revocation.
+  let cleanup = releaseFailedTaskRegistration(
+    parsed.session,
+    lease.data.anchorTargetId,
+    lease.data.targetId,
+    lease.data.targetKind,
+    lease.data.receiptNonce,
+    lease.data.account,
+    lease.data.profileBinding,
+    lease.data.browserGeneration,
+    controllerEndpointPort(lease.data.controllerEndpointId),
+    releaseLocalOptions(lease),
+  );
+  if (cleanup.ok !== true) return cleanup;
+  try {
+    root.removeOwned(bindingName(parsed.session), binding.raw);
+    root.removeOwned(taskLeaseName(parsed.session), lease.raw);
+  } catch (error) {
+    cleanup = cleanupFailure(
+      "session_metadata_cleanup_failed",
+      error?.message || "Released session metadata cleanup failed",
+    );
+  }
+  return cleanup;
 }
 
 function appendCleanupFailure(error, cleanup) {
@@ -3781,10 +5812,18 @@ function reconcileSessionTargets(parsed, authority, registration) {
       "discover-owned-descendants",
       "--session",
       parsed.session,
+      "--anchor-target-id",
+      registration.anchorTargetId,
       "--root-target-id",
       registration.targetId,
       "--receipt-nonce",
       registration.receiptNonce,
+      // WHY [AGENT-BROWSER-DYNAMIC-PORT-RECONCILE-001]: EREBORA runs on the
+      // controller-attested dynamic Chrome port. Omitting it made the helper
+      // scan the default endpoint, cross this call's 25-second deadline, and
+      // falsely reject an otherwise successful browser action.
+      "--port",
+      String(authority.upstreamPort),
       "--json",
     ]),
     "controller target ledger",
@@ -3796,6 +5835,7 @@ function reconcileSessionTargets(parsed, authority, registration) {
       "ok",
       "status",
       "session",
+      "anchorTargetId",
       "rootTargetId",
       "receiptNonce",
       "browserContextId",
@@ -3810,6 +5850,7 @@ function reconcileSessionTargets(parsed, authority, registration) {
     result.ok !== true ||
     result.status !== "reconciled" ||
     result.session !== parsed.session ||
+    result.anchorTargetId !== registration.anchorTargetId ||
     result.rootTargetId !== registration.targetId ||
     result.receiptNonce !== registration.receiptNonce ||
     result.browserContextId !== registration.browserContextId ||
@@ -3911,9 +5952,9 @@ function validateFocusAcquireResult(data, session, taskLease) {
     !Number.isSafeInteger(data.acquiredAt) ||
     !Number.isSafeInteger(data.deadlineAt) ||
     data.deadlineAt <= data.acquiredAt ||
-    (data.targetKind === "agent-workspace"
-      ? data.restorationKind !== "workspace-hwnd-only" ||
-        data.priorActiveTabId !== null
+    (data.targetKind === TASK_ROOT_TARGET_KIND
+      ? data.restorationKind !== "task-root-tab-and-hwnd" ||
+        !validControllerTargetId(data.priorActiveTabId)
       : data.restorationKind !== "user-tab-and-hwnd" ||
         !validControllerTargetId(data.priorActiveTabId))
   ) {
@@ -4005,7 +6046,7 @@ function requireActiveForegroundLease(root, session, taskLease) {
   const focus = loadFocusLease(root, session, taskLease);
   if (!focus) {
     fail(
-      "FOREGROUND_REQUIRED; popup-producing collaboration needs an exact active controller foreground lease",
+      "FOREGROUND_REQUIRED; the declared user-input boundary has no exact active controller focus lease",
       EX_UNAVAILABLE,
     );
   }
@@ -4236,6 +6277,282 @@ function runPopupClick(parsed) {
   return result;
 }
 
+function daemonTransportRebindBase(parsed, lease, state) {
+  return {
+    schema: DAEMON_TRANSPORT_REBIND_REQUEST_SCHEMA,
+    requestId: randomBytes(32).toString("hex"),
+    session: parsed.session,
+    daemon: {
+      pid: state.pid,
+      startTicks: state.startTicks,
+      socketPath: join(SOCKET_ROOT, `${parsed.session}.sock`),
+      socketDev: state.socketInfo.dev.toString(),
+      socketIno: state.socketInfo.ino.toString(),
+    },
+    root: {
+      anchorTargetId: lease.data.anchorTargetId,
+      targetId: lease.data.targetId,
+      targetKind: lease.data.targetKind,
+      browserContextId: lease.data.browserContextId,
+      profileBinding: lease.data.profileBinding,
+      browserGeneration: lease.data.browserGeneration,
+      receiptNonce: lease.data.receiptNonce,
+    },
+    prior: {
+      transportGeneration: lease.data.transportGeneration,
+      brokerLeaseId: lease.data.brokerAuthorizationLeaseId,
+    },
+  };
+}
+
+function parseDaemonTransportRebindResult(result, requestId) {
+  const canonicalLine = (value) =>
+    typeof value === "string" &&
+    value.length > 0 &&
+    Buffer.byteLength(value) <= 16 * 1024 &&
+    value.endsWith("\n") &&
+    !value.slice(0, -1).includes("\n");
+  if (
+    result.status !== 0 ||
+    result.signal ||
+    result.stderr !== "" ||
+    !canonicalLine(result.stdout)
+  ) {
+    fail(
+      "SESSION_TRANSPORT_REBIND_HELPER_FAILED; the exact daemon handover did not settle",
+      EX_UNAVAILABLE,
+    );
+  }
+  const data = parseJson(
+    Buffer.from(result.stdout.slice(0, -1), "utf8"),
+    "daemon transport rebind result",
+  );
+  if (
+    data?.schema !== DAEMON_TRANSPORT_REBIND_RESULT_SCHEMA ||
+    data.requestId !== requestId ||
+    typeof data.ok !== "boolean" ||
+    typeof data.status !== "string"
+  ) {
+    fail("daemon transport rebind result is mismatched", EX_DATAERR);
+  }
+  if (data.ok !== true) {
+    if (
+      !exactKeys(data, [
+        "schema",
+        "ok",
+        "status",
+        "requestId",
+        "reasonCode",
+        "reason",
+      ]) ||
+      data.status !== "rejected" ||
+      !/^[A-Z][A-Z0-9_]{2,63}$/.test(data.reasonCode) ||
+      typeof data.reason !== "string" ||
+      data.reason.length === 0 ||
+      data.reason.length > 240 ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(data.reason)
+    ) {
+      fail("daemon transport rebind failure is invalid", EX_DATAERR);
+    }
+    fail(`${data.reasonCode}; ${data.reason}`, EX_UNAVAILABLE);
+  }
+  return data;
+}
+
+function invokeDaemonTransportRebind(request) {
+  const opened = openStaticFile(rebindClientPath, 128 * 1024);
+  if (sha256(opened.raw) !== EXPECTED_REBIND_CLIENT_SHA256) {
+    closeOpened(opened);
+    fail("exact daemon rebind client hash mismatched", EX_SOFTWARE);
+  }
+  const input = Buffer.from(canonicalJson(request), "utf8");
+  let result;
+  try {
+    result = spawnSync(
+      "/usr/bin/node",
+      [
+        "/proc/self/fd/3",
+        "--socket-root",
+        SOCKET_ROOT,
+        "--session",
+        request.session,
+        "--socket",
+        request.daemon.socketPath,
+        "--timeout-ms",
+        "5000",
+      ],
+      {
+        encoding: "utf8",
+        env: BASE_CHILD_ENV,
+        stdio: ["pipe", "pipe", "pipe", opened.fd],
+        input,
+        timeout: 7000,
+        maxBuffer: 20 * 1024,
+      },
+    );
+  } finally {
+    input.fill(0);
+    closeOpened(opened);
+  }
+  return parseDaemonTransportRebindResult(result, request.requestId);
+}
+
+function validateDaemonRebindIdentity(result, parsed, state) {
+  if (
+    result.session !== parsed.session ||
+    result.daemonPid !== state.pid ||
+    result.daemonStartTicks !== state.startTicks ||
+    result.socketPath !== join(SOCKET_ROOT, `${parsed.session}.sock`) ||
+    result.socketDev !== state.socketInfo.dev.toString() ||
+    result.socketIno !== state.socketInfo.ino.toString()
+  ) {
+    fail("daemon changed during transport handover", EX_DATAERR);
+  }
+}
+
+function prepareDaemonTransportRebind(parsed, lease, state) {
+  const base = daemonTransportRebindBase(parsed, lease, state);
+  const result = invokeDaemonTransportRebind({ ...base, phase: "prepare" });
+  if (
+    !exactKeys(result, [
+      "schema",
+      "ok",
+      "status",
+      "requestId",
+      "session",
+      "daemonPid",
+      "daemonStartTicks",
+      "socketPath",
+      "socketDev",
+      "socketIno",
+      "handoverId",
+      "rootTargetId",
+      "targetCount",
+      "topologySha256",
+      "deadlineAt",
+    ]) ||
+    result.status !== "prepared" ||
+    !/^[0-9a-f]{64}$/.test(result.handoverId) ||
+    result.rootTargetId !== lease.data.targetId ||
+    !Number.isSafeInteger(result.targetCount) ||
+    result.targetCount < 1 ||
+    result.targetCount > 64 ||
+    !/^[0-9a-f]{64}$/.test(result.topologySha256) ||
+    !Number.isSafeInteger(result.deadlineAt) ||
+    result.deadlineAt <= Date.now() ||
+    result.deadlineAt > Date.now() + 36_000
+  ) {
+    fail("daemon transport handover preparation is invalid", EX_DATAERR);
+  }
+  validateDaemonRebindIdentity(result, parsed, state);
+  return { base, result };
+}
+
+function abortDaemonTransportRebind(prepared, parsed, state) {
+  try {
+    const request = {
+      ...prepared.base,
+      requestId: randomBytes(32).toString("hex"),
+      phase: "abort",
+      handoverId: prepared.result.handoverId,
+    };
+    const result = invokeDaemonTransportRebind(request);
+    if (
+      !exactKeys(result, [
+        "schema",
+        "ok",
+        "status",
+        "requestId",
+        "session",
+        "daemonPid",
+        "daemonStartTicks",
+        "socketPath",
+        "socketDev",
+        "socketIno",
+        "handoverId",
+        "rootTargetId",
+      ]) ||
+      result.status !== "aborted" ||
+      result.handoverId !== prepared.result.handoverId ||
+      result.rootTargetId !== prepared.base.root.targetId
+    ) {
+      return false;
+    }
+    validateDaemonRebindIdentity(result, parsed, state);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function commitDaemonTransportRebind(
+  prepared,
+  parsed,
+  state,
+  renewal,
+  authority,
+) {
+  const request = {
+    ...prepared.base,
+    requestId: randomBytes(32).toString("hex"),
+    phase: "commit",
+    handoverId: prepared.result.handoverId,
+    renewed: {
+      brokerGeneration: renewal.brokerGeneration,
+      transportGeneration: renewal.transportGeneration,
+      brokerLeaseId: renewal.brokerLeaseId,
+      authorization: authority.authorization.value,
+      brokerCdpWebSocketUrl: renewal.brokerCdpWebSocketUrl,
+      consentGeneration: renewal.consentGeneration,
+      brokerProducerContractSha256: renewal.brokerProducerContractSha256,
+      brokerCapabilityExpiresAt: renewal.brokerCapabilityExpiresAt,
+      renewedAt: renewal.renewedAt,
+    },
+  };
+  const result = invokeDaemonTransportRebind(request);
+  if (
+    !exactKeys(result, [
+      "schema",
+      "ok",
+      "status",
+      "requestId",
+      "session",
+      "daemonPid",
+      "daemonStartTicks",
+      "socketPath",
+      "socketDev",
+      "socketIno",
+      "handoverId",
+      "rootTargetId",
+      "activeTargetId",
+      "targetCount",
+      "priorTransportGeneration",
+      "transportGeneration",
+      "priorBrokerLeaseId",
+      "brokerLeaseId",
+      "topologySha256",
+    ]) ||
+    result.status !== "rebound" ||
+    result.handoverId !== prepared.result.handoverId ||
+    result.rootTargetId !== prepared.base.root.targetId ||
+    typeof result.activeTargetId !== "string" ||
+    !result.activeTargetId ||
+    !Number.isSafeInteger(result.targetCount) ||
+    result.targetCount < prepared.result.targetCount ||
+    result.targetCount > 64 ||
+    result.priorTransportGeneration !==
+      prepared.base.prior.transportGeneration ||
+    result.transportGeneration !== renewal.transportGeneration ||
+    result.priorBrokerLeaseId !== prepared.base.prior.brokerLeaseId ||
+    result.brokerLeaseId !== renewal.brokerLeaseId ||
+    result.topologySha256 !== prepared.result.topologySha256
+  ) {
+    fail("daemon transport handover result is invalid", EX_DATAERR);
+  }
+  validateDaemonRebindIdentity(result, parsed, state);
+  return result;
+}
+
 function nativeArgs(parsed, authority) {
   return [
     ...parsed.nativeGlobals,
@@ -4404,6 +6721,7 @@ function bootstrapAttestedDaemon(
 }
 
 function bootstrapLockName(session) {
+  // The same transition lock guards cold creation and exact legacy retirement.
   return `session-${session}.bootstrap-lock`;
 }
 
@@ -4426,7 +6744,7 @@ function loadBootstrapLock(root, session) {
     ]) ||
     data.schema !== "agent-browser.bootstrap-lock.v1" ||
     data.session !== session ||
-    !["caleb", "erebora"].includes(data.account) ||
+    !/^(?:caleb|erebora|profile-[0-9a-f]{64})$/.test(data.account) ||
     !Number.isSafeInteger(data.pid) ||
     data.pid <= 1 ||
     !/^[0-9]+$/.test(data.startTicks) ||
@@ -4438,7 +6756,11 @@ function loadBootstrapLock(root, session) {
 }
 
 function bootstrapOwnerIsLive(lock) {
-  return exactProcessIsLive(lock.data.pid, lock.data.startTicks);
+  // An observation error cannot transfer the transition lock. Only proof that
+  // the recorded process birth ended permits exact lock reclamation.
+  return (
+    processIdentityStatus(lock.data.pid, lock.data.startTicks) !== "dead"
+  );
 }
 
 function acquireBootstrapLock(root, parsed, identity) {
@@ -4467,14 +6789,16 @@ function acquireBootstrapLock(root, parsed, identity) {
   return raw;
 }
 
+function requireExactBootstrapLock(root, session, bootstrapRaw) {
+  const lock = loadBootstrapLock(root, session);
+  if (!lock || !lock.raw.equals(bootstrapRaw)) {
+    fail("session bootstrap ownership changed", EX_DATAERR);
+  }
+  return lock;
+}
+
 function requireClosedBootstrapNamespace(root, parsed, bootstrapRaw) {
-  const requireExactLock = () => {
-    const lock = loadBootstrapLock(root, parsed.session);
-    if (!lock || !lock.raw.equals(bootstrapRaw)) {
-      fail("session bootstrap ownership changed", EX_DATAERR);
-    }
-  };
-  requireExactLock();
+  requireExactBootstrapLock(root, parsed.session, bootstrapRaw);
   const state = readSessionState(root, parsed.session);
   if (
     state.kind !== "closed" ||
@@ -4486,7 +6810,7 @@ function requireClosedBootstrapNamespace(root, parsed, bootstrapRaw) {
   }
   // Re-read the lock after the namespace snapshot so a replacement during the
   // check cannot authorize retirement from stale local ownership evidence.
-  requireExactLock();
+  requireExactBootstrapLock(root, parsed.session, bootstrapRaw);
   return state;
 }
 
@@ -4675,47 +6999,281 @@ function runDoctor(parsed) {
   return status;
 }
 
-function handleClose(root, parsed, binding) {
-  let state = readSessionState(root, parsed.session);
-  const lease = loadTaskLease(root, parsed.session);
-  if (state.kind === "closed") {
-    // Local metadata may be released only when both records prove this wrapper
-    // owned the already-empty lane. Exact focus/session registrations are
-    // restored/released; the broker and workspace target are never closed.
-    if (binding && lease && binding.account === lease.data.account) {
-      restoreOwnedFocusLease(root, parsed.session, lease);
-      releaseTaskRegistration(
-        parsed.session,
-        lease.data.targetId,
-        lease.data.targetKind,
-        lease.data.receiptNonce,
+function requireUnchangedLegacyRetirementSnapshot(
+  root,
+  session,
+  binding,
+  lease,
+  expectedState,
+  bootstrapRaw,
+) {
+  const check = () => {
+    requireExactBootstrapLock(root, session, bootstrapRaw);
+    requireUnchangedLegacyMetadata(root, session, binding, lease);
+    const currentState = readSessionState(root, session);
+    if (!sameLegacyRetirementState(currentState, expectedState)) {
+      fail(
+        "legacy session state changed during exact retirement",
+        EX_UNAVAILABLE,
       );
-      root.removeOwned(bindingName(parsed.session), binding.raw);
-      root.removeOwned(taskLeaseName(parsed.session), lease.raw);
+    }
+    requireLegacyOwnerlessRetirement(root, session, currentState, lease);
+    return currentState;
+  };
+  check();
+  return check();
+}
+
+function legacySocketReservationPayload(session, bootstrapRaw) {
+  return Buffer.from(
+    `${canonicalJson({
+      schema: "agent-browser.socket-retirement-reservation.v1",
+      session,
+      bootstrapSha256: sha256(bootstrapRaw),
+      pid: process.pid,
+      startTicks: processStartTicks(process.pid),
+      nonce: randomBytes(32).toString("hex"),
+    })}\n`,
+    "utf8",
+  );
+}
+
+function requireLegacySocketReservation(
+  root,
+  session,
+  binding,
+  lease,
+  bootstrapRaw,
+  reservationRaw,
+) {
+  const check = () => {
+    requireExactBootstrapLock(root, session, bootstrapRaw);
+    requireUnchangedLegacyMetadata(root, session, binding, lease);
+    const reservation = root.openFile(`${session}.sock`, 4096, 0o600, {
+      allowMissing: true,
+    });
+    if (!reservation || !reservation.raw.equals(reservationRaw)) {
+      closeOpened(reservation);
+      fail(
+        "legacy socket retirement reservation changed",
+        EX_UNAVAILABLE,
+      );
+    }
+    closeOpened(reservation);
+    if (
+      root.lstat(`${session}.pid`) ||
+      root.lstat(`${session}.stream`) ||
+      root.lstat(`${session}.port`) ||
+      root.lstat(`${session}.daemon-identity`) ||
+      !processIdentityIsDefinitelyDead(lease.data.pid, lease.data.startTicks) ||
+      socketPathHasLiveKernelEndpoint(join(SOCKET_ROOT, `${session}.sock`))
+    ) {
+      fail(
+        "LEGACY_SESSION_OWNER_UNKNOWN; the exact legacy session changed while its socket path was reserved",
+        EX_UNAVAILABLE,
+      );
+    }
+  };
+  check();
+  check();
+}
+
+function acquireLegacySocketReservation(
+  root,
+  session,
+  binding,
+  lease,
+  bootstrapRaw,
+) {
+  const raw = legacySocketReservationPayload(session, bootstrapRaw);
+  if (!root.writeAtomic(`${session}.sock`, raw, { exclusive: true })) {
+    fail(
+      "LEGACY_SESSION_OWNER_UNKNOWN; the legacy socket path changed before retirement",
+      EX_UNAVAILABLE,
+    );
+  }
+  try {
+    requireLegacySocketReservation(
+      root,
+      session,
+      binding,
+      lease,
+      bootstrapRaw,
+      raw,
+    );
+    return raw;
+  } catch (error) {
+    root.removeOwned(`${session}.sock`, raw);
+    throw error;
+  }
+}
+
+function retireLegacyOwnerlessSession(
+  root,
+  parsed,
+  binding,
+  lease,
+  identity,
+  initialState,
+) {
+  let bootstrapRaw = null;
+  let reservationRaw = null;
+  try {
+    bootstrapRaw = acquireBootstrapLock(root, parsed, identity);
+    const state = requireUnchangedLegacyRetirementSnapshot(
+      root,
+      parsed.session,
+      binding,
+      lease,
+      initialState,
+      bootstrapRaw,
+    );
+    if (state.kind === "stale") {
+      cleanupExactStaleSession(root, parsed.session, state, lease.data);
+    }
+    if (readSessionState(root, parsed.session).kind !== "closed") {
+      fail(
+        "legacy session did not reach a closed local namespace",
+        EX_UNAVAILABLE,
+      );
+    }
+    // WHY: the transition lock serializes supported creators, while this exact
+    // regular-file reservation closes the Unix bind gap between death proof and
+    // metadata retirement. Any competing endpoint wins O_EXCL and is preserved.
+    reservationRaw = acquireLegacySocketReservation(
+      root,
+      parsed.session,
+      binding,
+      lease,
+      bootstrapRaw,
+    );
+    requireLegacySocketReservation(
+      root,
+      parsed.session,
+      binding,
+      lease,
+      bootstrapRaw,
+      reservationRaw,
+    );
+    restoreOwnedFocusLease(root, parsed.session, lease);
+    requireLegacySocketReservation(
+      root,
+      parsed.session,
+      binding,
+      lease,
+      bootstrapRaw,
+      reservationRaw,
+    );
+    releaseTaskRegistration(
+      parsed.session,
+      lease.data.anchorTargetId,
+      lease.data.targetId,
+      lease.data.targetKind,
+      lease.data.receiptNonce,
+      releaseLocalOptions(lease),
+    );
+    requireLegacySocketReservation(
+      root,
+      parsed.session,
+      binding,
+      lease,
+      bootstrapRaw,
+      reservationRaw,
+    );
+    root.removeOwned(bindingName(parsed.session), binding.raw);
+    root.removeOwned(taskLeaseName(parsed.session), lease.raw);
+    root.removeOwned(`${parsed.session}.sock`, reservationRaw);
+    reservationRaw = null;
+    if (readSessionState(root, parsed.session).kind !== "closed") {
+      fail("legacy session retirement did not remain closed", EX_UNAVAILABLE);
     }
     return 0;
+  } finally {
+    if (reservationRaw) {
+      root.removeOwned(`${parsed.session}.sock`, reservationRaw);
+    }
+    if (bootstrapRaw) {
+      root.removeOwned(bootstrapLockName(parsed.session), bootstrapRaw);
+    }
+  }
+}
+
+function handleClose(
+  root,
+  parsed,
+  binding,
+  { allowDeadOwner = true } = {},
+) {
+  let state = readSessionState(root, parsed.session);
+  const lease = loadTaskLease(root, parsed.session);
+  const owner = parsed.agentOwner;
+  if (state.kind === "closed") {
+    if (!binding && !lease) return 0;
+    requireCloseMetadataPair(binding, lease, "closed");
   }
   if (state.kind === "stale") {
-    if (!binding || !lease || binding.account !== lease.data.account) {
-      fail(
-        "stale session ownership is incomplete; cleanup evidence is preserved",
-        EX_DATAERR,
-      );
-    }
-    if (parsed.account && parsed.account !== binding.account) {
+    requireCloseMetadataPair(binding, lease, "stale");
+  }
+  if (lease?.ownership === "legacy-ownerless") {
+    requireCloseMetadataPair(binding, lease, "legacy");
+  }
+  let requestedIdentity = null;
+  let identity = binding
+    ? { account: binding.account, profile: binding.profile, email: "" }
+    : null;
+  if (binding && parsed.account) {
+    requestedIdentity = accountIdentity(parsed.account);
+    identity = requestedIdentity;
+    parsed.account = requestedIdentity.account;
+    if (requestedIdentity.account !== binding.account) {
       fail(
         `session is bound to ${binding.account}; close it without rebinding`,
         EX_DATAERR,
       );
     }
+  }
+  if (lease?.ownership === "legacy-ownerless") {
+    identity = requestedIdentity ?? accountIdentityForBinding(binding);
+    return retireLegacyOwnerlessSession(
+      root,
+      parsed,
+      binding,
+      lease,
+      identity,
+      state,
+    );
+  }
+  if (state.kind === "closed") {
+    // Local metadata may be released only when both records prove this wrapper
+    // owned the already-empty lane. Exact focus/session registrations are
+    // restored/released; the exact task root closes while the broker, user
+    // tabs, and unrelated sessions remain, and an idle anchor retires.
+    validateAgentOwner(lease, owner, { allowDeadOwner });
+    restoreOwnedFocusLease(root, parsed.session, lease);
+    releaseTaskRegistration(
+      parsed.session,
+      lease.data.anchorTargetId,
+      lease.data.targetId,
+      lease.data.targetKind,
+      lease.data.receiptNonce,
+      releaseLocalOptions(lease),
+    );
+    root.removeOwned(bindingName(parsed.session), binding.raw);
+    root.removeOwned(taskLeaseName(parsed.session), lease.raw);
+    return 0;
+  }
+  if (state.kind === "stale") {
+    validateAgentOwner(lease, owner, { allowDeadOwner });
     validateStaleOwnership(root, parsed.session, state, lease.data);
     restoreOwnedFocusLease(root, parsed.session, lease);
     cleanupExactStaleSession(root, parsed.session, state, lease.data);
     releaseTaskRegistration(
       parsed.session,
+      lease.data.anchorTargetId,
       lease.data.targetId,
       lease.data.targetKind,
       lease.data.receiptNonce,
+      releaseLocalOptions(lease),
     );
     root.removeOwned(bindingName(parsed.session), binding.raw);
     root.removeOwned(taskLeaseName(parsed.session), lease.raw);
@@ -4730,21 +7288,112 @@ function handleClose(root, parsed, binding) {
   if (!binding || !lease) {
     fail("live session is unowned; target close is refused", EX_DATAERR);
   }
-  if (parsed.account && parsed.account !== binding.account) {
-    fail(
-      `session is bound to ${binding.account}; close it without rebinding`,
-      EX_DATAERR,
-    );
-  }
   const graph = loadCanonicalRuntimeGraph();
   validateDaemonIdentity(root, parsed.session, state, graph);
-  const identity = accountIdentity(binding.account);
+  validateLocalTaskOwnership(lease, state, identity, owner, {
+    allowDeadOwner,
+  });
   restoreOwnedFocusLease(root, parsed.session, lease);
-  let authority = loadTransportAuthority(parsed.session);
+  let authority;
+  try {
+    authority = loadTransportAuthority(parsed.session, lease);
+  } catch (error) {
+    if (
+      !(error instanceof WrapperError) ||
+      error.code !== EX_UNAVAILABLE ||
+      error.message !== EXACT_EXPIRED_RELEASE_HEALTH_DRIFT
+    ) {
+      throw error;
+    }
+    const expiresAtMs = canonicalRfc3339Milliseconds(
+      lease.data.brokerCapabilityExpiresAt,
+    );
+    if (expiresAtMs === null || expiresAtMs > Date.now()) throw error;
+
+    // WHY [AGENT-BROWSER-HEALTH-DRIFT-EXPIRED-CLOSE-001]: an exact task root
+    // can disappear before its expired broker capability is revoked, causing
+    // the broker to disable authentication for every caller. Native close can
+    // no longer authenticate in that state. Only after re-proving the exact
+    // local agent, daemon source, PID/start, socket, lease bytes, and expired
+    // capability may close stop that daemon and invoke the controller's exact
+    // release transaction. The controller then revokes only this lease and
+    // closes only its registered task tree; no user tab or sibling session is
+    // selected here.
+    revalidateCanonicalRuntimeGraph(graph);
+    const currentBinding = loadBinding(root, parsed.session);
+    const currentLease = loadTaskLease(root, parsed.session);
+    state = readSessionState(root, parsed.session);
+    if (
+      !currentBinding ||
+      !currentLease ||
+      currentLease.ownership !== "agent" ||
+      !currentBinding.raw.equals(binding.raw) ||
+      !currentLease.raw.equals(lease.raw)
+    ) {
+      fail(
+        "expired health-drift close ownership changed before recovery",
+        EX_DATAERR,
+      );
+    }
+    validateLocalTaskOwnership(currentLease, state, identity, owner, {
+      allowDeadOwner,
+    });
+    validateDaemonIdentity(root, parsed.session, state, graph);
+    if (!stopExactProcess(state.pid, state.startTicks, Date.now() + 3000)) {
+      fail(
+        "expired health-drift close daemon remained live",
+        EX_UNAVAILABLE,
+      );
+    }
+    state = readSessionState(root, parsed.session);
+    if (state.kind === "stale") {
+      cleanupExactStaleSession(root, parsed.session, state, lease.data);
+      state = readSessionState(root, parsed.session);
+    }
+    if (state.kind !== "closed") {
+      fail(
+        "expired health-drift close did not retire the exact daemon namespace",
+        EX_UNAVAILABLE,
+      );
+    }
+    releaseTaskRegistration(
+      parsed.session,
+      lease.data.anchorTargetId,
+      lease.data.targetId,
+      lease.data.targetKind,
+      lease.data.receiptNonce,
+      releaseLocalOptions(lease),
+    );
+    root.removeOwned(bindingName(parsed.session), binding.raw);
+    root.removeOwned(taskLeaseName(parsed.session), lease.raw);
+    return 0;
+  }
+  if (authority.warm) {
+    const attestedIdentity = authority.profileIdentity;
+    if (
+      !attestedIdentity ||
+      attestedIdentity.account !== binding.account ||
+      attestedIdentity.profile !== binding.profile ||
+      (requestedIdentity &&
+        (requestedIdentity.account !== attestedIdentity.account ||
+          requestedIdentity.profile !== attestedIdentity.profile ||
+          requestedIdentity.email !== attestedIdentity.email))
+    ) {
+      fail(
+        "warm close identity no longer matches the exact Stable profile binding",
+        EX_DATAERR,
+      );
+    }
+    identity = attestedIdentity;
+  } else if (!requestedIdentity) {
+    identity = accountIdentityForBinding(binding);
+  }
   let native;
   try {
     state = readSessionState(root, parsed.session);
-    validateTaskLease(lease, state, identity, authority);
+    validateTaskLease(lease, state, identity, authority, owner, {
+      allowDeadOwner,
+    });
     authority = bindTransportAuthorization(authority, lease.data);
     revalidateCanonicalRuntimeGraph(graph);
     validateDaemonIdentity(root, parsed.session, state, graph);
@@ -4752,19 +7401,47 @@ function handleClose(root, parsed, binding) {
     native.ensureRevision();
     revalidateCanonicalRuntimeGraph(graph);
     state = readSessionState(root, parsed.session);
-    validateTaskLease(lease, state, identity, authority);
+    validateTaskLease(lease, state, identity, authority, owner, {
+      allowDeadOwner,
+    });
     validateDaemonIdentity(root, parsed.session, state, graph);
-    const result = native.run(
-      nativeArgs(parsed, authority),
-      nativeProfileEnv(identity, null, graph, authority),
-    );
-    authority = revalidateTransportAuthority(authority, parsed.session);
-    if (result.status !== 0) return result.status ?? 1;
+    let result;
+    try {
+      result = native.run(
+        nativeArgs(parsed, authority),
+        nativeProfileEnv(identity, null, graph, authority),
+      );
+    } catch (error) {
+      throw appendCleanupFailure(
+        error,
+        releaseFailedExplicitClose(root, parsed, binding, lease),
+      );
+    }
+    if (result.status !== 0) {
+      const status = result.status ?? 1;
+      const cleanup = releaseFailedExplicitClose(root, parsed, binding, lease);
+      if (cleanup.ok !== true) {
+        throw appendCleanupFailure(
+          new WrapperError(
+            `NATIVE_CLOSE_FAILED; exact native close exited with status ${status}`,
+            status,
+          ),
+          cleanup,
+        );
+      }
+      return status;
+    }
     releaseTaskRegistration(
       parsed.session,
+      lease.data.anchorTargetId,
       lease.data.targetId,
       lease.data.targetKind,
       lease.data.receiptNonce,
+      releaseLocalOptions(lease, {
+        port: authority.upstreamPort,
+        brokerProducerContractSha256:
+          authority.attestation.brokerProducerContractSha256,
+      }),
     );
     root.removeOwned(bindingName(parsed.session), binding.raw);
     root.removeOwned(taskLeaseName(parsed.session), lease.raw);
@@ -4785,30 +7462,58 @@ function handleSessionList(root, parsed, binding) {
   }
   const graph = loadCanonicalRuntimeGraph();
   validateDaemonIdentity(root, parsed.session, state, graph);
-  const identity = accountIdentity(binding.account);
-  let authority = loadTransportAuthority(parsed.session);
+  const identity = accountIdentityForBinding(binding);
+  const owner = parsed.agentOwner;
+  if (parsed.account) {
+    const requested = accountIdentity(parsed.account);
+    parsed.account = requested.account;
+    if (requested.account !== binding.account) {
+      fail(`session is bound to ${binding.account}; close it before rebinding`, EX_DATAERR);
+    }
+  }
+  validateLocalTaskOwnership(lease, state, identity, owner);
+  let authority = loadTransportAuthority(parsed.session, lease);
   let native;
   try {
-    validateTaskLease(lease, state, identity, authority);
+    validateTaskLease(lease, state, identity, authority, owner);
     authority = bindTransportAuthorization(authority, lease.data);
     native = new NativeRuntime(root);
     native.ensureRevision();
     revalidateCanonicalRuntimeGraph(graph);
     state = readSessionState(root, parsed.session);
-    validateTaskLease(lease, state, identity, authority);
+    validateTaskLease(lease, state, identity, authority, owner);
     validateDaemonIdentity(root, parsed.session, state, graph);
     const result = native.run(
       ["--session", parsed.session, "session", "list"],
       nativeProfileEnv(identity, null, graph, authority),
     );
-    authority = revalidateTransportAuthority(authority, parsed.session);
+    authority = revalidateTransportAuthority(authority, parsed.session, lease);
     return result.status ?? 1;
   } finally {
     native?.close();
   }
 }
 
-function recycleExpiringWorkspaceSession(root, parsed, binding, state) {
+function renewedTaskLeasePayload(lease, renewal, authority) {
+  return Buffer.from(
+    `${canonicalJson({
+      ...lease.data,
+      controllerEndpointId: authority.data.controller_endpoint_id,
+      browserGeneration: authority.browserGeneration,
+      brokerGeneration: authority.data.broker_generation,
+      transportGeneration: authority.transportGeneration,
+      registrationReceiptSha256: renewal.registrationReceiptSha256,
+      brokerAuthorizationLeaseId: renewal.brokerLeaseId,
+      brokerAuthorizationPath: renewal.brokerAuthFilePath,
+      brokerAuthorizationSha256: renewal.brokerAuthFileSha256,
+      brokerCapabilityExpiresAt: renewal.brokerCapabilityExpiresAt,
+      leaseId: randomBytes(32).toString("hex"),
+    })}\n`,
+    "utf8",
+  );
+}
+
+function renewExpiringTaskSessionTransport(root, parsed, binding, state) {
   if (
     state.kind !== "live" ||
     !binding ||
@@ -4827,76 +7532,293 @@ function recycleExpiringWorkspaceSession(root, parsed, binding, state) {
   if (expiresAt > Date.now() + BROKER_CAPABILITY_REACQUIRE_MARGIN_MS) {
     return { state, binding };
   }
-  const identity = accountIdentity(binding.account);
-  validateLocalTaskOwnership(lease, state, identity);
-  if (lease.data.targetKind !== "agent-workspace") {
+  const identity = accountIdentityForBinding(binding);
+  const owner = parsed.agentOwner;
+  validateLocalTaskOwnership(lease, state, identity, owner);
+  if (lease.data.targetKind !== TASK_ROOT_TARGET_KIND) {
     fail(
-      "TARGET_RESELECTION_REQUIRED; an expiring explicit user-tab collaboration cannot be silently reacquired",
+      "TARGET_RESELECTION_REQUIRED; an expiring explicit user-tab collaboration cannot be silently renewed",
+      EX_UNAVAILABLE,
+    );
+  }
+  const graph = loadCanonicalRuntimeGraph();
+  validateDaemonIdentity(root, parsed.session, state, graph);
+  if (loadFocusLease(root, parsed.session, lease)) {
+    if (expiresAt <= Date.now()) {
+      fail(
+        "TRANSPORT_RENEWAL_REQUIRES_BACKGROUND; expired foreground authority cannot be changed implicitly",
+        EX_UNAVAILABLE,
+      );
+    }
+    restoreOwnedFocusLease(root, parsed.session, lease);
+  }
+
+  const priorAuthority = loadTransportAuthority(parsed.session, lease);
+  if (
+    priorAuthority.data.controller_endpoint_id !==
+      lease.data.controllerEndpointId ||
+    priorAuthority.browserGeneration !== lease.data.browserGeneration
+  ) {
+    fail(
+      "BROWSER_GENERATION_CHANGED; the exact task root cannot cross a browser restart",
       EX_UNAVAILABLE,
     );
   }
 
-  // The task token authenticates the daemon's one broker connection. Replacing
-  // that token cannot re-authorize an existing socket, so retire only this exact
-  // daemon/registration and reacquire the same persistent workspace below.
-  const graph = loadCanonicalRuntimeGraph();
-  validateDaemonIdentity(root, parsed.session, state, graph);
-  const focus = loadFocusLease(root, parsed.session, lease);
-  let focusReleasedLocally = false;
-  if (focus && expiresAt > Date.now()) {
-    restoreOwnedFocusLease(root, parsed.session, lease);
-    focusReleasedLocally = true;
-  }
-  if (!stopExactProcess(state.pid, state.startTicks)) {
-    fail(
-      "SESSION_REACQUIRE_FAILED; exact expiring workspace daemon did not stop",
-      EX_UNAVAILABLE,
+  const prepared = prepareDaemonTransportRebind(parsed, lease, state);
+  let response;
+  let result;
+  let authority;
+  let commitStarted = false;
+  try {
+    response = parseControllerJsonLine(
+      runController([
+      "renew-session-transport",
+      "--session",
+      parsed.session,
+      "--anchor-target-id",
+      lease.data.anchorTargetId,
+      "--target-id",
+      lease.data.targetId,
+      "--receipt-nonce",
+      lease.data.receiptNonce,
+      "--daemon-pid",
+      String(lease.data.pid),
+      "--daemon-start-ticks",
+      lease.data.startTicks,
+      "--socket",
+      join(SOCKET_ROOT, `${parsed.session}.sock`),
+      "--socket-dev",
+      lease.data.socketDev,
+      "--socket-ino",
+      lease.data.socketIno,
+      "--prior-browser-generation",
+      lease.data.browserGeneration,
+      "--prior-transport-generation",
+      lease.data.transportGeneration,
+      "--prior-broker-lease-id",
+      lease.data.brokerAuthorizationLeaseId,
+      "--port",
+      String(priorAuthority.upstreamPort),
+      "--json",
+      ]),
+      "controller session transport renewal",
+      "SESSION_TRANSPORT_RENEWAL_FAILED; exact task root remains on expiring authority",
     );
-  }
-  state = readSessionState(root, parsed.session);
-  if (state.kind === "stale") {
-    cleanupExactStaleSession(root, parsed.session, state, lease.data);
-    state = readSessionState(root, parsed.session);
-  }
-  if (state.kind !== "closed") {
-    fail(
-      "SESSION_REACQUIRE_FAILED; exact expiring workspace namespace did not close",
-      EX_UNAVAILABLE,
-    );
-  }
-  const released = releaseTaskRegistration(
-    parsed.session,
-    lease.data.targetId,
-    lease.data.targetKind,
-    lease.data.receiptNonce,
-  );
-  if (focus && !focusReleasedLocally) {
+    result = response.data;
     if (
-      !["restored", "skipped-concurrent-change"].includes(
-        released.focusDisposition,
-      )
+      !exactKeys(result, [
+      "schema",
+      "ok",
+      "status",
+      "session",
+      "account",
+      "profileDirectory",
+      "profileEmail",
+      "anchorTargetId",
+      "targetId",
+      "targetKind",
+      "browserContextId",
+      "profileBinding",
+      "browserGeneration",
+      "brokerGeneration",
+      "transportGeneration",
+      "receiptNonce",
+      "daemonPid",
+      "daemonStartTicks",
+      "socketPath",
+      "socketDev",
+      "socketIno",
+      "brokerLeaseId",
+      "brokerAuthFilePath",
+      "brokerAuthFileSha256",
+      "brokerCdpWebSocketUrl",
+      "brokerHealthUrl",
+      "consentGeneration",
+      "brokerProducerContractSha256",
+      "brokerCapabilityExpiresAt",
+      "priorBrokerCapabilityRevoked",
+      "renewedAt",
+    ]) ||
+    result.schema !== SESSION_TRANSPORT_RENEWAL_SCHEMA ||
+    result.ok !== true ||
+    result.status !== "renewed" ||
+    result.session !== parsed.session ||
+    result.account !== identity.account ||
+    result.profileDirectory !== identity.profile ||
+    result.profileEmail !== identity.email ||
+    result.anchorTargetId !== lease.data.anchorTargetId ||
+    result.targetId !== lease.data.targetId ||
+    result.targetKind !== lease.data.targetKind ||
+    result.browserContextId !== lease.data.browserContextId ||
+    result.profileBinding !== lease.data.profileBinding ||
+    result.browserGeneration !== lease.data.browserGeneration ||
+    !/^[0-9a-f]{64}$/.test(result.brokerGeneration) ||
+    !/^[0-9a-f]{64}$/.test(result.transportGeneration) ||
+    result.receiptNonce !== lease.data.receiptNonce ||
+    result.daemonPid !== lease.data.pid ||
+    result.daemonStartTicks !== lease.data.startTicks ||
+    result.socketPath !== join(SOCKET_ROOT, `${parsed.session}.sock`) ||
+    result.socketDev !== lease.data.socketDev ||
+    result.socketIno !== lease.data.socketIno ||
+    !/^[0-9a-f]{64}$/.test(result.brokerLeaseId) ||
+    result.brokerAuthFilePath !==
+      expectedBrokerAuthorizationPath(
+        lease.data.controllerEndpointId,
+        result.brokerLeaseId,
+      ) ||
+    !/^[0-9a-f]{64}$/.test(result.brokerAuthFileSha256) ||
+    typeof result.brokerCdpWebSocketUrl !== "string" ||
+    typeof result.brokerHealthUrl !== "string" ||
+    !/^[0-9a-f]{64}$/.test(result.consentGeneration) ||
+    !/^[0-9a-f]{64}$/.test(result.brokerProducerContractSha256) ||
+    canonicalRfc3339Milliseconds(result.brokerCapabilityExpiresAt) === null ||
+    canonicalRfc3339Milliseconds(result.brokerCapabilityExpiresAt) <=
+      Date.now() + BROKER_CAPABILITY_REACQUIRE_MARGIN_MS ||
+    result.priorBrokerCapabilityRevoked !== true ||
+    !Number.isSafeInteger(result.renewedAt) ||
+    result.renewedAt <= 0 ||
+      result.renewedAt > Date.now() + 1_000
     ) {
       fail(
-        "SESSION_REACQUIRE_FAILED; controller did not retire the expired focus lease",
+        "controller returned a mismatched session transport renewal",
+        EX_DATAERR,
+      );
+    }
+
+    authority = loadTransportAuthority(parsed.session);
+    if (
+      authority.data.controller_endpoint_id !==
+        lease.data.controllerEndpointId ||
+      authority.browserGeneration !== lease.data.browserGeneration
+    ) {
+      fail(
+        "BROWSER_GENERATION_CHANGED; the exact task root cannot cross a browser restart",
         EX_UNAVAILABLE,
       );
     }
-    root.removeOwned(focusLeaseName(parsed.session), focus.raw);
-  }
-  root.removeOwned(bindingName(parsed.session), binding.raw);
-  root.removeOwned(taskLeaseName(parsed.session), lease.raw);
-  if (released.status !== "released") {
-    fail(
-      "TARGET_REPROVISION_REQUIRED; persistent workspace disappeared during capability reacquisition",
-      EX_UNAVAILABLE,
+    if (
+      authority.data.broker_generation !== result.brokerGeneration ||
+      authority.transportGeneration !== result.transportGeneration ||
+      authority.webSocketUrl !== result.brokerCdpWebSocketUrl ||
+      authority.healthUrl !== result.brokerHealthUrl ||
+      authority.data.consent_generation !== result.consentGeneration ||
+      authority.snapshot.broker.producerContractSha256 !==
+        result.brokerProducerContractSha256
+    ) {
+      fail(
+        "renewed session transport did not match current controller authority",
+        EX_DATAERR,
+      );
+    }
+    authority = bindTransportAuthorization(authority, {
+      brokerAuthorizationLeaseId: result.brokerLeaseId,
+      brokerAuthorizationPath: result.brokerAuthFilePath,
+      brokerAuthorizationSha256: result.brokerAuthFileSha256,
+    });
+    state = readSessionState(root, parsed.session);
+    validateLocalTaskOwnership(lease, state, identity, owner);
+    validateDaemonIdentity(root, parsed.session, state, graph);
+    commitStarted = true;
+    commitDaemonTransportRebind(
+      prepared,
+      parsed,
+      state,
+      result,
+      authority,
     );
+    state = readSessionState(root, parsed.session);
+    validateLocalTaskOwnership(lease, state, identity, owner);
+    validateDaemonIdentity(root, parsed.session, state, graph);
+  } catch (error) {
+    if (!commitStarted) {
+      let aborted = false;
+      try {
+        const abortState = readSessionState(root, parsed.session);
+        validateLocalTaskOwnership(lease, abortState, identity, owner);
+        validateDaemonIdentity(root, parsed.session, abortState, graph);
+        aborted = abortDaemonTransportRebind(prepared, parsed, abortState);
+      } catch {
+        aborted = false;
+      }
+      if (!aborted) {
+        const code = Number.isSafeInteger(error?.code)
+          ? error.code
+          : EX_UNAVAILABLE;
+        throw new WrapperError(
+          sanitize(
+            `${error?.message || "session transport renewal failed"}; TRANSPORT_REBIND_ABORT_FAILED; exact daemon handover remains blocked until its bounded deadline`,
+          ),
+          code,
+        );
+      }
+    }
+    throw error;
   }
-  return { state: readSessionState(root, parsed.session), binding: null };
+  const renewed = {
+    ...result,
+    registrationReceiptSha256: sha256(response.raw),
+  };
+  const renewedRaw = renewedTaskLeasePayload(lease, renewed, authority);
+  root.replaceOwned(taskLeaseName(parsed.session), lease.raw, renewedRaw);
+  const published = loadTaskLease(root, parsed.session);
+  if (!published || !published.raw.equals(renewedRaw)) {
+    fail("renewed task ownership lease was not durably published", EX_SOFTWARE);
+  }
+  validateTaskLease(published, state, identity, authority, owner);
+  return { state, binding };
 }
 
 function handleBrowserAction(root, parsed, binding) {
   let state = readSessionState(root, parsed.session);
-  ({ state, binding } = recycleExpiringWorkspaceSession(
+  const owner = parsed.agentOwner;
+  const priorLease = loadTaskLease(root, parsed.session);
+  if (priorLease?.ownership === "legacy-ownerless") {
+    requireLegacyOwnerlessRetirement(root, parsed.session, state, priorLease);
+    fail(
+      "LEGACY_SESSION_RETIRE_REQUIRED; close the exact dead legacy namespace before reuse",
+      EX_UNAVAILABLE,
+    );
+  }
+  if (binding && priorLease) {
+    const ownerState = validateAgentOwner(priorLease, owner, {
+      allowDeadOwner: true,
+    });
+    if (ownerState === "dead-owner") {
+      // WHY: a named session may be reused only after the exact prior agent
+      // birth is dead and the normal close path has retired its attested
+      // daemon, socket, root/descendants, capability, and local records.  A
+      // live foreign owner is rejected above; no URL/title/tab guess is used.
+      handleClose(
+        root,
+        {
+          ...parsed,
+          account: null,
+          command: "close",
+          commandArgs: [],
+          expectPopup: false,
+          targetLease: null,
+        },
+        binding,
+        { allowDeadOwner: true },
+      );
+      state = readSessionState(root, parsed.session);
+      binding = loadBinding(root, parsed.session);
+      if (state.kind !== "closed" || binding || loadTaskLease(root, parsed.session)) {
+        fail(
+          "DEAD_OWNER_RECOVERY_FAILED; exact prior session did not retire",
+          EX_UNAVAILABLE,
+        );
+      }
+    }
+  }
+  if (parsed.currentTab && state.kind !== "closed") {
+    fail(
+      "--current-tab is cold-bootstrap-only and cannot rebind an existing session namespace",
+      EX_DATAERR,
+    );
+  }
+  ({ state, binding } = renewExpiringTaskSessionTransport(
     root,
     parsed,
     binding,
@@ -4926,7 +7848,7 @@ function handleBrowserAction(root, parsed, binding) {
   }
   if (createsSession && parsed.expectPopup) {
     fail(
-      "FOREGROUND_REQUIRED; popup-producing collaboration requires an already registered foreground session",
+      "POPUP_SESSION_REQUIRED; popup-producing collaboration requires an already registered session",
       EX_UNAVAILABLE,
     );
   }
@@ -4937,14 +7859,26 @@ function handleBrowserAction(root, parsed, binding) {
     );
   }
 
-  const selectedAccount = binding?.account ?? parsed.account ?? "caleb";
-  if (binding && parsed.account && parsed.account !== binding.account) {
+  const requestedIdentity = parsed.account ? accountIdentity(parsed.account) : null;
+  if (requestedIdentity) parsed.account = requestedIdentity.account;
+  if (binding && requestedIdentity && requestedIdentity.account !== binding.account) {
     fail(
       `session is bound to ${binding.account}; close it before rebinding`,
       EX_DATAERR,
     );
   }
-  const identity = accountIdentity(selectedAccount);
+  // A live task lease already binds the exact account/profile. Its email is
+  // accepted only after the controller reopens the matching registered
+  // provenance and Stable Local State in the warm attestation below. This
+  // avoids a separate resolver process without trusting local binding text as
+  // profile authority.
+  let identity = binding
+    ? requestedIdentity ?? {
+        account: binding.account,
+        email: "",
+        profile: binding.profile,
+      }
+    : requestedIdentity ?? accountIdentity("");
   let bootstrapRaw = null;
   let authority;
   let native;
@@ -4965,22 +7899,79 @@ function handleBrowserAction(root, parsed, binding) {
     graph = loadCanonicalRuntimeGraph();
     if (!createsSession) {
       validateDaemonIdentity(root, parsed.session, state, graph);
+      lease = loadTaskLease(root, parsed.session);
+      validateLocalTaskOwnership(lease, state, identity, owner);
     }
     if (createsSession) {
       bootstrapRaw = acquireBootstrapLock(root, parsed, identity);
       state = requireClosedBootstrapNamespace(root, parsed, bootstrapRaw);
     }
     if (!createsSession && parsed.command === "background") {
-      lease = loadTaskLease(root, parsed.session);
-      validateLocalTaskOwnership(lease, state, identity);
       restoreOwnedFocusLease(root, parsed.session, lease);
       return 0;
     }
-    authority = loadTransportAuthority(parsed.session);
+    let coldBootstrap = null;
     if (createsSession) {
-      const autoAcquired = !parsed.targetLease;
-      if (autoAcquired) {
-        autoAcquiredLocation = acquireRegisteredWorkspaceTargetLease(
+      const exactLock = requireExactBootstrapLock(
+        root,
+        parsed.session,
+        bootstrapRaw,
+      );
+      coldBootstrap = {
+        account: identity.account,
+        requestId: exactLock.data.nonce,
+        requesterPid: exactLock.data.pid,
+        requesterStartTicks: exactLock.data.startTicks,
+        verify: () => {
+          state = requireClosedBootstrapNamespace(
+            root,
+            parsed,
+            bootstrapRaw,
+          );
+        },
+      };
+    }
+    authority = loadTransportAuthority(
+      parsed.session,
+      lease,
+      null,
+      coldBootstrap,
+    );
+    if (!createsSession) {
+      if (authority.warm) {
+        const attestedIdentity = authority.profileIdentity;
+        if (
+          !attestedIdentity ||
+          attestedIdentity.account !== binding.account ||
+          attestedIdentity.profile !== binding.profile ||
+          (requestedIdentity &&
+            (requestedIdentity.account !== attestedIdentity.account ||
+              requestedIdentity.profile !== attestedIdentity.profile ||
+              requestedIdentity.email !== attestedIdentity.email))
+        ) {
+          fail(
+            "warm session identity no longer matches the exact Stable profile binding",
+            EX_DATAERR,
+          );
+        }
+        identity = attestedIdentity;
+      } else if (!requestedIdentity) {
+        // Any warm mismatch keeps the existing full resolver/ensure path.
+        identity = accountIdentityForBinding(binding);
+      }
+    }
+    if (createsSession) {
+      if (parsed.currentTab) {
+        autoAcquiredLocation = acquireCurrentTabTargetLease(
+          parsed,
+          identity,
+          authority,
+        );
+        // Target invitation can outlive the five-second process snapshot.
+        // Re-prove the same generations before trusting its exact receipt.
+        authority = refreshTransportAuthority(authority, parsed.session, lease);
+      } else if (!parsed.targetLease) {
+        autoAcquiredLocation = acquireSessionTaskRootLease(
           parsed,
           identity,
           authority,
@@ -4988,9 +7979,13 @@ function handleBrowserAction(root, parsed, binding) {
             state = requireClosedBootstrapNamespace(root, parsed, bootstrapRaw);
           },
         );
-        // Lease discovery can legitimately outlive the five-second process
-        // snapshot. Re-prove the same generations before trusting its result.
-        authority = refreshTransportAuthority(authority, parsed.session);
+        // Record the exact issued root before validating the controller's
+        // locally renewed proof. A mismatch can therefore retire only this
+        // root and can never reach receipt consumption or native execution.
+        authority = adoptAcquiredTransportProof(
+          authority,
+          autoAcquiredLocation,
+        );
       }
       targetLeasePreflight = preflightTargetLease(
         parsed,
@@ -5001,17 +7996,22 @@ function handleBrowserAction(root, parsed, binding) {
       authority = targetLeasePreflight.authority;
     } else {
       state = readSessionState(root, parsed.session);
-      lease = loadTaskLease(root, parsed.session);
-      validateTaskLease(lease, state, identity, authority);
+      validateTaskLease(lease, state, identity, authority, owner);
       authority = bindTransportAuthorization(authority, lease.data);
     }
     if (!createsSession && parsed.command === "foreground") {
       graph = revalidateCanonicalRuntimeGraph(graph);
       state = readSessionState(root, parsed.session);
-      validateTaskLease(lease, state, identity, authority);
+      validateTaskLease(lease, state, identity, authority, owner);
       validateDaemonIdentity(root, parsed.session, state, graph);
       acquireOwnedFocusLease(root, parsed.session, lease);
-      authority = revalidateTransportAuthority(authority, parsed.session);
+      authority =
+        tryAttestAndReconcileWarmTransportAuthority(
+          authority,
+          parsed.session,
+          lease,
+        ) ??
+        revalidateTransportAuthority(authority, parsed.session, lease);
       return 0;
     }
     native = new NativeRuntime(root);
@@ -5038,16 +8038,31 @@ function handleBrowserAction(root, parsed, binding) {
     validateTransportCache(root, authority, native);
 
     if (parsed.expectPopup) {
+      // Popups are target-lifecycle work, not a human-input boundary. Keep the
+      // exact session in the background and reconcile the new target through
+      // broker provenance; foreground is reserved for --input-boundary.
       graph = revalidateCanonicalRuntimeGraph(graph);
       state = readSessionState(root, parsed.session);
-      validateTaskLease(lease, state, identity, authority);
+      validateTaskLease(lease, state, identity, authority, owner);
       validateDaemonIdentity(root, parsed.session, state, graph);
-      requireActiveForegroundLease(root, parsed.session, lease);
       const result = runPopupClick(parsed);
-      if (TARGET_CREATING_COMMANDS.has(parsed.command)) {
-        reconcileSessionTargets(parsed, authority, lease.data);
+      const warmReconciled = tryAttestAndReconcileWarmTransportAuthority(
+        authority,
+        parsed.session,
+        lease,
+      );
+      if (warmReconciled) {
+        authority = warmReconciled;
+      } else {
+        if (TARGET_CREATING_COMMANDS.has(parsed.command)) {
+          reconcileSessionTargets(parsed, authority, lease.data);
+        }
+        authority = revalidateTransportAuthority(
+          authority,
+          parsed.session,
+          lease,
+        );
       }
-      authority = revalidateTransportAuthority(authority, parsed.session);
       writeTransportCache(root, authority, native);
       return result.status ?? 1;
     }
@@ -5055,7 +8070,7 @@ function handleBrowserAction(root, parsed, binding) {
     graph = revalidateCanonicalRuntimeGraph(graph);
     state = readSessionState(root, parsed.session);
     if (!createsSession) {
-      validateTaskLease(lease, state, identity, authority);
+      validateTaskLease(lease, state, identity, authority, owner);
     }
     validateDaemonIdentity(root, parsed.session, state, graph);
     const result = native.run(
@@ -5063,8 +8078,25 @@ function handleBrowserAction(root, parsed, binding) {
       nativeProfileEnv(identity, claim, graph, authority),
     );
     if (claim) verifyTargetClaimed(claim);
+    let warmReconciled = false;
     if (!createsSession || result.status !== 0) {
-      authority = revalidateTransportAuthority(authority, parsed.session);
+      const warmAuthority = !createsSession
+        ? tryAttestAndReconcileWarmTransportAuthority(
+            authority,
+            parsed.session,
+            lease,
+          )
+        : null;
+      if (warmAuthority) {
+        authority = warmAuthority;
+        warmReconciled = true;
+      } else {
+        authority = revalidateTransportAuthority(
+          authority,
+          parsed.session,
+          lease,
+        );
+      }
     }
     if (result.status !== 0) {
       if (createsSession) {
@@ -5077,9 +8109,12 @@ function handleBrowserAction(root, parsed, binding) {
           daemonBootstrap,
         );
         shouldRollback = false;
-        releaseConsumedTargetLease(parsed, claim);
+        releaseConsumedTargetLease(parsed, identity, claim);
         claimReleased = true;
-      } else if (TARGET_CREATING_COMMANDS.has(parsed.command)) {
+      } else if (
+        TARGET_CREATING_COMMANDS.has(parsed.command) &&
+        !warmReconciled
+      ) {
         reconcileSessionTargets(parsed, authority, lease.data);
       }
       return result.status ?? 1;
@@ -5099,6 +8134,7 @@ function handleBrowserAction(root, parsed, binding) {
         authority,
         state,
         claim,
+        owner,
       );
       validateRegisteredSessionProof(parsed, identity, authority, state, claim);
       createdLeaseRaw = taskLeasePayload(
@@ -5107,6 +8143,7 @@ function handleBrowserAction(root, parsed, binding) {
         authority,
         state,
         registration,
+        owner,
       );
       if (
         !root.writeAtomic(taskLeaseName(parsed.session), createdLeaseRaw, {
@@ -5127,8 +8164,21 @@ function handleBrowserAction(root, parsed, binding) {
       }
       ownershipCommitted = true;
       shouldRollback = false;
+      lease = loadTaskLease(root, parsed.session);
+      const warmAuthority = tryAttestAndReconcileWarmTransportAuthority(
+        authority,
+        parsed.session,
+        lease,
+      );
+      if (warmAuthority) {
+        authority = warmAuthority;
+        warmReconciled = true;
+      }
     }
-    if (createsSession || TARGET_CREATING_COMMANDS.has(parsed.command)) {
+    if (
+      !warmReconciled &&
+      (createsSession || TARGET_CREATING_COMMANDS.has(parsed.command))
+    ) {
       reconcileSessionTargets(
         parsed,
         authority,
@@ -5154,9 +8204,14 @@ function handleBrowserAction(root, parsed, binding) {
       if (!failedCleanup) {
         const released = releaseFailedTaskRegistration(
           parsed.session,
+          registration.anchorTargetId,
           registration.targetId,
           registration.targetKind,
           registration.receiptNonce,
+          registration.account,
+          registration.profileBinding,
+          registration.browserGeneration,
+          authority?.upstreamPort ?? null,
         );
         if (released.ok !== true) failedCleanup = released;
       }
@@ -5168,15 +8223,21 @@ function handleBrowserAction(root, parsed, binding) {
       autoAcquiredLocation &&
       !failedCleanup
     ) {
-      const released = releaseFailedPendingWorkspaceLease(
-        parsed,
-        identity,
-        autoAcquiredLocation.receipt,
-      );
+      const released = parsed.currentTab
+        ? releaseFailedPendingCurrentTabLease(
+            parsed,
+            identity,
+            autoAcquiredLocation,
+          )
+        : releaseFailedPendingTaskRootLease(
+            parsed,
+            identity,
+            autoAcquiredLocation.receipt,
+          );
       if (released.ok !== true) failedCleanup = released;
     }
     if (!ownershipCommitted && !registration && claim && !claimReleased) {
-      releaseConsumedTargetLease(parsed, claim);
+      releaseConsumedTargetLease(parsed, identity, claim);
       claimReleased = true;
     }
     if (!ownershipCommitted && createdBindingRaw) {
@@ -5220,6 +8281,9 @@ function main() {
     }
   }
   if (parsed.command === "doctor") return runDoctor(parsed);
+  if (parsed.command === "recover-metamask-vault")
+    return runMetaMaskVaultRecovery(parsed);
+  parsed.agentOwner = invokingAgentIdentity();
 
   if (parsed.command === "close") {
     const root = SecureDir.open(SOCKET_ROOT, { create: false, mode: 0o700 });
@@ -5241,25 +8305,32 @@ function main() {
   }
 }
 
-let parsedJsonOutput = false;
+let isMainModule = false;
 try {
-  const args = process.argv.slice(2);
-  parsedJsonOutput =
-    args.includes("--json") && !args.some((arg) => arg.startsWith("--json="));
-  const status = main();
-  process.exit(status);
-} catch (error) {
-  const code = error instanceof WrapperError ? error.code : EX_SOFTWARE;
-  const message =
-    error instanceof WrapperError
-      ? error.message
-      : sanitize(error?.message || "unexpected wrapper failure");
-  if (parsedJsonOutput) {
-    process.stdout.write(
-      `${JSON.stringify({ success: false, data: null, error: message })}\n`,
-    );
-  } else {
-    process.stderr.write(`agent-browser: ${message}\n`);
+  isMainModule = Boolean(process.argv[1]) && realpathSync(process.argv[1]) === scriptPath;
+} catch {}
+
+if (isMainModule) {
+  let parsedJsonOutput = false;
+  try {
+    const args = process.argv.slice(2);
+    parsedJsonOutput =
+      args.includes("--json") && !args.some((arg) => arg.startsWith("--json="));
+    const status = main();
+    process.exit(status);
+  } catch (error) {
+    const code = error instanceof WrapperError ? error.code : EX_SOFTWARE;
+    const message =
+      error instanceof WrapperError
+        ? error.message
+        : sanitize(error?.message || "unexpected wrapper failure");
+    if (parsedJsonOutput) {
+      process.stdout.write(
+        `${JSON.stringify({ success: false, data: null, error: message })}\n`,
+      );
+    } else {
+      process.stderr.write(`agent-browser: ${message}\n`);
+    }
+    process.exit(code);
   }
-  process.exit(code);
 }

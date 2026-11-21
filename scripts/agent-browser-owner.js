@@ -110,7 +110,13 @@ export function resolveInvokingOwner({
     if (DEAD_STATES.has(stat.state)) throw failure("OWNER_IDENTITY_CHANGED");
     const observed = { ...stat, uid: actualUid, executable: exe };
     if (!selected) selected = observed;
-    const kind = basename(exe).toLowerCase().replace(/\.exe$/, "");
+    // WHY: when an agent auto-updates while running, Linux reports its old binary as
+    // "/path/claude.exe (deleted)". Without stripping that suffix the agent is not
+    // recognized, ownership falls to each short-lived tool shell, and the broker retires
+    // the session within a second of that shell exiting, so the next command sees a new
+    // about:blank tab. Observed 2026-09-17 after claude-code 2.1.274 installed mid-session.
+    // Removing this strip reintroduces blank tabs across tool calls after any agent update.
+    const kind = basename(exe.replace(/ \(deleted\)$/, "")).toLowerCase().replace(/\.exe$/, "");
     if (AGENTS.has(kind)) {
       selected = observed;
       agentKind = kind;

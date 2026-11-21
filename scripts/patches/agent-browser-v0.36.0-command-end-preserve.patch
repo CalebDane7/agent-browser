@@ -1,0 +1,106 @@
+--- a/cli/src/native/private_cws.rs
++++ b/cli/src/native/private_cws.rs
+@@ -93,6 +93,33 @@
+     json!({ "id": cmd["id"], "success": false, "error": message })
+ }
+ 
++fn finish_response(transaction: &Value, mut response: Value, cleanup: Result<(), String>) -> Value {
++    let Err(message) = cleanup else { return response; };
++    let diagnostic = format!("Command cleanup failed ({message}).");
++    let append_warning = |response: &mut Value, message: String| {
++        response["warning"] = match response["warning"].as_str() {
++            Some(previous) => json!(format!("{previous}\n{message}")),
++            None => json!(message),
++        };
++    };
++    if response["success"] != true {
++        // WHY: command.end is a fence/cleanup acknowledgement, not the page action.
++        // Replacing an earlier page error hid the causal red and invited unsafe retries.
++        append_warning(&mut response, diagnostic);
++        return response;
++    }
++    let warning = if transaction["batch"] == true {
++        format!("{diagnostic} Completed batch results remain in data.responses; do not repeat successful actions.")
++    } else {
++        format!("{diagnostic} The command returned success; its result remains in data. Do not repeat the action.")
++    };
++    response["success"] = json!(false);
++    response["error"] = json!("COMMAND_CLEANUP_FAILED");
++    response["code"] = json!("command_cleanup_failed");
++    append_warning(&mut response, warning);
++    response
++}
++
+ pub async fn execute(transaction: &Value, state: &mut DaemonState) -> Value {
+     let grant = &transaction["grant"];
+     let Some(nonce) = grant["nonce"].as_str() else { return error(transaction, "COMMAND_ENVELOPE_INVALID"); };
+@@ -131,10 +158,10 @@
+     }).await;
+     // No timeout means cancellation here. If transport is lost, broker/worker
+     // epoch fencing rejects old frames; exact daemon death remains observable.
+-    if let Err(message) = control(json!({
++    let cleanup = control(json!({
+         "op": "command.end", "command": command, "daemonPid": std::process::id()
+-    }), &command).await { return error(transaction, &message); }
+-    response
++    }), &command).await.map(|_| ());
++    finish_response(transaction, response, cleanup)
+ }
+ 
+ #[cfg(test)]
+@@ -158,4 +185,55 @@
+         }, async { encode_cdp(&message).unwrap() }).await;
+         assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap()["agentBrowserCommand"], "a".repeat(64));
+     }
++    #[test]
++    fn cleanup_failure_preserves_primary_page_error() {
++        let transaction = json!({ "id": "transaction", "batch": false });
++        let primary = json!({ "id": "action", "success": false, "error": "net::ERR_CONNECTION_REFUSED" });
++        let result = finish_response(&transaction, primary, Err("TAB_NOT_OWNED".to_string()));
++        assert_eq!(result["error"], "net::ERR_CONNECTION_REFUSED");
++        assert_eq!(result["warning"], "Command cleanup failed (TAB_NOT_OWNED).");
++        assert_eq!(result["success"], false);
++    }
++    #[test]
++    fn cleanup_failure_preserves_completed_action_result_and_forces_failure() {
++        let transaction = json!({ "id": "transaction", "batch": false });
++        let primary = json!({ "id": "action", "success": true,
++            "data": { "url": "https://example.test/after-mutation" } });
++        let result = finish_response(&transaction, primary, Err("TAB_NOT_OWNED".to_string()));
++        assert_eq!(result["data"]["url"], "https://example.test/after-mutation");
++        assert_eq!(result["error"], "COMMAND_CLEANUP_FAILED");
++        assert_eq!(result["code"], "command_cleanup_failed");
++        assert_eq!(result["success"], false);
++        assert!(result["warning"].as_str().unwrap().contains("Do not repeat"));
++    }
++    #[test]
++    fn cleanup_failure_preserves_batch_per_action_results() {
++        let transaction = json!({ "id": "transaction", "batch": true });
++        let primary = json!({ "id": "transaction", "success": true, "data": { "responses": [
++            { "id": "one", "success": true, "data": { "clicked": true } },
++            { "id": "two", "success": false, "error": "selector missing" }
++        ] } });
++        let result = finish_response(&transaction, primary.clone(), Err("TAB_NOT_OWNED".to_string()));
++        assert_eq!(result["data"], primary["data"]);
++        assert_eq!(result["success"], false);
++        assert!(result["warning"].as_str().unwrap().contains("data.responses"));
++        assert!(result["warning"].as_str().unwrap().contains("do not repeat"));
++    }
++    #[test]
++    fn successful_cleanup_leaves_ordinary_responses_unchanged() {
++        let transaction = json!({ "id": "transaction", "batch": false });
++        let success = json!({ "id": "action", "success": true, "data": { "value": 7 } });
++        let failure = json!({ "id": "action", "success": false, "error": "ordinary red" });
++        assert_eq!(finish_response(&transaction, success.clone(), Ok(())), success);
++        assert_eq!(finish_response(&transaction, failure.clone(), Ok(())), failure);
++    }
++    #[test]
++    fn cleanup_failure_appends_to_existing_warning() {
++        let transaction = json!({ "id": "transaction", "batch": false });
++        let primary = json!({ "id": "action", "success": false, "error": "primary",
++            "warning": "Pending dialog remains observable." });
++        let result = finish_response(&transaction, primary, Err("TAB_NOT_OWNED".to_string()));
++        assert_eq!(result["warning"],
++            "Pending dialog remains observable.\nCommand cleanup failed (TAB_NOT_OWNED).");
++    }
+ }

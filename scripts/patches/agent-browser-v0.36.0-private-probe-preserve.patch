@@ -1,0 +1,79 @@
+--- a/cli/src/native/actions.rs
++++ b/cli/src/native/actions.rs
+@@ -2185,6 +2185,38 @@
+     state.active_provider_connection = false;
+ }
+ 
++fn relaunch_after_liveness_probe(private_cws: bool, alive: bool) -> Result<bool, String> {
++    if !alive && private_cws {
++        // WHY: the private provider owns an existing task capability, not a
++        // replaceable browser process. A failed 3s Page.getFrameTree probe can
++        // mean a paused/busy renderer. Closing its provider destroys the task,
++        // then reconnecting that same capability fails the WebSocket handshake.
++        // Preserve the document and report uncertainty; broker command.begin
++        // still owns true root/epoch revocation, and explicit close still retires.
++        return Err("PRIVATE_CWS_LIVENESS_UNCONFIRMED: retained the existing task capability; no relaunch attempted. Check the prior action outcome before repeating a mutation.".to_string());
++    }
++    Ok(!alive)
++}
++
++#[cfg(test)]
++mod private_cws_liveness_policy_tests {
++    use super::relaunch_after_liveness_probe;
++
++    #[test]
++    fn inconclusive_private_probe_cannot_authorize_destructive_relaunch() {
++        let error = relaunch_after_liveness_probe(true, false).unwrap_err();
++        assert!(error.starts_with("PRIVATE_CWS_LIVENESS_UNCONFIRMED:"));
++        assert!(error.contains("retained the existing task capability"));
++    }
++
++    #[test]
++    fn successful_probe_and_nonprivate_recovery_keep_their_existing_policy() {
++        assert_eq!(relaunch_after_liveness_probe(true, true), Ok(false));
++        assert_eq!(relaunch_after_liveness_probe(false, true), Ok(false));
++        assert_eq!(relaunch_after_liveness_probe(false, false), Ok(true));
++    }
++}
++
+ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(), String> {
+     let close_error = if let Some(mut mgr) = state.browser.take() {
+         mgr.close().await.err()
+@@ -2474,7 +2506,16 @@
+         if restore_key_change_needs_launch {
+             true
+         } else if let Some(ref mut mgr) = state.browser {
+-            mgr.has_process_exited() || !mgr.is_connection_alive().await
++            let private_cws = mgr.is_direct_page_connection()
++                && super::private_cws::provider_connection().is_some();
++            if mgr.has_process_exited() {
++                true
++            } else {
++                match relaunch_after_liveness_probe(private_cws, mgr.is_connection_alive().await) {
++                    Ok(relaunch) => relaunch,
++                    Err(error) => return error_response(&id, &error),
++                }
++            }
+         } else {
+             true
+         }
+@@ -4484,11 +4525,16 @@
+         let was_external = mgr.is_cdp_connection();
+         let hash_changed = state.launch_hash != Some(new_hash);
+         let storage_state_requires_clean_launch = storage_state_owned.is_some() && !is_external;
+-        is_external != was_external
++        let structurally_changed = is_external != was_external
+             || hash_changed
+             || storage_state_requires_clean_launch
+-            || mgr.has_process_exited()
+-            || !mgr.is_connection_alive().await
++            || mgr.has_process_exited();
++        structurally_changed
++            || relaunch_after_liveness_probe(
++                mgr.is_direct_page_connection()
++                    && super::private_cws::provider_connection().is_some(),
++                mgr.is_connection_alive().await,
++            )?
+     } else {
+         true
+     };

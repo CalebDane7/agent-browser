@@ -18,8 +18,8 @@
     "platform": "linux-x64",
     "archivePath": "package/bin/agent-browser-linux-x64",
     "outputName": "agent-browser-v0.36.0-linux-x64",
-    "size": 12076512,
-    "sha256": "6612815bd78804803f9d1a0272528d1c6fa555f9a6d994511126ed9eed8c7f23",
+    "size": 12080480,
+    "sha256": "35c7b948a927b5e72284d562870feafea7543d6e27070c2a7b6652b38c372067",
     "releaseUrl": "https://github.com/vercel-labs/agent-browser/releases/download/v0.36.0/agent-browser-linux-x64",
     "localBuild": {
       "baseCommit": "eb05921bad874cd2a1b4fa5d1149f1ed26576cae",
@@ -59,6 +59,14 @@
         {
           "path": "patches/agent-browser-v0.36.0-errors-clear.patch",
           "sha256": "df8803e3650a9c442e93a591e36ef9233ff24c1030220cd40c5df50d11613326"
+        },
+        {
+          "path": "patches/agent-browser-v0.36.0-command-end-preserve.patch",
+          "sha256": "31024dc382baeaf7330e5de3af4f28bccb3e2b49b40c0ef597bb29da91d892a5"
+        },
+        {
+          "path": "patches/agent-browser-v0.36.0-private-probe-preserve.patch",
+          "sha256": "af703945799534c7b295ee8e6af210675755a8cf24820c602fdaf0d231d2b53f"
         }
       ]
     }

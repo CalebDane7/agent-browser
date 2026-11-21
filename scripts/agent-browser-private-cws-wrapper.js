@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import { requestExtensionControl } from "./agent-browser-extension-control.js";
 import {
   canonicalJson,
+  exactKeys,
   isAccount,
   isSession,
   sha256,
@@ -324,6 +325,9 @@ export function parseWrapperArgs(argv) {
   }
   if (forwarded[0] === "background" && forwarded.length !== 1)
     fail("background takes no arguments", EX_USAGE);
+  if (forwarded[0] === "recovery" &&
+      (forwarded.length !== 2 || forwarded[1] !== "inspect"))
+    fail("recovery supports only inspect", EX_USAGE);
   return { account, session, currentTab, forwarded };
 }
 
@@ -541,18 +545,20 @@ export async function run(argv) {
   const foreground = options.forwarded[0] === "foreground";
   const background = options.forwarded[0] === "background";
   const focusControl = foreground || background;
-  if (!focusControl) validateEngine();
+  const recoveryInspection = options.forwarded[0] === "recovery";
+  const retainedControl = focusControl || recoveryInspection;
+  if (!retainedControl) validateEngine();
   const config = readProfileConfig();
   const profile = config.profiles.find((item) => item.account === options.account);
   if (!profile) fail(`profile is not enrolled: ${options.account}`, EX_UNAVAILABLE);
-  const receipt = await (focusControl ? requireExtensionBroker : ensureExtensionBroker)({
+  const receipt = await (retainedControl ? requireExtensionBroker : ensureExtensionBroker)({
     stateRoot: STATE_ROOT,
     profileConfig: PROFILE_CONFIG,
   });
-  if (!focusControl) await ensureProfileOnline(receipt, profile);
+  if (!retainedControl) await ensureProfileOnline(receipt, profile);
 
   const grantPath = grantPathForSession(engineSession);
-  const diagnosticPath = focusControl ? undefined : providerDiagnosticPath();
+  const diagnosticPath = retainedControl ? undefined : providerDiagnosticPath();
   const closesSession = options.forwarded[0] === "close";
   const providerArgs = closesSession ? [] : ["--provider", PROVIDER_NAME];
   const issuedAt = Date.now();
@@ -569,6 +575,40 @@ export async function run(argv) {
   const identity = createGrant(grantPath, grant);
   let result;
   try {
+    if (recoveryInspection) {
+      // R1562 WHY: ordinary commands first probe Page.getFrameTree. A busy or
+      // modal renderer can make that probe inconclusive, hiding even dialog
+      // status. Inspect ONLY existing extension ownership through the broker's
+      // one-use owner grant; never launch, rebind, retire, focus or probe pages.
+      let observed;
+      try {
+        observed = await requestExtensionControl(receipt.controlSocket,
+          { op: "recovery.inspect", grant }, 3_000);
+      } catch (error) {
+        const code = /^[A-Z][A-Z0-9_]{2,63}$/.test(error?.code ?? "")
+          ? error.code : "CONTROL_UNAVAILABLE";
+        // Unstructured owner messages can contain page data. Keep only codes.
+        fail(`recovery inspection not confirmed: ${code}`, EX_UNAVAILABLE);
+      }
+      const schema = "agent-browser.recovery-inspection.v1";
+      const uncertain = exactKeys(observed, ["schema", "outcome"]) &&
+        ["inventory-invalid", "state-changed"].includes(observed.outcome);
+      const present = observed?.outcome === "requested-root-present";
+      const inspected = exactKeys(observed, ["schema", "outcome", "brokerSessionPresent",
+        "requestedTabCount", "knownRootMatches"]) &&
+        (present || observed.outcome === "requested-root-missing") &&
+        typeof observed.brokerSessionPresent === "boolean" &&
+        Number.isSafeInteger(observed.requestedTabCount) &&
+        (present ? observed.requestedTabCount >= 1 && observed.requestedTabCount <= 64
+          : observed.requestedTabCount === 0) &&
+        (present && observed.brokerSessionPresent
+          ? typeof observed.knownRootMatches === "boolean" : observed.knownRootMatches === null);
+      if (observed?.schema !== schema || (!uncertain && !inspected))
+        fail("recovery inspection response is invalid", EX_UNAVAILABLE);
+      // Unknown/invalid inventory is not successful absence proof.
+      process.stdout.write(`${canonicalJson({ success: inspected, data: observed })}\n`);
+      return inspected ? 0 : EX_UNAVAILABLE;
+    }
     if (background) {
       // WHY: returning from a manual-input handoff is owner-bound broker work,
       // not a donor command, tab adoption, launch, retry or blind focus reset.

@@ -10,8 +10,8 @@ import { execSync } from 'child_process';
 const SCREENSHOT_MAX_DIM = 1568;
 const DEFAULT_MAX_OUTPUT_BYTES = 50000;
 const MAX_CONFIGURED_OUTPUT_BYTES = 100000000;
-// Output limiting is adapted and materially changed from vercel-labs/agent-browser
-// 021d9255:cli/src/output.rs (Apache-2.0); this version bounds complete JSON bytes.
+// @agent-browser-donor-provenance {"schema":"agent-browser-donor-provenance.v1","repository":"https://github.com/vercel-labs/agent-browser","release":"v0.35.2","commit":"118af8eef1eebe21b949c3cf677d468330da7a46","tree":"d4f318b7089cffe15f854175f4b12bcff69db392","source":{"path":"cli/src/output.rs","gitBlobSha1":"8c510a2b3e9aec06eb7171af255cc4ea15e25c7c","sha256":"68c1810832389d56fdb28ee26b5239069654239aca523faf285fd7a0a12340dc","regions":[{"symbol":"truncate_if_needed","lines":[36,59],"sha256":"8683055fe914494cd6851b7f6eddec9f330692f71ecef6368ac9b844f5bc8dbc"}]},"local":{"symbols":["responseBytes","fullOutputRequested","outputLimit","jsonEscapedUnit","countTextLines","textPrefixForJsonBudget","linePrefixForJsonBudget","boundedTextResponse","boundedJsonResponse","boundedArrayResponse"],"modified":true,"modification":"Complete serialized UTF-8 JSON byte bounds, structured truncation metadata, and Unicode-safe prefixes replace upstream character-only truncation."},"license":{"spdx":"Apache-2.0","copyright":"Copyright 2025 Vercel Inc.","gitBlobSha1":"8226d363f88a734e52cc79ead7a5588cc55e76f7","sha256":"014bb31e83d5c2e76aea1cc6e82217346ab41362f32cb355ad0f5c10aa0aeaff"}}
+// No donor runtime is imported; the authenticated wrapper and broker remain the only ownership, focus, and cleanup path.
 const snapshotBaselines = new WeakMap();
 
 function responseBytes(response) {

@@ -140,3 +140,48 @@ if (process.argv[2] === '--admission-fixture') {
     }
   });
 }
+
+// R1501 WHY: fixture-only admission tests missed the actual supervisor importing
+// the admission entrypoint again. Exercise that static dependency through the
+// literal CLI, while replacing browser execution with a no-effect wrapper.
+if (process.argv[2] !== '--admission-fixture') test('literal admission CLI resolves actual supervisor graph without unsettled top-level await', { skip: !linux, timeout: 10000 }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-browser-admission-graph-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const scripts = path.join(dir, 'scripts');
+  fs.mkdirSync(scripts);
+  fs.writeFileSync(path.join(dir, 'package.json'), '{"type":"module"}\n');
+  for (const name of ['agent-browser-admission.mjs', 'agent-browser-admission-lock.mjs',
+    'agent-browser-extension-supervisor.js', 'agent-browser-extension-control.js',
+    'agent-browser-extension-protocol.js']) {
+    fs.copyFileSync(fileURLToPath(new URL(`../scripts/${name}`, import.meta.url)), path.join(scripts, name));
+  }
+  fs.writeFileSync(path.join(scripts, 'agent-browser-private-cws-wrapper.js'), `
+import assert from 'node:assert/strict';
+import {fileURLToPath} from 'node:url';
+import {requireExtensionBroker, ensureExtensionBroker} from './agent-browser-extension-supervisor.js';
+assert.equal(typeof requireExtensionBroker, 'function');
+assert.equal(typeof ensureExtensionBroker, 'function');
+assert.equal(process.argv[1], fileURLToPath(import.meta.url));
+process.send({pid:process.pid,parentPid:process.ppid,cwd:process.cwd(),argv:process.argv.slice(2)});
+process.exitCode=23;
+`);
+  const child = spawn(process.execPath, [path.join(scripts, 'agent-browser-admission.mjs'), ...fixtureArgs], {
+    cwd: dir, env: {PATH:'/usr/bin:/bin', LANG:'C.UTF-8', TMPDIR:dir},
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+  });
+  let stderr = '', observed;
+  child.stderr.on('data', b => { stderr = (stderr + b).slice(-4096); });
+  child.on('message', message => { observed = message; });
+  const result = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => resolve({code, signal}));
+  });
+  assert.deepEqual(result, {code:23, signal:null}, stderr);
+  assert.equal(stderr, '');
+  assert.equal(observed?.pid, child.pid);
+  assert.equal(observed?.parentPid, process.pid);
+  assert.equal(observed?.cwd, dir);
+  assert.deepEqual(observed?.argv, fixtureArgs);
+  const fd = admission.acquireAdmissionLock({root:path.join(dir, `agent-browser-admission-${process.getuid()}`), exclusive:true, waitSeconds:0});
+  fs.closeSync(fd);
+});

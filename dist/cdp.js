@@ -29,9 +29,7 @@ function exactBrokerWsUrl(wsUrl, transportGeneration) {
         wsUrl === `ws://127.0.0.1:${port}/cdp/${transportGeneration}`;
 }
 
-export function consumeBrokerAuthorizationFromEnvironment(expectedTransportGeneration, expectedLeaseId) {
-    const authorization = process.env[BROKER_AUTHORIZATION_ENV];
-    delete process.env[BROKER_AUTHORIZATION_ENV];
+export function validateBrokerAuthorization(authorization, expectedTransportGeneration, expectedLeaseId) {
     if (typeof expectedTransportGeneration !== 'string' ||
         !/^[0-9a-f]{64}$/.test(expectedTransportGeneration) ||
         typeof expectedLeaseId !== 'string' ||
@@ -46,6 +44,16 @@ export function consumeBrokerAuthorizationFromEnvironment(expectedTransportGener
         throw new Error('BROKER_AUTHORIZATION_REQUIRED: broker authorization does not match the exact target lease.');
     }
     return authorization;
+}
+
+export function consumeBrokerAuthorizationFromEnvironment(expectedTransportGeneration, expectedLeaseId) {
+    const authorization = process.env[BROKER_AUTHORIZATION_ENV];
+    delete process.env[BROKER_AUTHORIZATION_ENV];
+    return validateBrokerAuthorization(
+        authorization,
+        expectedTransportGeneration,
+        expectedLeaseId,
+    );
 }
 
 export class CDPClient {
@@ -65,18 +73,32 @@ export class CDPClient {
      * @param {number} [opts.timeout=10000] - Connection timeout in ms
      * @param {string} [opts.brokerTransportGeneration] - Exact existing-profile broker generation
      * @param {string} [opts.brokerLeaseId] - Exact one-use target lease identifier
+     * @param {string} [opts.brokerAuthorization] - Exact daemon-handover authorization; consumed synchronously
      */
     async connect(wsUrl, opts = {}) {
         const brokerTransport = opts.brokerTransportGeneration !== undefined ||
-            opts.brokerLeaseId !== undefined;
+            opts.brokerLeaseId !== undefined ||
+            opts.brokerAuthorization !== undefined;
         let brokerAuthorization = null;
         if (brokerTransport) {
             // This capability must disappear before URL parsing, fetch, timers,
             // WebSocket construction, or any other asynchronous boundary.
-            brokerAuthorization = consumeBrokerAuthorizationFromEnvironment(
-                opts.brokerTransportGeneration,
-                opts.brokerLeaseId,
-            );
+            if (opts.brokerAuthorization !== undefined) {
+                brokerAuthorization = opts.brokerAuthorization;
+                delete opts.brokerAuthorization;
+                delete process.env[BROKER_AUTHORIZATION_ENV];
+                brokerAuthorization = validateBrokerAuthorization(
+                    brokerAuthorization,
+                    opts.brokerTransportGeneration,
+                    opts.brokerLeaseId,
+                );
+            }
+            else {
+                brokerAuthorization = consumeBrokerAuthorizationFromEnvironment(
+                    opts.brokerTransportGeneration,
+                    opts.brokerLeaseId,
+                );
+            }
             if (!exactBrokerWsUrl(wsUrl, opts.brokerTransportGeneration)) {
                 throw new Error('BROKER_ENDPOINT_REQUIRED: supported existing-profile transport requires the exact direct loopback WebSocket.');
             }

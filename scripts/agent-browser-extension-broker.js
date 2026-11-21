@@ -27,6 +27,7 @@ import os from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
+import { createLazyTransportDiagnostic } from "./subscription-rental-transport-diagnostic.mjs";
 import { ownerIdentityStatus, ownerNamespace, ownerSession, validateOwnerIdentity, observeProcessIdentity } from "./agent-browser-owner.js";
 import {
   CONTROL_SCHEMA,
@@ -553,6 +554,10 @@ export class Broker {
     this.wsServer = new WebSocketServer({ noServer: true, perMessageDeflate: false });
     this.stopping = false;
     this.startTicks = processStartTicks();
+    // WHY: startup-only arming misses a scope supplied after installation and
+    // would require a second shared restart. Lazy once-only arming stays inert
+    // until the exact target's first event; expiry never permits automatic rearm.
+    this.transportDiagnostic = createLazyTransportDiagnostic(args.stateRoot, this.startTicks, writePrivateJson);
   }
 
   ownerRecordPath() {
@@ -875,6 +880,7 @@ export class Broker {
     for (const session of this.sessions.values()) {
       if (session.profileKey !== peer.profile?.profileKey || session.epoch !== peer.epoch) continue;
       session.offline = true;
+      this.transportDiagnostic?.event("peer-offline", session);
       if (session.ws) {
         session.ws.close(1012, "profile connection restarted");
         session.ws = null;
@@ -884,6 +890,7 @@ export class Broker {
 
   retireSessionLedger(session, reason) {
     if (this.sessions.get(session.name) !== session) return false;
+    this.transportDiagnostic?.event("ledger-retired", session, true);
     if (this.focusHandoff?.session === session) void this.cancelFocusHandoff(this.focusHandoff);
     if (session.ws) {
       session.ws.close(1001, reason);
@@ -988,6 +995,7 @@ export class Broker {
         owner.tabIds.delete(value.tabId);
         return;
       }
+      this.transportDiagnostic?.event("root-revoked", owner);
       const tabIds = [...owner.tabIds].sort((a, b) =>
         String(a).localeCompare(String(b)),
       );
@@ -1789,6 +1797,7 @@ export class Broker {
       });
     }
     const ownerRecord = this.ownerRecords.get(session.name);
+    this.transportDiagnostic?.event("provider-close-request", session);
     const peer = this.peersByAccount.get(session.account);
     const exactPeer = peer && peer.epoch === session.epoch ? peer : null;
     if (exactPeer) {
@@ -1805,6 +1814,7 @@ export class Broker {
       }
     }
     if (session.ws) session.ws.close(1000, "session closed");
+    this.transportDiagnostic?.event("provider-close-retired", session, true);
     this.endpoints.delete(session.endpointToken);
     if (this.sessions.get(session.name) === session) this.sessions.delete(session.name);
     session.cleanup = "";
@@ -2062,6 +2072,52 @@ export class Broker {
     return identity;
   }
 
+  async inspectRecovery(grant) {
+    // Use the exact existing one-use owner grant admission, not a diagnostic bypass.
+    this.consumeGrant(grant);
+    const peer = this.peersByAccount.get(grant.account);
+    if (!peer || peer.closed) {
+      throw Object.assign(new Error("profile extension is offline"), { bridgeCode: "PROFILE_OFFLINE" });
+    }
+    const owner = this.matchOwnerRecord(grant, peer.profile.profileKey);
+    if (!owner) {
+      throw Object.assign(new Error("session owner is unavailable"), { bridgeCode: "SESSION_CONFLICT" });
+    }
+    if (this.pendingSessions.has(grant.session) || this.ownerRetirements.has(grant.session)) {
+      throw Object.assign(new Error("session operation is pending"), { bridgeCode: "SESSION_BUSY" });
+    }
+    const known = this.sessions.get(grant.session);
+    const epoch = peer.epoch;
+    const unchanged = () => this.peersByAccount.get(grant.account) === peer && !peer.closed &&
+      peer.epoch === epoch && this.ownerRecords.get(grant.session) === owner &&
+      this.sessions.get(grant.session) === known && !this.pendingSessions.has(grant.session) &&
+      !this.ownerRetirements.has(grant.session);
+    let items;
+    try {
+      // Despite its name this existing helper ONLY requests state.inventory and
+      // validates it. Never call recovery, rebind, launch, retire or page/CDP here.
+      items = await this.inventoryForRetire(peer, Date.now() + 2000);
+    } catch (error) {
+      if (error?.bridgeCode !== "RECOVERY_REJECTED") throw error;
+      return {
+        schema: "agent-browser.recovery-inspection.v1",
+        outcome: unchanged() ? "inventory-invalid" : "state-changed",
+      };
+    }
+    if (!unchanged()) {
+      return { schema: "agent-browser.recovery-inspection.v1", outcome: "state-changed" };
+    }
+    const requested = items.find((item) => item.session === grant.session);
+    return {
+      schema: "agent-browser.recovery-inspection.v1",
+      outcome: requested ? "requested-root-present" : "requested-root-missing",
+      brokerSessionPresent: Boolean(known),
+      requestedTabCount: requested ? requested.tabIds.length : 0,
+      // No raw session/root/window IDs, URLs, peer keys, tokens or other owners.
+      knownRootMatches: known && requested ? known.rootTabId === requested.rootTabId : null,
+    };
+  }
+
   async beginCommand(grant, daemonPid) {
     this.commandMaps();
     const daemon = this.daemonIdentity(grant?.session, daemonPid);
@@ -2262,6 +2318,9 @@ export class Broker {
     }
     if (request.op === "background" && exactKeys(request, ["schema", "id", "op", "grant"]))
       return this.background(request.grant);
+    if (request.op === "recovery.inspect" &&
+        exactKeys(request, ["schema", "id", "op", "grant"]))
+      return this.inspectRecovery(request.grant);
     if (request.op === "command.begin" &&
         exactKeys(request, ["schema", "id", "op", "grant", "daemonPid"]))
       return this.beginCommand(request.grant, request.daemonPid);
@@ -2522,6 +2581,10 @@ export class Broker {
     this.httpServer.on("upgrade", (request, socket, head) => {
       const match = request.url?.match(/^\/page\/([0-9a-f]{64})$/);
       const session = match ? this.endpoints.get(match[1]) : null;
+      // WHY: generic engine Handshake errors cannot distinguish these guards.
+      // Observe fixed booleans only; never log the URL, Host or endpoint token.
+      this.transportDiagnostic?.upgrade(session, match?.[1],
+        request.headers.host === `127.0.0.1:${this.httpServer.address().port}`);
       if (!session || session.offline || request.headers.host !== `127.0.0.1:${this.httpServer.address().port}`) {
         socket.destroy();
         return;

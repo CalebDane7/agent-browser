@@ -319,7 +319,7 @@
       if (!remaining) resolveContextWaiters(record, null);
     }
 
-    function recordForWire(session, tabId, requestEpoch) {
+    function recordForWire(session, tabId, requestEpoch, allowCleanupOnly = false) {
       assertSession(session);
       if (retiringSessions.has(session)) {
         throw new BridgeError("SESSION_RETIRING");
@@ -335,6 +335,9 @@
       if (sessionEpochs.get(session) !== requestEpoch) {
         throw new BridgeError("REBIND_REQUIRED");
       }
+      // WHY: a source-proven popup that failed attachment/frame validation still
+      // needs exact retirement. Cleanup ownership never grants page authority.
+      if (record.cleanupOnly && !allowCleanupOnly) throw new BridgeError("TARGET_CLEANUP_ONLY");
       return record;
     }
 
@@ -400,6 +403,7 @@
           session: record.session,
           root: record.root,
           createdByExtension: record.createdByExtension,
+          ...(record.cleanupOnly ? { cleanupOnly: true } : {}),
           ...(record.sharedUserTab ? { sharedUserTab: record.sharedUserTab } : {}),
           openerTabId: record.openerTabId || null,
           creationEpoch: record.creationEpoch || null,
@@ -493,6 +497,7 @@
               ownedWindow: Boolean(item.ownedWindow),
               session: item.session,
               root: Boolean(item.root),
+              cleanupOnly: item.cleanupOnly === true,
               // Only the exact historical explicit false user-root producer
               // may migrate. Missing legacy provenance stays detach-only.
               sharedUserTab: item.createdByExtension === false && item.root === true &&
@@ -560,10 +565,19 @@
             return profileKey;
           }
         }
-        profileKey = randomHex();
+        const newProfileKey = randomHex();
         await chromeApi.storage.local.set({
-          [PROFILE_KEY_STORAGE_KEY]: profileKey,
+          [PROFILE_KEY_STORAGE_KEY]: newProfileKey,
         });
+        // WHY: A failed or no-op storage write must not publish a temporary
+        // in-memory identity that can be paired, then vanish on worker restart.
+        const confirmed = await chromeApi.storage.local.get(
+          PROFILE_KEY_STORAGE_KEY,
+        );
+        if (confirmed[PROFILE_KEY_STORAGE_KEY] !== newProfileKey) {
+          throw new Error("Agent Browser profile identity was not stored");
+        }
+        profileKey = newProfileKey;
         return profileKey;
       })();
       try {
@@ -939,7 +953,14 @@
       }
       connectPromise = (async () => {
         await stateReady;
-        const key = await getProfileKey();
+        let key;
+        try {
+          key = await getProfileKey();
+        } catch {
+          void clearPairingAction("Agent Browser profile storage unavailable");
+          scheduleReconnect();
+          return;
+        }
         const nextEpoch = randomHex();
         let nextPort;
         try {
@@ -1934,7 +1955,8 @@
       return descriptor(record);
     }
 
-    async function attachAndValidate(record, onFailure) {
+    async function attachAndValidate(record, onFailure, initializingDescendant = false) {
+      if (record.cleanupOnly && !initializingDescendant) throw new BridgeError("TARGET_CLEANUP_ONLY");
       if (record.attached && record.validated) return;
       let attachedHere = false;
       let stage = "debugger.attach";
@@ -1996,10 +2018,17 @@
       } catch (error) {
         onFailure?.(stage, errorCode(error), failureClass || claimApiFailureClass(error));
         if (record.attached || attachedHere) {
+          // Expected failed-validation detach must not erase cleanup provenance
+          // through synchronous debugger.onDetach. Other revocations stay terminal.
+          const guarded = record.cleanupOnly && record.createdByExtension && !record.root;
+          const alreadyRetiring = retiringTabIds.has(record.chromeTabId);
+          if (guarded) retiringTabIds.add(record.chromeTabId);
           try {
             await chromeApi.debugger.detach({ tabId: record.chromeTabId });
           } catch {
             // The target may already have vanished.
+          } finally {
+            if (guarded && !alreadyRetiring) retiringTabIds.delete(record.chromeTabId);
           }
         }
         record.attached = false;
@@ -2593,7 +2622,7 @@
     }
 
     async function closeTab(args, requestEpoch) {
-      const record = recordForWire(args.session, args.tabId, requestEpoch);
+      const record = recordForWire(args.session, args.tabId, requestEpoch, true);
       const disposition = await retireOwnedRecord(record);
       const closedWindowIds = await cleanupOwnedWindow();
       return {
@@ -2617,6 +2646,16 @@
       ) {
         throw new BridgeError("INVALID_ARGS");
       }
+      // An unresolved creating edge grants no removal authority: preserve the
+      // root and fail promptly. Once its exact record is published, teardown
+      // may preempt a stuck attach via the separate cleanup lane. The pending
+      // continuation cannot resurrect a retired record (identity checks below).
+      const unresolved = [...pendingAdoptions.entries()].some(([chromeTabId, entry]) => {
+        if (entry.session !== session) return false;
+        const record = tabsByHandle.get(handlesByChromeTab.get(chromeTabId));
+        return !record || record.session !== session || !record.createdByExtension;
+      });
+      if (unresolved) throw new BridgeError("TARGET_BUSY");
       const expected = [...(sessions.get(session) || new Set())].sort();
       const requested = [...new Set(args.tabIds)].sort();
       const requestedSet = new Set(requested);
@@ -2847,6 +2886,7 @@
           ),
           session: opener.session,
           root: false,
+          cleanupOnly: true,
           openerTabId: opener.tabId,
           creationEpoch: adoptionEpoch,
           attached: false,
@@ -2858,31 +2898,44 @@
         true,
       );
       addRecord(record);
+      // Publish this already-proven creating edge before the asynchronous attach.
+      // The existing event grants membership/cleanup only; recordForWire denies
+      // execution until complete validation. Keep the root as lifecycle anchor.
+      const persisted = persistOwnership();
+      postEvent(record, "AgentBrowser.tabAdopted", {
+        tabId: record.tabId,
+        openerTabId: opener.tabId,
+      });
       try {
+        await persisted;
+        if (!liveAdoptionSource(opener, adoptionEpoch, root) ||
+            tabsByHandle.get(record.tabId) !== record) throw new BridgeError("STALE_CONNECTION");
         await attachAndValidate(record, (stage, code) =>
-          rememberOwnershipFailure(record, stage, code, adoptionEpoch));
+          rememberOwnershipFailure(record, stage, code, adoptionEpoch), true);
         if (!liveAdoptionSource(opener, adoptionEpoch, root) ||
-            tabsByHandle.get(record.tabId) !== record) throw new BridgeError("STALE_CONNECTION");
+            tabsByHandle.get(record.tabId) !== record || !record.attached || !record.validated)
+          throw new BridgeError("STALE_CONNECTION");
+        record.cleanupOnly = false;
         await persistOwnership();
-        if (!liveAdoptionSource(opener, adoptionEpoch, root) ||
-            tabsByHandle.get(record.tabId) !== record) throw new BridgeError("STALE_CONNECTION");
-        postEvent(record, "AgentBrowser.tabAdopted", {
-          tabId: record.tabId,
-          openerTabId: opener.tabId,
-        });
         return record;
       } catch {
+        // Regression: target.validate/TARGET_DENIED used to remove this record
+        // while the physical popup survived, allowing a later root-only close0.
+        // Preserve exact session/opener/physical/window/epoch provenance solely
+        // for retirement and rebind. No failed target can be reattached/executed.
+        if (tabsByHandle.get(record.tabId) !== record) return;
+        record.cleanupOnly = true;
+        record.validated = false;
+        record.mainFrameId = null;
+        record.mainContextId = null;
         if (record.attached) {
+          const alreadyRetiring = retiringTabIds.has(record.chromeTabId);
+          retiringTabIds.add(record.chromeTabId);
           try { await chromeApi.debugger.detach({ tabId: record.chromeTabId }); } catch {}
+          finally { if (!alreadyRetiring) retiringTabIds.delete(record.chromeTabId); }
           record.attached = false;
-          record.validated = false;
         }
-        if (ownedWindow && record.chromeWindowId === ownedWindow.chromeWindowId) {
-          ownedWindow.contaminated = true;
-        }
-        removeRecord(record);
         await persistOwnership();
-        await cleanupOwnedWindow();
       }
     }
     async function handleTabAttached(chromeTabId, attachInfo) {
@@ -3143,19 +3196,69 @@
     async function revokeUnsafeTarget(record) {
       if (!tabsByHandle.has(record.tabId)) return;
       postEvent(record, "AgentBrowser.tabRevoked", { reason: "target_denied" });
-      if (record.attached) {
-        record.attached = false;
-        try {
-          await chromeApi.debugger.detach({ tabId: record.chromeTabId });
-        } catch {
-          // Chrome may have detached first when the target changed type.
-        }
-      }
       if (ownedWindow && record.chromeWindowId === ownedWindow.chromeWindowId) {
         ownedWindow.contaminated = true;
       }
-      removePhysicalRecords(record);
-      await persistOwnership();
+      // WHY: a failed navigation can commit chrome-error:// after the extension
+      // created this task tab. Revoking only the opaque record makes the later
+      // exact broker cleanup powerless and leaves the physical tab behind.
+      // Apply the same provenance boundary as ordinary retirement:
+      // extension-created tabs are removed, while invited user tabs are
+      // detached and preserved.
+      const epoch = sessionEpochs.get(record.session);
+      retiringTabIds.add(record.chromeTabId);
+      try {
+        if (record.createdByExtension) {
+          closingTabIds.add(record.chromeTabId);
+          try {
+            await chromeApi.tabs.remove(record.chromeTabId);
+          } catch (error) {
+            if (!confirmedClosedTabIds.has(record.chromeTabId) &&
+                error?.message !== `No tab with id: ${record.chromeTabId}.`) {
+              rememberOwnershipFailure(record, "tabs.remove", "TAB_REMOVE_FAILED", epoch);
+              // Keep the exact created-tab records for session.close or a
+              // reconnected broker to retry. Detach while retirement remains
+              // guarded so synchronous onDetach cannot erase that authority.
+              if (record.attached) {
+                try {
+                  await chromeApi.debugger.detach({ tabId: record.chromeTabId });
+                } catch {
+                  // The removal failure is the truthful cleanup result.
+                }
+              }
+              record.attached = false;
+              record.validated = false;
+              record.mainFrameId = null;
+              record.mainContextId = null;
+              await persistOwnership();
+              return;
+            }
+          } finally {
+            closingTabIds.delete(record.chromeTabId);
+            confirmedClosedTabIds.delete(record.chromeTabId);
+          }
+          removePhysicalRecords(record);
+        } else {
+          // Unsafe navigation is a physical-target event. Every explicitly
+          // invited participant loses capability together, while the user's
+          // physical tab remains untouched.
+          if (record.attached) {
+            try {
+              await chromeApi.debugger.detach({ tabId: record.chromeTabId });
+            } catch {
+              rememberOwnershipFailure(record, "debugger.detach", "TAB_DETACH_FAILED", epoch);
+            }
+          }
+          record.attached = false;
+          record.validated = false;
+          record.mainFrameId = null;
+          record.mainContextId = null;
+          removePhysicalRecords(record);
+        }
+        await persistOwnership();
+      } finally {
+        retiringTabIds.delete(record.chromeTabId);
+      }
       await cleanupOwnedWindow();
     }
 
@@ -3174,6 +3277,18 @@
       }
       const record = debuggerRecord(source);
       if (!record) return;
+      if (record.cleanupOnly && record.createdByExtension && !record.root) {
+        // A failed-validation detach may arrive after detach() resolved. Its
+        // cleanup authority survives both event orders; no executable authority
+        // remains to revoke. Healthy/root detach and cross-window moves retain
+        // their existing terminal behavior.
+        record.attached = false;
+        record.validated = false;
+        record.mainFrameId = null;
+        record.mainContextId = null;
+        await persistOwnership();
+        return;
+      }
       record.attached = false;
       record.validated = false;
       record.mainFrameId = null;

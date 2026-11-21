@@ -603,14 +603,79 @@ class CDPPage {
         return evaluate(this._client, 'document.title', { sessionId: this._sessionId });
     }
 
+    async _traverseHistory(delta, timeout = 30000) {
+        const history = await this._client.send('Page.getNavigationHistory', {}, this._sessionId);
+        const entries = Array.isArray(history.entries) ? history.entries : [];
+        const currentIndex = Number.isInteger(history.currentIndex) ? history.currentIndex : -1;
+        const targetIndex = currentIndex + delta;
+        if (currentIndex < 0 || targetIndex < 0 || targetIndex >= entries.length) return;
+        const entry = entries[targetIndex];
+        if (!Number.isInteger(entry?.id)) {
+            throw new Error('History traversal target is unavailable');
+        }
+        const frameTree = await this._client.send('Page.getFrameTree', {}, this._sessionId);
+        const mainFrameId = frameTree.frameTree?.frame?.id;
+        if (typeof mainFrameId !== 'string' || !mainFrameId) {
+            throw new Error('History traversal main frame is unavailable');
+        }
+
+        let timer;
+        let onLoad;
+        let onWithinDocument;
+        const navigation = new Promise((resolve, reject) => {
+            const cleanup = () => {
+                clearTimeout(timer);
+                this._client.off('Page.loadEventFired', onLoad);
+                this._client.off('Page.navigatedWithinDocument', onWithinDocument);
+            };
+            const complete = (params) => {
+                if (params.sessionId && params.sessionId !== this._sessionId) return;
+                cleanup();
+                resolve();
+            };
+            onLoad = complete;
+            onWithinDocument = (params) => {
+                if (params.frameId !== mainFrameId) return;
+                complete(params);
+            };
+            timer = setTimeout(() => {
+                cleanup();
+                reject(new Error(`History traversal timed out after ${timeout}ms`));
+            }, timeout);
+            this._client.on('Page.loadEventFired', onLoad);
+            this._client.on('Page.navigatedWithinDocument', onWithinDocument);
+        });
+        try {
+            await this._client.send(
+                'Page.navigateToHistoryEntry',
+                { entryId: entry.id },
+                this._sessionId,
+                { timeout },
+            );
+            await navigation;
+            const current = await this._client.send('Page.getNavigationHistory', {}, this._sessionId);
+            if (current.currentIndex !== targetIndex || current.entries?.[targetIndex]?.id !== entry.id) {
+                throw new Error('History traversal did not reach the exact requested entry');
+            }
+            this._url = entry.url ?? this._url;
+        }
+        catch (error) {
+            // The promise owns listener cleanup on both event and timeout. If
+            // navigateToHistoryEntry itself fails, await its bounded cleanup
+            // before surfacing the command error so no handler leaks forward.
+            if (timer) clearTimeout(timer);
+            this._client.off('Page.loadEventFired', onLoad);
+            this._client.off('Page.navigatedWithinDocument', onWithinDocument);
+            throw error;
+        }
+    }
+
     async goBack() {
-        await evaluate(this._client, 'history.back()', { sessionId: this._sessionId });
-        await new Promise(r => setTimeout(r, 500)); // Brief wait for navigation
+        await this._traverseHistory(-1);
     }
 
     async goForward() {
-        await evaluate(this._client, 'history.forward()', { sessionId: this._sessionId });
-        await new Promise(r => setTimeout(r, 500));
+        await this._traverseHistory(1);
     }
 
     async reload() {
@@ -1261,9 +1326,8 @@ class CDPRequestInterceptor {
 
 
 // ─── BrowserManager ──────────────────────────────────────────────────────────
-const TARGET_RECEIPT_SCHEMA = 'agent-browser.target-lease.v1';
-const TARGET_CLAIM_ENVELOPE_SCHEMA = 'agent-browser.target-claim-envelope.v2';
-const CONTROLLER_ENDPOINT_ID = '9222-31e541860f6a45f39f32';
+const TARGET_RECEIPT_SCHEMA = 'agent-browser.target-lease.v2';
+const TARGET_CLAIM_ENVELOPE_SCHEMA = 'agent-browser.target-claim-envelope.v3';
 const PROFILE_ATTESTATION_SCHEMA = 'agent-browser.profile-attestation.v2';
 const TRANSPORT_PROOF_STATE_SCHEMA = 'agent-browser.transport-proof-state.v1';
 const TRANSPORT_PROOF_MAX_AGE_MS = 5_000;
@@ -1285,6 +1349,7 @@ const PROFILE_ATTESTATION_KEYS = [
 // that process/generation authority before any Target command is sent.
 const TRUSTED_PROFILE_ATTESTATION_HELPER_REVISIONS = new Set([
     'agent-browser.transport-proof-helper.wsl-stable.v2',
+    'agent-browser.transport-proof-helper.wsl-stable.v3',
 ]);
 const TARGET_RECEIPT_MAX_TTL_MS = 30_000;
 const TARGET_RECEIPT_CLOCK_SKEW_MS = 5_000;
@@ -1293,15 +1358,16 @@ const TARGET_CLAIM_ENVELOPE_MAX_BYTES = 16 * 1024;
 const TARGET_CLAIM_PATH_ENV = 'AGENT_BROWSER_TARGET_CLAIM_PATH';
 const BROKER_AUTHORIZATION_ENV = 'AGENT_BROWSER_BROKER_AUTHORIZATION';
 const TARGET_RECEIPT_KEYS = [
-    'accountEmail', 'browserContextId', 'browserGeneration', 'expiresAt', 'issuedAt',
+    'accountEmail', 'anchorTargetId', 'browserContextId', 'browserGeneration', 'expiresAt', 'issuedAt',
     'leaseId', 'nonce', 'profileBinding', 'profileDirectory', 'schema', 'session', 'targetId', 'targetKind', 'transportGeneration',
     'workspaceMarkerUrl',
 ];
 const TARGET_CLAIM_ENVELOPE_KEYS = ['receipt', 'schema'];
-const TARGET_LEASE_KINDS = new Set(['agent-workspace', 'user-collaboration']);
+const TARGET_LEASE_KINDS = new Set(['agent-task-root', 'user-collaboration']);
 const TARGET_REPROVISION_REQUIRED = 'TARGET_REPROVISION_REQUIRED';
 const TARGET_ACTION_OUTCOME_UNKNOWN = 'TARGET_ACTION_OUTCOME_UNKNOWN';
 const TARGET_AUTHORITY_ATTEMPTED = Symbol('targetAuthorityAttempted');
+const TARGET_TRANSPORT_REBIND_PLAN = Symbol('targetTransportRebindPlan');
 const CLOUD_EPHEMERAL_ROOT_AUTHORITY = Symbol('cloudEphemeralRootAuthority');
 const BROWSER_DIAGNOSTIC_LIMIT = 200;
 
@@ -1336,15 +1402,18 @@ function validateTargetReceipt(receipt) {
         ? Object.keys(receipt).sort()
         : [];
     const session = process.env.AGENT_BROWSER_SESSION || 'default';
-    const workspaceMarkerValid = receipt?.targetKind === 'agent-workspace'
+    const workspaceMarkerValid = receipt?.targetKind === 'agent-task-root'
         ? typeof receipt.workspaceMarkerUrl === 'string' &&
-            /^about:blank#agent-browser-workspace-[0-9a-f]{64}$/.test(receipt.workspaceMarkerUrl)
+            /^about:blank#agent-browser-task-[0-9a-f]{64}$/.test(receipt.workspaceMarkerUrl)
         : receipt?.targetKind === 'user-collaboration' && receipt.workspaceMarkerUrl === null;
     if (receipt?.schema !== TARGET_RECEIPT_SCHEMA ||
         receiptKeys.length !== TARGET_RECEIPT_KEYS.length ||
         receiptKeys.some((key, index) => key !== TARGET_RECEIPT_KEYS[index]) ||
+        typeof receipt.anchorTargetId !== 'string' || !receipt.anchorTargetId ||
+        receipt.anchorTargetId.length > 256 || /[\u0000-\u001f\u007f]/.test(receipt.anchorTargetId) ||
         typeof receipt.targetId !== 'string' || !receipt.targetId || receipt.targetId.length > 256 ||
         /[\u0000-\u001f\u007f]/.test(receipt.targetId) ||
+        receipt.anchorTargetId === receipt.targetId ||
         Buffer.from(receipt.targetId, 'utf8').toString('utf8') !== receipt.targetId ||
         typeof receipt.browserContextId !== 'string' || !receipt.browserContextId ||
         receipt.browserContextId.length > 256 || /[\u0000-\u001f\u007f]/.test(receipt.browserContextId) ||
@@ -1461,7 +1530,7 @@ function readBoundedClaimEnvelope(descriptor) {
     }
 }
 
-function exactControllerEndpointRoot() {
+function exactControllerEndpointsRoot() {
     const uid = process.geteuid?.() ?? process.getuid?.();
     if (!Number.isSafeInteger(uid) || uid < 0) {
         throw new Error('Target receipt controller endpoint identity requires a local numeric uid.');
@@ -1471,22 +1540,29 @@ function exactControllerEndpointRoot() {
         const stat = lstatSync(runtimeParent);
         if (stat.isDirectory() && !stat.isSymbolicLink() && stat.uid === uid &&
             (stat.mode & 0o077) === 0) {
-            return `${runtimeParent}/agent-browser-controller/endpoints/${CONTROLLER_ENDPOINT_ID}`;
+            return `${runtimeParent}/agent-browser-controller/endpoints`;
         }
     } catch {
         // The controller makes the same deterministic fallback choice.
     }
-    return `/tmp/agent-browser-controller-${uid}/endpoints/${CONTROLLER_ENDPOINT_ID}`;
+    return `/tmp/agent-browser-controller-${uid}/endpoints`;
 }
 
 function bindExactControllerReceiptRoot(receiptRoot, testEndpointRoot) {
     const endpointRoot = path.dirname(receiptRoot);
-    const allowedRoot = testEndpointRoot === undefined
-        ? exactControllerEndpointRoot()
-        : path.resolve(testEndpointRoot);
-    if (endpointRoot !== allowedRoot ||
-        receiptRoot !== path.join(endpointRoot, 'target-leases')) {
-        throw new Error('Target lease claim root does not match the fixed attested controller endpoint.');
+    if (testEndpointRoot === undefined) {
+        const endpointId = path.basename(endpointRoot);
+        const endpointsRoot = exactControllerEndpointsRoot();
+        if (path.dirname(endpointRoot) !== endpointsRoot ||
+            !/^[1-9][0-9]{0,4}-[0-9a-f]{20}$/.test(endpointId)) {
+            throw new Error('Target lease claim root does not match a dynamic controller endpoint identity.');
+        }
+    }
+    else if (endpointRoot !== path.resolve(testEndpointRoot)) {
+        throw new Error('Target lease claim root does not match the exact test controller endpoint.');
+    }
+    if (receiptRoot !== path.join(endpointRoot, 'target-leases')) {
+        throw new Error('Target lease claim root is outside the exact controller endpoint.');
     }
     assertSecureReceiptPath(endpointRoot, 'directory');
     if (realpathSync(endpointRoot) !== endpointRoot) {
@@ -1523,6 +1599,20 @@ function normalizeControllerEndpoint(value) {
     } catch {
         return null;
     }
+}
+
+function dynamicControllerEndpointIdentity(value) {
+    const normalized = normalizeControllerEndpoint(value);
+    const match = normalized?.match(/^http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})$/);
+    if (!match) return null;
+    const port = Number.parseInt(match[1], 10);
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65535) return null;
+    const endpointKey = createHash('sha256').update(normalized, 'utf8').digest('hex').slice(0, 20);
+    return {
+        normalized,
+        port,
+        endpointId: `${port}-${endpointKey}`,
+    };
 }
 
 function isExactBrokerTransportUrl(value, transportGeneration, expectedPort = null) {
@@ -1593,6 +1683,54 @@ function hasExactObjectKeys(value, expectedKeys) {
         actual.every((key, index) => key === expected[index]);
 }
 
+function transportRebindFailure(code, message) {
+    const error = new Error(`${code}: ${message}`);
+    error.code = code;
+    return error;
+}
+
+function transportRebindDeadlineRemaining(deadlineAt) {
+    const remaining = deadlineAt - Date.now();
+    if (!Number.isSafeInteger(deadlineAt) || remaining <= 0) {
+        throw transportRebindFailure(
+            'TRANSPORT_REBIND_DEADLINE_EXCEEDED',
+            'The one bounded transport handover attempt expired.',
+        );
+    }
+    return remaining;
+}
+
+function installTransportRebindDeadlineGuard(client, deadlineAt) {
+    const send = client.send;
+    const guardedSend = function (method, params = {}, sessionId, options = {}) {
+        const remaining = transportRebindDeadlineRemaining(deadlineAt);
+        const configured = Number(options?.timeout);
+        const timeout = Number.isFinite(configured) && configured > 0
+            ? Math.min(configured, remaining)
+            : remaining;
+        return Reflect.apply(send, this, [
+            method,
+            params,
+            sessionId,
+            { ...options, timeout: Math.max(1, timeout) },
+        ]);
+    };
+    client.send = guardedSend;
+    return () => {
+        if (client.send === guardedSend) client.send = send;
+    };
+}
+
+function canonicalBrokerExpiry(value) {
+    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) {
+        return null;
+    }
+    const timestamp = Date.parse(value);
+    return Number.isSafeInteger(timestamp) && new Date(timestamp).toISOString() === value
+        ? timestamp
+        : null;
+}
+
 function isSha256(value) {
     return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 }
@@ -1600,6 +1738,12 @@ function isSha256(value) {
 function transportProcessProofError(message, cause = undefined) {
     const error = new Error(`NEEDS_TRANSPORT_PROCESS_PROOF: ${message}`, cause === undefined ? undefined : { cause });
     error.code = 'NEEDS_TRANSPORT_PROCESS_PROOF';
+    return error;
+}
+
+function transportProofPublicationRace(message, cause = undefined) {
+    const error = transportProcessProofError(message, cause);
+    error.code = 'TRANSPORT_PROOF_PUBLICATION_RACE';
     return error;
 }
 
@@ -1614,7 +1758,7 @@ function browserGenerationFromTransportProof(chrome) {
     }), 'utf8').digest('hex');
 }
 
-function loadTrustedTransportProcessProof(attestation, controllerEndpointRoot) {
+function loadTrustedTransportProcessProof(attestation, controllerEndpointRoot, controllerPort) {
     const proofPath = path.join(
         controllerEndpointRoot,
         'profile-attestation',
@@ -1642,11 +1786,15 @@ function loadTrustedTransportProcessProof(attestation, controllerEndpointRoot) {
         if (namedStat.isSymbolicLink() || !namedStat.isFile() ||
             namedStat.dev !== stat.dev || namedStat.ino !== stat.ino ||
             realpathSync(proofPath) !== proofPath) {
-            throw new Error('proof artifact changed while it was being verified.');
+            throw transportProofPublicationRace(
+                'proof artifact publication changed while it was being verified.',
+            );
         }
         const digest = createHash('sha256').update(raw).digest('hex');
         if (digest !== attestation.transport_proof_state_sha256) {
-            throw new Error('proof artifact hash differs from the profile attestation.');
+            throw transportProofPublicationRace(
+                'proof artifact and profile attestation were published from different observations.',
+            );
         }
 
         let proof;
@@ -1682,7 +1830,7 @@ function loadTrustedTransportProcessProof(attestation, controllerEndpointRoot) {
             !isSha256(chrome.executableSha256) || !isSha256(chrome.browserGeneration) ||
             chrome.browserGeneration !== browserGenerationFromTransportProof(chrome) ||
             !hasExactObjectKeys(chromeListener, ['address', 'port', 'owningPid']) ||
-            chromeListener.address !== '127.0.0.1' || chromeListener.port !== 9222 ||
+            chromeListener.address !== '127.0.0.1' || chromeListener.port !== controllerPort ||
             chromeListener.owningPid !== chrome.pid) {
             throw new Error('proof artifact does not identify the exact Stable Chrome listener and image.');
         }
@@ -1701,8 +1849,8 @@ function loadTrustedTransportProcessProof(attestation, controllerEndpointRoot) {
             portproxy.service !== 'iphlpsvc' ||
             !hasExactObjectKeys(proxyListen, ['address', 'port']) ||
             !hasExactObjectKeys(proxyConnect, ['address', 'port']) ||
-            proxyConnect.address !== '127.0.0.1' || proxyConnect.port !== 9222 ||
-            proxyListen.port !== 9222 ||
+            proxyConnect.address !== '127.0.0.1' || proxyConnect.port !== controllerPort ||
+            proxyListen.port !== controllerPort ||
             !hasExactObjectKeys(adapter, [
                 'interfaceIndex', 'name', 'description', 'address', 'prefixLength',
                 'networkCategory', 'scope',
@@ -1724,8 +1872,8 @@ function loadTrustedTransportProcessProof(attestation, controllerEndpointRoot) {
             !isSha256(socat.executableSha256) ||
             !hasExactObjectKeys(socat.listen, ['address', 'port']) ||
             !hasExactObjectKeys(socat.connect, ['address', 'port']) ||
-            socat.listen.address !== '127.0.0.1' || socat.listen.port !== 9222 ||
-            socat.connect.address !== proxyListen.address || socat.connect.port !== 9222) {
+            socat.listen.address !== '127.0.0.1' || socat.listen.port !== controllerPort ||
+            socat.connect.address !== proxyListen.address || socat.connect.port !== controllerPort) {
             throw new Error('proof artifact does not identify the protected WSL bridge.');
         }
 
@@ -1744,7 +1892,7 @@ function loadTrustedTransportProcessProof(attestation, controllerEndpointRoot) {
             !hasExactObjectKeys(broker.listen, ['address', 'port']) ||
             broker.listen.address !== '127.0.0.1' ||
             !Number.isSafeInteger(broker.listen.port) || broker.listen.port < 1 ||
-            broker.listen.port > 65535 || broker.listen.port === 9222 ||
+            broker.listen.port > 65535 || broker.listen.port === controllerPort ||
             ![broker.brokerGeneration, broker.browserGeneration,
                 broker.consentGeneration, broker.transportGeneration,
                 broker.producerContractSha256].every(isSha256) ||
@@ -1760,14 +1908,15 @@ function loadTrustedTransportProcessProof(attestation, controllerEndpointRoot) {
         }
         return proof;
     } catch (error) {
-        if (error?.code === 'NEEDS_TRANSPORT_PROCESS_PROOF') throw error;
+        if (error?.code === 'NEEDS_TRANSPORT_PROCESS_PROOF' ||
+            error?.code === 'TRANSPORT_PROOF_PUBLICATION_RACE') throw error;
         throw transportProcessProofError('trusted controller process proof is invalid.', error);
     } finally {
         if (descriptor !== undefined) closeSync(descriptor);
     }
 }
 
-function loadAndValidateProfileAttestation(controllerEndpointRoot, options) {
+function loadAndValidateProfileAttestationOnce(controllerEndpointRoot, options) {
     const attestationDir = path.join(controllerEndpointRoot, 'profile-attestation');
     const attestationPath = path.join(attestationDir, 'stable-chrome.v2.json');
     try {
@@ -1795,7 +1944,9 @@ function loadAndValidateProfileAttestation(controllerEndpointRoot, options) {
         if (namedStat.isSymbolicLink() || !namedStat.isFile() ||
             namedStat.dev !== stat.dev || namedStat.ino !== stat.ino ||
             realpathSync(attestationPath) !== attestationPath) {
-            throw new Error('Stable profile attestation changed while it was being verified.');
+            throw transportProofPublicationRace(
+                'Stable profile attestation publication changed while it was being verified.',
+            );
         }
         let attestation;
         try {
@@ -1806,13 +1957,16 @@ function loadAndValidateProfileAttestation(controllerEndpointRoot, options) {
         const keys = attestation && typeof attestation === 'object'
             ? Object.keys(attestation).sort()
             : [];
+        const endpointIdentity = dynamicControllerEndpointIdentity(attestation?.cdp_http_url);
         if (keys.length !== PROFILE_ATTESTATION_KEYS.length ||
             keys.some((key, index) => key !== PROFILE_ATTESTATION_KEYS[index]) ||
             attestation.schema !== PROFILE_ATTESTATION_SCHEMA ||
             attestation.profile_kind !== 'windows-stable' ||
             attestation.browser_ownership !== 'external-user-stable' ||
             attestation.profile_root !== STABLE_CHROME_USER_DATA_ROOT ||
-            normalizeControllerEndpoint(attestation.cdp_http_url) !== 'http://127.0.0.1:9222' ||
+            endpointIdentity === null ||
+            (options.testControllerEndpointRoot === undefined &&
+                path.basename(controllerEndpointRoot) !== endpointIdentity.endpointId) ||
             typeof attestation.helper_revision !== 'string' || !attestation.helper_revision ||
             attestation.helper_revision.length > 256 ||
             ![attestation.browser_generation, attestation.broker_generation,
@@ -1828,6 +1982,7 @@ function loadAndValidateProfileAttestation(controllerEndpointRoot, options) {
         const transportProof = loadTrustedTransportProcessProof(
             attestation,
             controllerEndpointRoot,
+            endpointIdentity.port,
         );
         return {
             ...attestation,
@@ -1846,6 +2001,31 @@ function loadAndValidateProfileAttestation(controllerEndpointRoot, options) {
     } finally {
         if (descriptor !== undefined) closeSync(descriptor);
     }
+}
+
+function loadAndValidateProfileAttestation(controllerEndpointRoot, options) {
+    let publicationRace = null;
+    // WHY: the controller atomically replaces the proof and its attestation as
+    // two names. Concurrent cold sessions may cross those two replacements.
+    // Re-open the complete pair only for that observed publication race and
+    // keep every normal schema, freshness, path, owner, and generation check.
+    // The hard cap prevents corruption or an active writer from becoming an
+    // unbounded retry or a silently accepted transport.
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+        try {
+            return loadAndValidateProfileAttestationOnce(
+                controllerEndpointRoot,
+                options,
+            );
+        } catch (error) {
+            if (error?.code !== 'TRANSPORT_PROOF_PUBLICATION_RACE') throw error;
+            publicationRace = error;
+        }
+    }
+    throw transportProcessProofError(
+        'controller proof publication did not stabilize.',
+        publicationRace,
+    );
 }
 
 /**
@@ -2053,7 +2233,7 @@ function isReceiptablePageUrl(url) {
 }
 
 function isLeasedRootUrl(receipt, url) {
-    return receipt.targetKind === 'agent-workspace'
+    return receipt.targetKind === 'agent-task-root'
         ? url === receipt.workspaceMarkerUrl
         : isReceiptablePageUrl(url);
 }
@@ -2108,6 +2288,8 @@ export class BrowserManager {
     _closePromise = null;
     _connectionGeneration = 0;
     _targetAuthority = undefined;
+    _transportRebindPlan = null;
+    _transportRebindDeadlineCleanup = null;
     _targetLifecycleEvents = [];
     _nextTargetOrder = 0;
     isPersistentContext = false;
@@ -2218,7 +2400,7 @@ export class BrowserManager {
     }
 
     publicTargetUrl(target, url) {
-        return target?.lifecycleKind === 'agent-workspace' &&
+        return target?.lifecycleKind === 'agent-task-root' &&
             target?.binding?.workspaceMarkerUrl === url
             ? 'about:blank'
             : url;
@@ -2312,7 +2494,7 @@ export class BrowserManager {
             ? sourceBinding.browserContextId
             : source?.browserContextId ?? null;
         if (sourceBinding && (info.browserContextId ?? null) !== browserContextId) return null;
-        const owned = sourceKind === 'agent-workspace' ||
+        const owned = sourceKind === 'agent-task-root' ||
             sourceKind === 'ephemeral-owned-child' ||
             (!sourceKind && sourceOwned);
         const lifecycleKind = owned ? 'ephemeral-owned-child' : 'user-collaboration';
@@ -2365,7 +2547,8 @@ export class BrowserManager {
         if (!descriptor) return null;
         const owned = options.owned ?? descriptor.owned === true;
         let sessionId;
-        let safeToClose = owned && !descriptor.binding;
+        let safeToClose = owned && !descriptor.binding &&
+            options.preserveTargetOnFailure !== true;
         try {
             if (descriptor.binding) {
                 const { targetInfo: exactTargetInfo } = await this.client.send('Target.getTargetInfo', {
@@ -2395,7 +2578,7 @@ export class BrowserManager {
                     throw new Error('Derived child target changed during attachment.');
                 }
                 info = attachedInfo;
-                safeToClose = owned;
+                safeToClose = owned && options.preserveTargetOnFailure !== true;
             }
             await enableDomains(this.client, sessionId);
             if (this._observedDestroyedTargetIds.has(info.targetId)) {
@@ -2458,7 +2641,7 @@ export class BrowserManager {
             await this.invalidateCDPSession().catch(() => {});
             this.activePageIndex = this.pages.length - 1;
         }
-        if (owned) {
+        if (owned && options.preserveState !== true) {
             await setViewport(this.client, 1280, 720, { sessionId: page._sessionId }).catch(() => {});
         }
         return page;
@@ -2638,13 +2821,17 @@ export class BrowserManager {
         return removed;
     }
 
-    async installTargetTracking() {
+    async installTargetTracking(options = {}) {
         if (!this.client || this._targetTrackingInstalled) return;
         let ready = false;
         const bufferedEvents = [];
         const processors = {};
         processors.targetCreated = (params) => {
-            const trackingPromise = this.trackExternalTarget(params.targetInfo, { activate: true });
+            const trackingPromise = this.trackExternalTarget(params.targetInfo, {
+                activate: true,
+                preserveState: options.preserveState === true,
+                preserveTargetOnFailure: options.preserveTargetOnFailure === true,
+            });
             if (trackingPromise) this.notifyPopupWaiters(trackingPromise);
         };
         processors.targetInfoChanged = (params) => {
@@ -2664,7 +2851,11 @@ export class BrowserManager {
                 tracked.page._url = this.publicTargetUrl(tracked, info.url) || tracked.page._url;
                 return;
             }
-            const trackingPromise = this.trackExternalTarget(info, { activate: true });
+            const trackingPromise = this.trackExternalTarget(info, {
+                activate: true,
+                preserveState: options.preserveState === true,
+                preserveTargetOnFailure: options.preserveTargetOnFailure === true,
+            });
             if (trackingPromise) this.notifyPopupWaiters(trackingPromise);
         };
         processors.targetCrashed = (params) => {
@@ -2901,6 +3092,12 @@ export class BrowserManager {
 
     assertMutable(operation = 'mutate browser state') {
         this.markLeasedTransportLostIfDisconnected();
+        if (this._transportRebindPlan) {
+            throw transportRebindFailure(
+                'TRANSPORT_REBIND_IN_PROGRESS',
+                `The exact session transport is quiescent before ${operation}.`,
+            );
+        }
         if (this._targetLeaseLost) {
             throw targetReprovisionRequired('The leased root or transport was lost; no further browser mutation is authorized.');
         }
@@ -2911,6 +3108,12 @@ export class BrowserManager {
 
     assertCommandAllowed(action) {
         this.markLeasedTransportLostIfDisconnected();
+        if (this._transportRebindPlan) {
+            throw transportRebindFailure(
+                'TRANSPORT_REBIND_IN_PROGRESS',
+                'The exact session transport is quiescent until its bounded handover completes.',
+            );
+        }
         if (this._targetLeaseLost && action !== 'close') {
             throw targetReprovisionRequired('The leased root or transport was lost; only cleanup is authorized.');
         }
@@ -3288,6 +3491,479 @@ export class BrowserManager {
         return false;
     }
 
+    currentLeasedTransportTopology() {
+        const targets = this._targets
+            .filter((target) => target.generation === this._connectionGeneration)
+            .map((target) => Object.freeze({
+                targetId: target.targetId,
+                openerId: target.openerId ?? null,
+                owned: target.owned === true,
+                leaseRoot: target.leaseRoot === true,
+                lifecycleKind: target.lifecycleKind,
+                browserContextId: target.browserContextId ?? target.binding?.browserContextId ?? null,
+                order: Number.isSafeInteger(target.order) ? target.order : 0,
+            }))
+            .sort((left, right) => left.order - right.order || left.targetId.localeCompare(right.targetId));
+        const active = this._targets.find((target) => target.page === this.pages[this.activePageIndex]);
+        return Object.freeze({
+            targets: Object.freeze(targets),
+            activeTargetId: active?.targetId ?? null,
+        });
+    }
+
+    topologyDigest(topology) {
+        return createHash('sha256').update(canonicalJson({
+            activeTargetId: topology.activeTargetId,
+            targets: topology.targets,
+        }), 'utf8').digest('hex');
+    }
+
+    assertLeasedTopologyBound(topology, expected) {
+        const descriptors = new Map();
+        for (const descriptor of topology.targets) {
+            if (descriptors.has(descriptor.targetId)) {
+                throw transportRebindFailure('TRANSPORT_REBIND_TOPOLOGY_INVALID', 'Tracked target identity is duplicated.');
+            }
+            descriptors.set(descriptor.targetId, descriptor);
+        }
+        let rootCount = 0;
+        for (const descriptor of topology.targets) {
+            const target = this._targets.find((candidate) =>
+                candidate.generation === this._connectionGeneration && candidate.targetId === descriptor.targetId);
+            const binding = target?.binding;
+            if (!target || !binding ||
+                binding.session !== expected.session ||
+                binding.rootTargetId !== expected.targetId ||
+                binding.browserContextId !== expected.browserContextId ||
+                binding.profileBinding !== expected.profileBinding ||
+                binding.browserGeneration !== expected.browserGeneration ||
+                binding.transportGeneration !== expected.transportGeneration ||
+                binding.leaseId !== expected.brokerLeaseId) {
+                throw transportRebindFailure('TRANSPORT_REBIND_TOPOLOGY_INVALID', 'Tracked target authority differs from the exact registered root.');
+            }
+            if (descriptor.leaseRoot) {
+                rootCount += 1;
+                if (descriptor.targetId !== expected.targetId || descriptor.owned ||
+                    descriptor.lifecycleKind !== expected.targetKind) {
+                    throw transportRebindFailure('TRANSPORT_REBIND_ROOT_CHANGED', 'The tracked lease root changed before handover.');
+                }
+            }
+            else if (!descriptor.openerId || !descriptors.has(descriptor.openerId)) {
+                throw transportRebindFailure('TRANSPORT_REBIND_TOPOLOGY_INVALID', 'A tracked descendant lost its exact opener lineage.');
+            }
+            else {
+                const expectedOwned = expected.targetKind === 'agent-task-root';
+                const expectedKind = expectedOwned ? 'ephemeral-owned-child' : 'user-collaboration';
+                if (descriptor.owned !== expectedOwned || descriptor.lifecycleKind !== expectedKind) {
+                    throw transportRebindFailure('TRANSPORT_REBIND_TOPOLOGY_INVALID', 'A tracked descendant changed its exact ownership kind.');
+                }
+            }
+        }
+        for (const descriptor of topology.targets) {
+            const seen = new Set();
+            let cursor = descriptor;
+            while (cursor && cursor.targetId !== expected.targetId) {
+                if (seen.has(cursor.targetId)) {
+                    throw transportRebindFailure('TRANSPORT_REBIND_TOPOLOGY_INVALID', 'Tracked descendant opener lineage is cyclic.');
+                }
+                seen.add(cursor.targetId);
+                cursor = descriptors.get(cursor.openerId);
+            }
+            if (!cursor || cursor.targetId !== expected.targetId) {
+                throw transportRebindFailure('TRANSPORT_REBIND_TOPOLOGY_INVALID', 'Tracked descendant is not rooted in the exact task root.');
+            }
+        }
+        if (rootCount !== 1 || topology.targets.length === 0 ||
+            !descriptors.has(expected.targetId) || !descriptors.has(topology.activeTargetId)) {
+            throw transportRebindFailure('TRANSPORT_REBIND_ROOT_CHANGED', 'The exact root and active target are not both tracked.');
+        }
+    }
+
+    assertLeasedTransportAuthority(expected) {
+        if (!hasExactObjectKeys(expected, [
+            'session', 'anchorTargetId', 'targetId', 'targetKind',
+            'browserContextId', 'profileBinding', 'browserGeneration',
+            'receiptNonce', 'transportGeneration', 'brokerLeaseId',
+        ])) {
+            throw transportRebindFailure('TRANSPORT_REBIND_REQUEST_INVALID', 'The prior session authority shape is invalid.');
+        }
+        this.markLeasedTransportLostIfDisconnected();
+        const authority = this._targetAuthority;
+        const receipt = authority?.receipt;
+        if (!authority || !receipt || !this.client?.isConnected() || this._targetLeaseLost ||
+            this._closing || this._closePromise || this._adoptedTargetLost) {
+            throw transportRebindFailure('TRANSPORT_REBIND_NOT_READY', 'The exact connected leased transport is unavailable.');
+        }
+        validateTargetReceipt(receipt);
+        if (!TARGET_LEASE_KINDS.has(expected.targetKind) ||
+            receipt.session !== expected.session ||
+            receipt.anchorTargetId !== expected.anchorTargetId ||
+            receipt.targetId !== expected.targetId ||
+            receipt.targetKind !== expected.targetKind ||
+            receipt.browserContextId !== expected.browserContextId ||
+            receipt.profileBinding !== expected.profileBinding ||
+            receipt.browserGeneration !== expected.browserGeneration ||
+            receipt.nonce !== expected.receiptNonce ||
+            receipt.transportGeneration !== expected.transportGeneration ||
+            receipt.leaseId !== expected.brokerLeaseId) {
+            throw transportRebindFailure('TRANSPORT_REBIND_AUTHORITY_MISMATCH', 'The daemon does not hold the supplied prior root authority.');
+        }
+        return authority;
+    }
+
+    async inventoryLeasedTransport(expected) {
+        if (this._transportRebindPlan) {
+            throw transportRebindFailure('TRANSPORT_REBIND_IN_PROGRESS', 'Another handover already owns this daemon.');
+        }
+        this.assertLeasedTransportAuthority(expected);
+        if (!await this.settleExternalTargetTracking(350) ||
+            this._pendingTargetIds.size > 0 || this._pendingTargetAttaches.size > 0 ||
+            this._popupWaiters.size > 0 || this._targetCloseOperations.size > 0 ||
+            this._closingTargetIds.size > 0 || this._closingOwnedTargetIds.size > 0 ||
+            this._unresolvedOwnedTargetIds.size > 0) {
+            throw transportRebindFailure('TRANSPORT_REBIND_BUSY', 'Target ownership work did not settle before inventory.');
+        }
+        // WHY: the daemon already owns the only task broker connection. Opening
+        // that lease a second time is rejected by the broker and previously
+        // forced every healthy warm command into Windows discovery. Inventory
+        // through this connected client preserves the one-client lease while
+        // the broker still filters the result to this exact opener tree.
+        const inventory = await this.client.send('Target.getTargets', {});
+        if (!Array.isArray(inventory?.targetInfos) || inventory.targetInfos.length > 64) {
+            throw transportRebindFailure('TRANSPORT_REBIND_INVENTORY_INVALID', 'The task broker returned an invalid bounded inventory.');
+        }
+        const infos = new Map();
+        for (const value of inventory.targetInfos) {
+            const info = this.normalizeTargetInfo(value);
+            if (!info || info.type !== 'page' || infos.has(info.targetId)) {
+                throw transportRebindFailure('TRANSPORT_REBIND_INVENTORY_INVALID', 'The task broker returned an invalid or duplicate target.');
+            }
+            infos.set(info.targetId, info);
+        }
+        const topology = this.currentLeasedTransportTopology();
+        this.assertLeasedTopologyBound(topology, expected);
+        if (infos.size !== topology.targets.length) {
+            throw transportRebindFailure('TRANSPORT_REBIND_TOPOLOGY_CHANGED', 'The daemon and task broker inventories differ.');
+        }
+        for (const descriptor of topology.targets) {
+            const info = infos.get(descriptor.targetId);
+            if (!info || (info.browserContextId ?? null) !== expected.browserContextId ||
+                (!descriptor.leaseRoot && info.openerId !== descriptor.openerId)) {
+                throw transportRebindFailure('TRANSPORT_REBIND_TOPOLOGY_CHANGED', 'A broker target differs from the bound context or opener tree.');
+            }
+        }
+        const result = Object.freeze({
+            rootTargetId: expected.targetId,
+            activeTargetId: topology.activeTargetId,
+            browserContextId: expected.browserContextId,
+            targetCount: topology.targets.length,
+            topologySha256: this.topologyDigest(topology),
+            targets: Object.freeze(topology.targets.map((target) => Object.freeze({
+                targetId: target.targetId,
+                openerId: target.openerId,
+                owned: target.owned,
+                leaseRoot: target.leaseRoot,
+                targetKind: target.lifecycleKind,
+                browserContextId: target.browserContextId,
+                order: target.order,
+            }))),
+        });
+        if (Buffer.byteLength(canonicalJson(result), 'utf8') > 12 * 1024) {
+            throw transportRebindFailure('TRANSPORT_REBIND_INVENTORY_INVALID', 'The task inventory exceeds its response bound.');
+        }
+        return result;
+    }
+
+    prepareLeasedTransportRebind(expected) {
+        if (this._transportRebindPlan) {
+            throw transportRebindFailure('TRANSPORT_REBIND_IN_PROGRESS', 'Another handover already owns this daemon.');
+        }
+        this.assertLeasedTransportAuthority(expected);
+        if (expected.targetKind !== 'agent-task-root' ||
+            this._targetAuthority.receipt.targetKind !== 'agent-task-root') {
+            throw transportRebindFailure('TRANSPORT_REBIND_AUTHORITY_MISMATCH', 'The daemon does not hold the supplied prior root authority.');
+        }
+        const busy = this._targetAttachPromises.size > 0 ||
+            this._pendingTargetIds.size > 0 || this._pendingTargetAttaches.size > 0 ||
+            this._popupWaiters.size > 0 || this._targetCloseOperations.size > 0 ||
+            this._closingTargetIds.size > 0 || this._closingOwnedTargetIds.size > 0 ||
+            this._unresolvedOwnedTargetIds.size > 0 || this._recoveryTargets.length > 0 ||
+            this._recoveryPromise !== null || this.screencastActive || this.profilingActive ||
+            this._interceptor !== null || this.routes.size > 0 || this.scopedHeaderRoutes.size > 0 ||
+            this.activeFrame !== null || this._dialogCleanup || this._requestTrackingHandler ||
+            this.cdpSession !== null || this.isRecordingHar ||
+            this._targets.some((target) => target.page?._consoleUnsubscribe || target.page?._errorUnsubscribe);
+        if (busy) {
+            throw transportRebindFailure('TRANSPORT_REBIND_BUSY', 'Connection-scoped work must settle before capability rotation.');
+        }
+        const topology = this.currentLeasedTransportTopology();
+        this.assertLeasedTopologyBound(topology, expected);
+        const plan = Object.freeze({
+            [TARGET_TRANSPORT_REBIND_PLAN]: this,
+            expected: Object.freeze({ ...expected }),
+            topology,
+            topologySha256: this.topologyDigest(topology),
+            preparedAt: Date.now(),
+        });
+        this._transportRebindPlan = plan;
+        return {
+            rootTargetId: expected.targetId,
+            targetCount: topology.targets.length,
+            topologySha256: plan.topologySha256,
+        };
+    }
+
+    abortLeasedTransportRebind(plan) {
+        if (plan?.[TARGET_TRANSPORT_REBIND_PLAN] !== this || this._transportRebindPlan !== plan) {
+            throw transportRebindFailure('TRANSPORT_REBIND_HANDOVER_MISMATCH', 'The handover plan is not current.');
+        }
+        this._transportRebindPlan = null;
+    }
+
+    discardDisconnectedTransportState() {
+        this._transportRebindDeadlineCleanup?.();
+        this._transportRebindDeadlineCleanup = null;
+        this.client = null;
+        this.browser = null;
+        this.pages = [];
+        this.contexts = [];
+        this._targets = [];
+        this.cdpEndpoint = null;
+        this.cdpHttpBase = null;
+        this._targetTrackingInstalled = false;
+        this._targetTrackingHandlers = null;
+        this._targetAttachPromises.clear();
+        this._pendingTargetIds.clear();
+        this._pendingTargetAttaches.clear();
+        this._observedDestroyedTargetIds.clear();
+        this._targetCloseOperations.clear();
+        this._recoveryTargets = [];
+        this._recoveryActiveOrder = null;
+        this._recoveryPromise = null;
+        this._adoptedTargetLost = false;
+        this._targetLeaseLost = null;
+        this.activePageIndex = 0;
+        this._nextTargetOrder = 0;
+        this.activeFrame = null;
+        this.cdpSession = null;
+    }
+
+    async disconnectReboundTransportPreservingTargets() {
+        const client = this.client;
+        this.removeTargetTrackingHandlers();
+        if (client) await client.close().catch(() => {});
+        this.discardDisconnectedTransportState();
+    }
+
+    assertTopologyPreserved(plan, current) {
+        const currentById = new Map(current.targets.map((target) => [target.targetId, target]));
+        for (const expected of plan.topology.targets) {
+            const observed = currentById.get(expected.targetId);
+            if (!observed || canonicalJson(observed) !== canonicalJson(expected)) {
+                throw transportRebindFailure('TRANSPORT_REBIND_TOPOLOGY_CHANGED', 'The root or one of its descendants changed during handover.');
+            }
+        }
+        if (current.activeTargetId !== plan.topology.activeTargetId) {
+            throw transportRebindFailure('TRANSPORT_REBIND_ACTIVE_TARGET_CHANGED', 'The active task target changed during handover.');
+        }
+    }
+
+    async restoreRenewedTargetTopology(topology) {
+        await this.settleExternalTargetTracking(500);
+        const inventory = await this.client.send('Target.getTargets');
+        if (!Array.isArray(inventory?.targetInfos)) {
+            throw transportRebindFailure('TRANSPORT_REBIND_INVENTORY_INVALID', 'The renewed broker did not return an exact target inventory.');
+        }
+        const targetInfos = new Map(inventory.targetInfos.map((item) => [item?.targetId, item]));
+        let remaining = topology.targets.filter((target) => !target.leaseRoot);
+        for (let pass = 0; remaining.length > 0 && pass < topology.targets.length; pass += 1) {
+            const deferred = [];
+            let progress = false;
+            for (const expected of remaining) {
+                let tracked = this._targets.find((target) => target.targetId === expected.targetId);
+                if (!tracked) {
+                    const pending = this._pendingTargetAttaches.get(expected.targetId);
+                    if (pending) await pending.promise;
+                    tracked = this._targets.find((target) => target.targetId === expected.targetId);
+                }
+                if (!tracked) {
+                    const info = this.normalizeTargetInfo(targetInfos.get(expected.targetId));
+                    if (!info || !this._targets.some((target) => target.targetId === expected.openerId)) {
+                        deferred.push(expected);
+                        continue;
+                    }
+                    if (info.type !== 'page' || info.openerId !== expected.openerId ||
+                        (info.browserContextId ?? null) !== expected.browserContextId) {
+                        throw transportRebindFailure('TRANSPORT_REBIND_TOPOLOGY_CHANGED', 'A renewed descendant no longer matches its opener and context.');
+                    }
+                    await this.attachExternalTarget(info, {
+                        activate: false,
+                        owned: expected.owned,
+                        preserveState: true,
+                        preserveTargetOnFailure: true,
+                    });
+                    tracked = this._targets.find((target) => target.targetId === expected.targetId);
+                }
+                if (!tracked || tracked.openerId !== expected.openerId ||
+                    tracked.owned !== expected.owned ||
+                    tracked.lifecycleKind !== expected.lifecycleKind ||
+                    (tracked.browserContextId ?? tracked.binding?.browserContextId ?? null) !== expected.browserContextId) {
+                    throw transportRebindFailure('TRANSPORT_REBIND_TOPOLOGY_CHANGED', 'A renewed descendant did not retain its exact ownership identity.');
+                }
+                progress = true;
+            }
+            if (!progress && deferred.length > 0) break;
+            remaining = deferred;
+        }
+        if (remaining.length > 0) {
+            throw transportRebindFailure('TRANSPORT_REBIND_TOPOLOGY_INCOMPLETE', 'Not every pre-handover descendant was reattached.');
+        }
+        const expectedOrder = new Map(topology.targets.map((target) => [target.targetId, target.order]));
+        for (const target of this._targets) {
+            if (expectedOrder.has(target.targetId)) target.order = expectedOrder.get(target.targetId);
+        }
+        this._targets.sort((left, right) =>
+            (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER) ||
+            left.targetId.localeCompare(right.targetId));
+        this.pages = this._targets.map((target) => target.page);
+        if (this.contexts[0]) this.contexts[0]._pages = [...this.pages];
+        const activeIndex = this._targets.findIndex((target) => target.targetId === topology.activeTargetId);
+        if (activeIndex < 0) {
+            throw transportRebindFailure('TRANSPORT_REBIND_ACTIVE_TARGET_CHANGED', 'The active target was not restored.');
+        }
+        this.activePageIndex = activeIndex;
+        this._nextTargetOrder = this._targets.reduce(
+            (maximum, target) => Math.max(maximum, Number.isSafeInteger(target.order) ? target.order + 1 : maximum),
+            0,
+        );
+    }
+
+    async commitLeasedTransportRebind(plan, renewal, options = {}) {
+        if (plan?.[TARGET_TRANSPORT_REBIND_PLAN] !== this || this._transportRebindPlan !== plan) {
+            throw transportRebindFailure('TRANSPORT_REBIND_HANDOVER_MISMATCH', 'The handover plan is not current.');
+        }
+        if (!hasExactObjectKeys(options, ['deadlineAt']) ||
+            !Number.isSafeInteger(options.deadlineAt) ||
+            options.deadlineAt <= Date.now()) {
+            this._transportRebindPlan = null;
+            throw transportRebindFailure('TRANSPORT_REBIND_DEADLINE_INVALID', 'The handover deadline is invalid or expired.');
+        }
+        if (!hasExactObjectKeys(renewal, [
+            'brokerGeneration', 'transportGeneration', 'brokerLeaseId',
+            'brokerAuthorization', 'brokerCdpWebSocketUrl', 'consentGeneration',
+            'brokerProducerContractSha256', 'brokerCapabilityExpiresAt', 'renewedAt',
+        ])) {
+            this._transportRebindPlan = null;
+            throw transportRebindFailure('TRANSPORT_REBIND_REQUEST_INVALID', 'The renewed authority shape is invalid.');
+        }
+        const brokerAuthorization = renewal.brokerAuthorization;
+        delete renewal.brokerAuthorization;
+        try {
+            const expected = plan.expected;
+            const now = Date.now();
+            const expiry = canonicalBrokerExpiry(renewal.brokerCapabilityExpiresAt);
+            if (![renewal.brokerGeneration, renewal.transportGeneration,
+                renewal.consentGeneration, renewal.brokerProducerContractSha256]
+                .every((value) => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)) ||
+                typeof renewal.brokerLeaseId !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(renewal.brokerLeaseId) ||
+                renewal.brokerLeaseId === expected.brokerLeaseId ||
+                typeof brokerAuthorization !== 'string' ||
+                !new RegExp(`^Bearer ${renewal.transportGeneration}\\.${renewal.brokerLeaseId}\\.[A-Za-z0-9_-]{43}$`).test(brokerAuthorization) ||
+                !Number.isSafeInteger(renewal.renewedAt) || renewal.renewedAt <= 0 ||
+                renewal.renewedAt > now + TARGET_RECEIPT_CLOCK_SKEW_MS ||
+                renewal.renewedAt < now - TARGET_RECEIPT_MAX_TTL_MS ||
+                expiry === null || expiry <= now + 1000) {
+                throw transportRebindFailure('TRANSPORT_REBIND_AUTHORITY_INVALID', 'The renewed broker capability is invalid or stale.');
+            }
+            const priorAuthority = this._targetAuthority;
+            const profileAttestation = loadAndValidateProfileAttestation(
+                priorAuthority.controllerEndpointRoot,
+                {},
+            );
+            if (profileAttestation.browser_generation !== expected.browserGeneration ||
+                profileAttestation.broker_generation !== renewal.brokerGeneration ||
+                profileAttestation.transport_generation !== renewal.transportGeneration ||
+                profileAttestation.consent_generation !== renewal.consentGeneration ||
+                profileAttestation.transportProof?.broker?.producerContractSha256 !==
+                    renewal.brokerProducerContractSha256 ||
+                !isExactBrokerTransportUrl(
+                    renewal.brokerCdpWebSocketUrl,
+                    renewal.transportGeneration,
+                    profileAttestation.broker_port,
+                )) {
+                throw transportRebindFailure('TRANSPORT_REBIND_ATTESTATION_MISMATCH', 'Fresh controller process proof differs from the renewed broker authority.');
+            }
+            const receipt = Object.freeze({
+                ...priorAuthority.receipt,
+                transportGeneration: renewal.transportGeneration,
+                leaseId: renewal.brokerLeaseId,
+                issuedAt: renewal.renewedAt,
+                expiresAt: Math.min(
+                    renewal.renewedAt + TARGET_RECEIPT_MAX_TTL_MS,
+                    expiry,
+                ),
+            });
+            validateTargetReceipt(receipt);
+            validateTargetReceiptFresh(receipt, now);
+            const renewedAuthority = {
+                ...priorAuthority,
+                receipt,
+                browserGeneration: expected.browserGeneration,
+                profileAttestation,
+            };
+            const currentTopology = this.currentLeasedTransportTopology();
+            this.assertLeasedTopologyBound(currentTopology, expected);
+            this.assertTopologyPreserved(plan, currentTopology);
+
+            const oldClient = this.client;
+            this.removeTargetTrackingHandlers();
+            await oldClient.close().catch(() => {});
+            transportRebindDeadlineRemaining(options.deadlineAt);
+            this.discardDisconnectedTransportState();
+            await this._connectToWsUrl(
+                renewal.brokerCdpWebSocketUrl,
+                renewedAuthority,
+                null,
+                {
+                    brokerAuthorization,
+                    renewalRoot: true,
+                    preserveTargetState: true,
+                    transportRebindDeadlineAt: options.deadlineAt,
+                    deferLeasedFailureGuard: true,
+                },
+            );
+            await this.restoreRenewedTargetTopology(currentTopology);
+            transportRebindDeadlineRemaining(options.deadlineAt);
+            this._transportRebindDeadlineCleanup?.();
+            this._transportRebindDeadlineCleanup = null;
+            this.installLeasedTransportFailureGuard(this.client, this._targetAuthority);
+            this.refMap = {};
+            this.lastSnapshot = '';
+            this._nextSnapshotRefOrdinal = 1n;
+            return {
+                session: expected.session,
+                rootTargetId: expected.targetId,
+                activeTargetId: currentTopology.activeTargetId,
+                targetCount: currentTopology.targets.length,
+                priorTransportGeneration: expected.transportGeneration,
+                transportGeneration: renewal.transportGeneration,
+                priorBrokerLeaseId: expected.brokerLeaseId,
+                brokerLeaseId: renewal.brokerLeaseId,
+                topologySha256: plan.topologySha256,
+            };
+        }
+        catch (error) {
+            if (this.client && this.client !== undefined) {
+                await this.disconnectReboundTransportPreservingTargets().catch(() => {});
+            }
+            this._targetLeaseLost = { targetKind: plan.expected.targetKind };
+            throw error;
+        }
+        finally {
+            this._transportRebindPlan = null;
+        }
+    }
+
     // ── Cloud Providers ──────────────────────────────────────────────────────
 
     async closeBrowserbaseSession(sessionId, apiKey) {
@@ -3421,7 +4097,13 @@ export class BrowserManager {
     /**
      * Shared method: Connect to a WebSocket URL, discover targets, set up pages.
      */
-    async _connectToWsUrl(wsUrl, targetAuthority = undefined, connectionAuthority = null) {
+    async _connectToWsUrl(wsUrl, targetAuthority = undefined, connectionAuthority = null, options = {}) {
+        const explicitBrokerAuthorization = options.brokerAuthorization;
+        const transportRebindDeadlineAt = options.transportRebindDeadlineAt;
+        const deferLeasedFailureGuard = options.deferLeasedFailureGuard === true;
+        delete options.brokerAuthorization;
+        delete options.transportRebindDeadlineAt;
+        delete options.deferLeasedFailureGuard;
         // undefined means this entry point owns the one synchronous environment
         // consume. null is an explicit unreceipted authority state and must not
         // be recomputed by an auto-connect retry.
@@ -3453,6 +4135,7 @@ export class BrowserManager {
         let ctx = null;
         let generation = null;
         let restoreAuthorityCommandGuard = () => {};
+        let restoreDeadlineCommandGuard = () => {};
         try {
             if (authority) {
                 try {
@@ -3462,10 +4145,23 @@ export class BrowserManager {
                     throw error;
                 }
             }
+            const connectionTimeout = transportRebindDeadlineAt === undefined
+                ? null
+                : transportRebindDeadlineRemaining(transportRebindDeadlineAt);
             await client.connect(wsUrl, authority ? {
                 brokerTransportGeneration: authority.receipt.transportGeneration,
                 brokerLeaseId: authority.receipt.leaseId,
+                ...(explicitBrokerAuthorization === undefined
+                    ? {}
+                    : { brokerAuthorization: explicitBrokerAuthorization }),
+                ...(connectionTimeout === null ? {} : { timeout: connectionTimeout }),
             } : {});
+            if (transportRebindDeadlineAt !== undefined) {
+                restoreDeadlineCommandGuard = installTransportRebindDeadlineGuard(
+                    client,
+                    transportRebindDeadlineAt,
+                );
+            }
             if (authority) {
                 // Connection resolution can consume most of a receipt's short
                 // lifetime. No Target command is allowed before this second check.
@@ -3493,14 +4189,25 @@ export class BrowserManager {
             if (authority) {
                 const targetReceipt = authority.receipt;
                 assertTargetAuthorityCurrent(authority, client._resolvedWsUrl);
-                const { targetInfo } = await client.send('Target.getTargetInfo', {
-                    targetId: targetReceipt.targetId,
-                });
+                let targetInfo;
+                const detachDeadline = Date.now() + (options.renewalRoot ? 750 : 0);
+                do {
+                    ({ targetInfo } = await client.send('Target.getTargetInfo', {
+                        targetId: targetReceipt.targetId,
+                    }));
+                    if (targetInfo?.attached !== true || !options.renewalRoot || Date.now() >= detachDeadline) {
+                        break;
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, 15));
+                } while (true);
                 const info = this.normalizeTargetInfo(targetInfo);
+                const leasedRootUrlMatches = options.renewalRoot
+                    ? true
+                    : isLeasedRootUrl(targetReceipt, info?.url);
                 if (!info || info.targetId !== targetReceipt.targetId ||
                     targetInfo?.type !== 'page' || targetInfo.attached !== false ||
                     (targetInfo.browserContextId ?? null) !== targetReceipt.browserContextId ||
-                    !isLeasedRootUrl(targetReceipt, info.url)) {
+                    !leasedRootUrlMatches) {
                     throw new Error('Target lease does not identify the exact attachable registered root.');
                 }
                 assertTargetAuthorityCurrent(authority, client._resolvedWsUrl);
@@ -3518,9 +4225,12 @@ export class BrowserManager {
                         authority.profileAttestation,
                         client._resolvedWsUrl,
                     );
+                    const attachedLeasedRootUrlMatches = options.renewalRoot
+                        ? attachedInfo?.url === info.url
+                        : isLeasedRootUrl(targetReceipt, attachedInfo?.url);
                     if (!attachedInfo || attachedInfo.targetId !== info.targetId ||
                         attachedTargetInfo?.type !== 'page' || attachedTargetInfo.attached !== true ||
-                        attachedInfo.url !== info.url || !isLeasedRootUrl(targetReceipt, attachedInfo.url) ||
+                        attachedInfo.url !== info.url || !attachedLeasedRootUrlMatches ||
                         (attachedTargetInfo.browserContextId ?? null) !== targetReceipt.browserContextId ||
                         !provenanceStable || attachedGeneration !== authority.browserGeneration) {
                         throw new Error('Target lease identity changed during attachment.');
@@ -3533,7 +4243,8 @@ export class BrowserManager {
                 await enableDomains(client, sessionId);
                 const page = new CDPPage(client, sessionId, info.targetId);
                 const binding = leaseBindingFromReceipt(targetReceipt);
-                page._url = targetReceipt.targetKind === 'agent-workspace'
+                page._url = targetReceipt.targetKind === 'agent-task-root' &&
+                    info.url === targetReceipt.workspaceMarkerUrl
                     ? 'about:blank'
                     : info.url || 'about:blank';
                 page._contextRef = ctx;
@@ -3556,10 +4267,19 @@ export class BrowserManager {
                 this.activePageIndex = 0;
                 this.browser = client;
                 assertTargetAuthorityCurrent(authority, client._resolvedWsUrl);
-                await this.installTargetTracking();
+                await this.installTargetTracking({
+                    preserveState: options.preserveTargetState === true,
+                    preserveTargetOnFailure: options.preserveTargetState === true,
+                });
                 restoreAuthorityCommandGuard();
                 restoreAuthorityCommandGuard = () => {};
-                this.installLeasedTransportFailureGuard(client, authority);
+                if (!deferLeasedFailureGuard) {
+                    this.installLeasedTransportFailureGuard(client, authority);
+                }
+                if (transportRebindDeadlineAt !== undefined) {
+                    this._transportRebindDeadlineCleanup = restoreDeadlineCommandGuard;
+                    restoreDeadlineCommandGuard = () => {};
+                }
                 return;
             }
 
@@ -3608,6 +4328,7 @@ export class BrowserManager {
             throw error;
         } finally {
             restoreAuthorityCommandGuard();
+            restoreDeadlineCommandGuard();
         }
     }
 
@@ -4164,7 +4885,7 @@ export class BrowserManager {
     }
 
     async restoreWorkspaceMarker(target) {
-        if (!this.client || target.lifecycleKind !== 'agent-workspace' || target.leaseRoot !== true) return;
+        if (!this.client || target.lifecycleKind !== 'agent-task-root' || target.leaseRoot !== true) return;
         const markerUrl = target.binding?.workspaceMarkerUrl;
         const expectedContextId = target.binding?.browserContextId;
         if (!markerUrl || !target.binding?.profileBinding) {
@@ -4211,7 +4932,7 @@ export class BrowserManager {
         });
         const info = this.normalizeTargetInfo(targetInfo);
         const openerMatches = target.leaseRoot === true || info?.openerId === target.openerId;
-        const workspaceMarkerMatches = target.lifecycleKind !== 'agent-workspace' ||
+        const workspaceMarkerMatches = target.lifecycleKind !== 'agent-task-root' ||
             info?.url === target.binding.workspaceMarkerUrl;
         if (!info || info.targetId !== target.targetId || info.type !== 'page' ||
             targetInfo.attached !== true ||

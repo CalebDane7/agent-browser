@@ -21,7 +21,11 @@ const isWSL = (() => {
 const DAEMON_IDENTITY_SCHEMA = 'agent-browser-daemon-identity-v2';
 const DAEMON_RUNTIME_VERSION = '0.13.0';
 const DAEMON_PROTOCOL_IDENTITY = 'jsonl-command-v1';
-const DAEMON_CAPABILITIES = 'click-expect-popup-v1';
+const DAEMON_CAPABILITIES = 'click-expect-popup-v1,transport-rebind-v1,session-inventory-v1';
+const TRANSPORT_REBIND_REQUEST_SCHEMA = 'agent-browser.daemon-transport-rebind-request.v1';
+const TRANSPORT_REBIND_RESULT_SCHEMA = 'agent-browser.daemon-transport-rebind-result.v1';
+const TRANSPORT_REBIND_HANDOVER_TTL_MS = 35_000;
+const TRANSPORT_REBIND_COMMIT_TIMEOUT_MS = 4_000;
 const DAEMON_IDENTITY_REQUIRED_ENV = 'AGENT_BROWSER_DAEMON_IDENTITY_REQUIRED';
 const DAEMON_CANONICAL_MANIFEST_ENV = 'AGENT_BROWSER_CANONICAL_DIST_MANIFEST';
 const DAEMON_EXPECTED_MANIFEST_SHA256_ENV = 'AGENT_BROWSER_EXPECTED_CANONICAL_DIST_MANIFEST_SHA256';
@@ -45,6 +49,264 @@ const FATAL_DIAGNOSTIC_LABELS = new Set([
 let secureSocketRoot = null;
 const ownedDaemonArtifacts = new Map();
 const REF_PUBLISHING_ACTIONS = new Set(['snapshot', 'diff_snapshot', 'diff_url']);
+
+function exactObjectKeys(value, expected) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const actual = Object.keys(value).sort();
+    const sortedExpected = [...expected].sort();
+    return actual.length === sortedExpected.length &&
+        actual.every((key, index) => key === sortedExpected[index]);
+}
+
+function boundedText(value, maximum = 256) {
+    return typeof value === 'string' && value.length > 0 && value.length <= maximum &&
+        !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+}
+
+function transportRebindRequestFailure(code = 'TRANSPORT_REBIND_REQUEST_INVALID') {
+    const error = new Error(code);
+    error.code = code;
+    return error;
+}
+
+function validateTransportRebindRequest(value) {
+    const phase = value?.phase;
+    const expectedKeys = phase === 'prepare' || phase === 'inventory'
+        ? ['schema', 'requestId', 'phase', 'session', 'daemon', 'root', 'prior']
+        : phase === 'commit'
+            ? ['schema', 'requestId', 'phase', 'session', 'daemon', 'root', 'prior', 'handoverId', 'renewed']
+            : phase === 'abort'
+                ? ['schema', 'requestId', 'phase', 'session', 'daemon', 'root', 'prior', 'handoverId']
+                : null;
+    if (!expectedKeys || !exactObjectKeys(value, expectedKeys) ||
+        value.schema !== TRANSPORT_REBIND_REQUEST_SCHEMA ||
+        !/^[0-9a-f]{64}$/.test(value.requestId) ||
+        !isValidSessionName(value.session) ||
+        !exactObjectKeys(value.daemon, ['pid', 'startTicks', 'socketPath', 'socketDev', 'socketIno']) ||
+        !Number.isSafeInteger(value.daemon.pid) || value.daemon.pid <= 1 ||
+        !/^[0-9]+$/.test(value.daemon.startTicks) ||
+        !boundedText(value.daemon.socketPath, 1024) || !path.isAbsolute(value.daemon.socketPath) ||
+        !/^[0-9]+$/.test(value.daemon.socketDev) || !/^[0-9]+$/.test(value.daemon.socketIno) ||
+        !exactObjectKeys(value.root, [
+            'anchorTargetId', 'targetId', 'targetKind', 'browserContextId',
+            'profileBinding', 'browserGeneration', 'receiptNonce',
+        ]) ||
+        !boundedText(value.root.anchorTargetId) || !boundedText(value.root.targetId) ||
+        value.root.anchorTargetId === value.root.targetId ||
+        !(phase === 'inventory'
+            ? ['agent-task-root', 'user-collaboration'].includes(value.root.targetKind)
+            : value.root.targetKind === 'agent-task-root') ||
+        !boundedText(value.root.browserContextId) ||
+        !/^[0-9a-f]{64}$/.test(value.root.profileBinding) ||
+        !/^[0-9a-f]{64}$/.test(value.root.browserGeneration) ||
+        !/^[0-9a-f]{64}$/.test(value.root.receiptNonce) ||
+        !exactObjectKeys(value.prior, ['transportGeneration', 'brokerLeaseId']) ||
+        !/^[0-9a-f]{64}$/.test(value.prior.transportGeneration) ||
+        !/^[A-Za-z0-9_-]{16,128}$/.test(value.prior.brokerLeaseId)) {
+        throw transportRebindRequestFailure();
+    }
+    if (!['prepare', 'inventory'].includes(phase) && !/^[0-9a-f]{64}$/.test(value.handoverId)) {
+        throw transportRebindRequestFailure('TRANSPORT_REBIND_HANDOVER_INVALID');
+    }
+    if (phase === 'commit') {
+        const renewed = value.renewed;
+        if (!exactObjectKeys(renewed, [
+            'brokerGeneration', 'transportGeneration', 'brokerLeaseId',
+            'authorization', 'brokerCdpWebSocketUrl', 'consentGeneration',
+            'brokerProducerContractSha256', 'brokerCapabilityExpiresAt', 'renewedAt',
+        ]) ||
+            !/^[0-9a-f]{64}$/.test(renewed.brokerGeneration) ||
+            !/^[0-9a-f]{64}$/.test(renewed.transportGeneration) ||
+            !/^[A-Za-z0-9_-]{16,128}$/.test(renewed.brokerLeaseId) ||
+            typeof renewed.authorization !== 'string' || Buffer.byteLength(renewed.authorization, 'utf8') > 512 ||
+            !/^Bearer [0-9a-f]{64}\.[A-Za-z0-9_-]{16,128}\.[A-Za-z0-9_-]{43}$/.test(renewed.authorization) ||
+            !boundedText(renewed.brokerCdpWebSocketUrl, 512) ||
+            !/^[0-9a-f]{64}$/.test(renewed.consentGeneration) ||
+            !/^[0-9a-f]{64}$/.test(renewed.brokerProducerContractSha256) ||
+            !boundedText(renewed.brokerCapabilityExpiresAt, 64) ||
+            !Number.isSafeInteger(renewed.renewedAt) || renewed.renewedAt <= 0) {
+            throw transportRebindRequestFailure();
+        }
+    }
+    return value;
+}
+
+export function parseTransportRebindLine(line) {
+    let value;
+    try {
+        value = JSON.parse(line);
+    }
+    catch {
+        return { matched: false };
+    }
+    if (value?.schema !== TRANSPORT_REBIND_REQUEST_SCHEMA) return { matched: false };
+    return { matched: true, request: validateTransportRebindRequest(value) };
+}
+
+function samePreparedTransportOwner(request, prepared) {
+    return request.session === prepared.session &&
+        JSON.stringify(request.daemon) === JSON.stringify(prepared.daemon) &&
+        JSON.stringify(request.root) === JSON.stringify(prepared.root) &&
+        JSON.stringify(request.prior) === JSON.stringify(prepared.prior);
+}
+
+function transportRebindResult(request, status, identity, data = {}) {
+    return {
+        schema: TRANSPORT_REBIND_RESULT_SCHEMA,
+        ok: true,
+        status,
+        requestId: request.requestId,
+        session: request.session,
+        daemonPid: identity.pid,
+        daemonStartTicks: identity.startTicks,
+        socketPath: identity.socketPath,
+        socketDev: identity.socketDev,
+        socketIno: identity.socketIno,
+        ...data,
+    };
+}
+
+function transportRebindError(requestId, error) {
+    const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/.test(error.code)
+        ? error.code
+        : 'TRANSPORT_REBIND_FAILED';
+    return {
+        schema: TRANSPORT_REBIND_RESULT_SCHEMA,
+        ok: false,
+        status: 'rejected',
+        requestId: /^[0-9a-f]{64}$/.test(requestId ?? '') ? requestId : '0'.repeat(64),
+        reasonCode: code,
+        reason: `The bounded daemon transport handover was rejected at ${code}.`,
+    };
+}
+
+export class DaemonTransportRebindCoordinator {
+    constructor(manager, session, identityProvider) {
+        this.manager = manager;
+        this.session = session;
+        this.identityProvider = identityProvider;
+        this.handover = null;
+    }
+
+    expireIfNeeded() {
+        if (!this.handover || this.handover.phase === 'committing' ||
+            this.handover.deadlineAt > Date.now()) return;
+        try { this.manager.abortLeasedTransportRebind(this.handover.plan); } catch { }
+        this.handover = null;
+    }
+
+    isBlocking() {
+        this.expireIfNeeded();
+        return this.handover !== null;
+    }
+
+    assertDaemonIdentity(request) {
+        const identity = this.identityProvider();
+        if (request.session !== this.session ||
+            request.daemon.pid !== identity.pid ||
+            request.daemon.startTicks !== identity.startTicks ||
+            request.daemon.socketPath !== identity.socketPath ||
+            request.daemon.socketDev !== identity.socketDev ||
+            request.daemon.socketIno !== identity.socketIno) {
+            throw transportRebindRequestFailure('TRANSPORT_REBIND_DAEMON_CHANGED');
+        }
+        return identity;
+    }
+
+    async handle(request, activeCommandCount) {
+        this.expireIfNeeded();
+        const identity = this.assertDaemonIdentity(request);
+        if (!Number.isSafeInteger(activeCommandCount) || activeCommandCount !== 0) {
+            throw transportRebindRequestFailure('TRANSPORT_REBIND_BUSY');
+        }
+        const expected = {
+            session: request.session,
+            ...request.root,
+            transportGeneration: request.prior.transportGeneration,
+            brokerLeaseId: request.prior.brokerLeaseId,
+        };
+        if (request.phase === 'inventory') {
+            if (this.handover) throw transportRebindRequestFailure('TRANSPORT_REBIND_IN_PROGRESS');
+            const inventory = await this.manager.inventoryLeasedTransport(expected);
+            const inventoriedIdentity = this.assertDaemonIdentity(request);
+            return transportRebindResult(request, 'inventoried', inventoriedIdentity, {
+                ...inventory,
+                observedAt: Date.now(),
+            });
+        }
+        if (request.phase === 'prepare') {
+            if (this.handover) throw transportRebindRequestFailure('TRANSPORT_REBIND_IN_PROGRESS');
+            const prepared = this.manager.prepareLeasedTransportRebind(expected);
+            const handoverId = randomBytes(32).toString('hex');
+            this.handover = {
+                handoverId,
+                phase: 'prepared',
+                deadlineAt: Date.now() + TRANSPORT_REBIND_HANDOVER_TTL_MS,
+                plan: this.manager._transportRebindPlan,
+                session: request.session,
+                daemon: { ...request.daemon },
+                root: { ...request.root },
+                prior: { ...request.prior },
+            };
+            return transportRebindResult(request, 'prepared', identity, {
+                handoverId,
+                rootTargetId: prepared.rootTargetId,
+                targetCount: prepared.targetCount,
+                topologySha256: prepared.topologySha256,
+                deadlineAt: this.handover.deadlineAt,
+            });
+        }
+        const handover = this.handover;
+        if (!handover || request.handoverId !== handover.handoverId ||
+            !samePreparedTransportOwner(request, handover)) {
+            throw transportRebindRequestFailure('TRANSPORT_REBIND_HANDOVER_MISMATCH');
+        }
+        if (handover.phase !== 'prepared') {
+            throw transportRebindRequestFailure('TRANSPORT_REBIND_IN_PROGRESS');
+        }
+        if (request.phase === 'abort') {
+            this.manager.abortLeasedTransportRebind(handover.plan);
+            this.handover = null;
+            return transportRebindResult(request, 'aborted', identity, {
+                handoverId: request.handoverId,
+                rootTargetId: request.root.targetId,
+            });
+        }
+        handover.phase = 'committing';
+        const authorization = request.renewed.authorization;
+        delete request.renewed.authorization;
+        try {
+            const rebound = await this.manager.commitLeasedTransportRebind(
+                handover.plan,
+                {
+                    ...request.renewed,
+                    brokerAuthorization: authorization,
+                },
+                {
+                    deadlineAt: Math.min(
+                        handover.deadlineAt,
+                        Date.now() + TRANSPORT_REBIND_COMMIT_TIMEOUT_MS,
+                    ),
+                },
+            );
+            const reboundIdentity = this.assertDaemonIdentity(request);
+            return transportRebindResult(request, 'rebound', reboundIdentity, {
+                handoverId: request.handoverId,
+                rootTargetId: rebound.rootTargetId,
+                activeTargetId: rebound.activeTargetId,
+                targetCount: rebound.targetCount,
+                priorTransportGeneration: rebound.priorTransportGeneration,
+                transportGeneration: rebound.transportGeneration,
+                priorBrokerLeaseId: rebound.priorBrokerLeaseId,
+                brokerLeaseId: rebound.brokerLeaseId,
+                topologySha256: rebound.topologySha256,
+            });
+        }
+        finally {
+            this.handover = null;
+        }
+    }
+}
 
 function clearManagerRefs(manager) {
     const refs = typeof manager?.getRefMap === 'function' ? manager.getRefMap() : manager?.refMap;
@@ -527,6 +789,26 @@ function getLinuxProcessStartTicks() {
     }
     return startTicks;
 }
+function currentDaemonTransportIdentity() {
+    const connection = getConnectionInfo(currentSession);
+    if (connection.type !== 'unix') {
+        throw transportRebindRequestFailure('TRANSPORT_REBIND_PLATFORM_UNSUPPORTED');
+    }
+    assertSecureSocketRootUnchanged();
+    const socketPath = connection.path;
+    const socket = fs.lstatSync(socketPath, { bigint: true });
+    if (!socket.isSocket() || socket.isSymbolicLink() ||
+        path.dirname(socketPath) !== secureSocketRoot.path) {
+        throw transportRebindRequestFailure('TRANSPORT_REBIND_DAEMON_CHANGED');
+    }
+    return {
+        pid: process.pid,
+        startTicks: getLinuxProcessStartTicks(),
+        socketPath,
+        socketDev: socket.dev.toString(),
+        socketIno: socket.ino.toString(),
+    };
+}
 function toPosixPath(value) {
     return value.split(path.sep).join('/');
 }
@@ -828,6 +1110,12 @@ export async function startDaemon(options) {
     let shuttingDown = false;
     let identityReady = false;
     let shutdownPromise = null;
+    let activeCommandCount = 0;
+    const transportRebindCoordinator = new DaemonTransportRebindCoordinator(
+        manager,
+        currentSession,
+        currentDaemonTransportIdentity,
+    );
     const activeSockets = new Set();
     // Start stream server if port is specified (or use default if env var is set)
     const streamPort = options?.streamPort ??
@@ -899,6 +1187,30 @@ export async function startDaemon(options) {
                 if (!line.trim())
                     continue;
                 let responseControls = {};
+                let transportRequest;
+                try {
+                    transportRequest = parseTransportRebindLine(line);
+                }
+                catch (error) {
+                    socket.write(JSON.stringify(transportRebindError('0'.repeat(64), error)) + '\n');
+                    continue;
+                }
+                if (transportRequest.matched) {
+                    try {
+                        const response = await transportRebindCoordinator.handle(
+                            transportRequest.request,
+                            activeCommandCount,
+                        );
+                        socket.write(JSON.stringify(response) + '\n');
+                    }
+                    catch (error) {
+                        socket.write(JSON.stringify(transportRebindError(
+                            transportRequest.request.requestId,
+                            error,
+                        )) + '\n');
+                    }
+                    continue;
+                }
                 try {
                     const parseResult = parseCommand(line);
                     if (!parseResult.success) {
@@ -909,6 +1221,16 @@ export async function startDaemon(options) {
                         continue;
                     }
                     responseControls = parseResult.command;
+                    if (transportRebindCoordinator.isBlocking()) {
+                        const response = errorResponse(
+                            parseResult.command.id,
+                            'TRANSPORT_REBIND_IN_PROGRESS: the exact session is quiescent for one bounded capability handover.',
+                        );
+                        socket.write(serializeDaemonResponse(response, responseControls, manager) + '\n');
+                        continue;
+                    }
+                    activeCommandCount += 1;
+                    try {
                     // Auto-launch if not already launched and this isn't a launch/close command
                     if (!manager.isLaunched() &&
                         parseResult.command.action !== 'launch' &&
@@ -1024,6 +1346,10 @@ export async function startDaemon(options) {
                         }
                     }
                     socket.write(serializeDaemonResponse(response, responseControls, manager) + '\n');
+                    }
+                    finally {
+                        activeCommandCount = Math.max(0, activeCommandCount - 1);
+                    }
                 }
                 catch (err) {
                     const message = renderActionError(err);

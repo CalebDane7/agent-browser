@@ -438,7 +438,13 @@ function binding(session = "task") {
 }
 
 function grantForeground(session) {
-  const acquired = run(["--session", session, "foreground"]);
+  const acquired = run([
+    "--session",
+    session,
+    "foreground",
+    "--input-boundary",
+    "account-authority",
+  ]);
   if (acquired.status !== 0) {
     throw new Error(`foreground acquisition failed: ${acquired.stderr}`);
   }
@@ -2180,6 +2186,13 @@ describe("authenticated wrapper security boundaries", () => {
     expect(elapsed).toBeGreaterThanOrEqual(5000);
     expect(elapsed).toBeLessThan(9500);
     expect(trace()).toContain('controller=["discover-owned-descendants"');
+    const reconcileCall = trace()
+      .split("\n")
+      .find((line) => line.startsWith('controller=["discover-owned-descendants"'));
+    const reconcileArgs = JSON.parse(reconcileCall.slice("controller=".length));
+    expect(reconcileArgs[reconcileArgs.indexOf("--port") + 1]).toBe(
+      String(port),
+    );
     expect(trace()).not.toContain('controller=["acquire-focus"');
   }, 12_000);
 
@@ -3406,7 +3419,18 @@ describe("authenticated wrapper security boundaries", () => {
     expect(trace()).not.toContain('controller=["acquire-focus"');
 
     writeFileSync(tracePath, "", "utf8");
-    const acquired = run(["--session", "focus-control", "foreground"]);
+    const unproven = run(["--session", "focus-control", "foreground"]);
+    expect(unproven.status).toBe(64);
+    expect(unproven.stderr).toContain("--input-boundary");
+    expect(trace()).not.toContain('controller=["acquire-focus"');
+
+    const acquired = run([
+      "--session",
+      "focus-control",
+      "foreground",
+      "--input-boundary",
+      "two-factor",
+    ]);
     expect(acquired.status, acquired.stderr).toBe(0);
     expect(trace()).toContain(
       'controller=["acquire-focus","--session","focus-control","--target-id","fixture-workspace-caleb","--receipt-nonce"',
@@ -3421,7 +3445,13 @@ describe("authenticated wrapper security boundaries", () => {
     expect(typeof focus.socketIno).toBe("string");
 
     writeFileSync(tracePath, "", "utf8");
-    const idempotent = run(["--session", "focus-control", "foreground"]);
+    const idempotent = run([
+      "--session",
+      "focus-control",
+      "foreground",
+      "--input-boundary",
+      "two-factor",
+    ]);
     expect(idempotent.status, idempotent.stderr).toBe(0);
     expect(trace()).toContain('controller=["validate-focus-lease"');
     expect(trace()).not.toContain('controller=["acquire-focus"');
@@ -3439,7 +3469,13 @@ describe("authenticated wrapper security boundaries", () => {
 
     control("focus-publish-race", "1");
     writeFileSync(tracePath, "", "utf8");
-    const raced = run(["--session", "focus-control", "foreground"]);
+    const raced = run([
+      "--session",
+      "focus-control",
+      "foreground",
+      "--input-boundary",
+      "two-factor",
+    ]);
     expect(raced.status).toBe(70);
     expect(raced.stderr).toContain("publication raced");
     expect(readFileSync(focusPath, "utf8")).toBe("foreign-focus-owner\n");
@@ -3515,7 +3551,7 @@ describe("authenticated wrapper security boundaries", () => {
     expect(releasedAt).toBeGreaterThan(closedAt);
   }, 12_000);
 
-  it("premise: popup-producing clicks require an exact active foreground lease and one newline settles once; falsifier: background work clicks, EOF is required, or armed evidence disappears", () => {
+  it("premise: popup-producing clicks stay backgrounded and one newline settles once; falsifier: popup automation acquires focus, EOF is required, or armed evidence disappears", () => {
     writeAttestation();
     const opened = runWorkspace([
       "--session",
@@ -3533,24 +3569,10 @@ describe("authenticated wrapper security boundaries", () => {
       "@button",
       "--expect-popup",
     ]);
-    expect(background.status, background.stderr).toBe(69);
-    expect(background.stderr).toContain("FOREGROUND_REQUIRED");
-    expect(trace()).not.toContain("popup-request=");
-    expect(trace()).not.toContain("discover-owned-descendants");
-    expect(trace()).not.toContain('"click"');
-
-    grantForeground("popup");
-    writeFileSync(tracePath, "", "utf8");
-    const plain = run([
-      "--session",
-      "popup",
-      "click",
-      "@button",
-      "--expect-popup",
-    ]);
-    expect(plain.status, plain.stderr).toBe(0);
-    expect(plain.stdout).toBe("✓ Done [popupTracking=event-armed-v1]\n");
-    expect(trace()).toContain('controller=["validate-focus-lease"');
+    expect(background.status, background.stderr).toBe(0);
+    expect(background.stdout).toBe("✓ Done [popupTracking=event-armed-v1]\n");
+    expect(trace()).not.toContain('controller=["acquire-focus"');
+    expect(trace()).not.toContain('controller=["validate-focus-lease"');
     expect(trace()).toContain('"action":"click"');
     expect(trace()).toContain('"expectPopup":true');
 
