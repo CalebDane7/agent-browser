@@ -62,6 +62,22 @@ must trace to the current human-authorized result.
   before a conflicting cutover. Neither the observed drain duration nor process
   overlap grants permission to kill unrelated processes.
 
+## Owner Detection: Every Command Lands On about:blank
+
+Symptom: `open` succeeds, but the next command (a separate tool call, or the
+same call through a pipe, `$(...)` or another subshell) reports `about:blank`.
+Cause: `scripts/agent-browser-owner.js` did not recognize the agent process,
+so the short-lived tool shell became the owner and each shell got its own tab.
+Seen with a binary replaced by an update (`... (deleted)`) and with a native
+installer path `.../claude/versions/<ver>` whose basename is a version.
+Detection now accepts the versioned product folder, the binary name, or the
+process name from `/proc/<pid>/stat`. Guard:
+`tests/agent-browser-owner-deleted-exe.test.mjs`.
+
+Repair the detection itself; never tell agents to avoid pipes or use one shell.
+Proof: `open` in one tool call, then `get url | cat` in a separate call returns
+the opened URL, not `about:blank`.
+
 ## Targets And Focus
 
 - Candidate and release proof use extension-provisioned task-owned inactive

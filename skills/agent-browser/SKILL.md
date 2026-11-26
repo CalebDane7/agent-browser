@@ -28,28 +28,68 @@ proof inside non-web projects, forms, downloads, screenshots and existing-tab
 help; API/source-only checks do not need a browser. Wallet/extension requests
 retain the state protections below and do not gain extension-UI access.
 
+## The Exact Recipe (read this first)
+
+For an ordinary task (open, read, click, fill, check, screenshot) this recipe
+is all you need. The rest of this file covers special cases: co-working in the
+user's tab, lost connections, wallets, and proof capture for public pages.
+
+1. **Make a session file once per task, in your first browser call.**
+   ```bash
+   SCRATCH=/path/to/a/folder/you/own   # e.g. your agent's scratch folder
+   mkdir -p "$SCRATCH"
+   IFS= read -r u </proc/sys/kernel/random/uuid
+   echo "browser-task-${u//-/}" > "$SCRATCH/ab-session"
+   ```
+   Shell variables vanish between tool calls; the file doesn't. Start every
+   later call with `SCRATCH=<same folder>; S=$(cat "$SCRATCH/ab-session")`.
+2. **Every command, including `close`, uses the same two flags:**
+   `agent-browser --account <handle> --session "$S" <command>`.
+   `<handle>` is an enrolled handle from "Choose The Account" below. To use the
+   configured default account, leave `--account` off every command.
+   There's no setup, `connect` or debugging-port step. The tool refuses
+   `connect`, and Chrome is already wired up.
+3. **Open the page:** `open URL` prints the page title and URL. In your next
+   tool call, `get url` must print that same URL. If it prints `about:blank`,
+   follow "If the next command sees about:blank" under Failure And State
+   Protection.
+4. **Read before acting:** `snapshot -i --compact`, then act on a fresh `@eN` ref.
+   Re-snapshot after anything changes the page.
+   On a big page, narrow it: `snapshot -i --compact -s 'nav'`, or pipe it
+   through `grep -i book`. Refs from that output are valid until the next snapshot.
+5. **Run JavaScript with `eval`:** one line works directly, e.g.
+   `eval 'document.title'`. For multi-line code use `eval --stdin < file.js`.
+   Results come back as JSON, so text arrives in quotes.
+6. **Google Ads, GA4, Tag Manager and similar Material/Angular consoles:**
+   `snapshot -i` often shows nothing. Use `eval` to find exactly one visible
+   matching element and call `.click()` on it inside the eval. Do the same if
+   a `click` command doesn't change the page.
+7. **Prove the result:** reload or reopen, read the value, and look at any
+   screenshot you take.
+8. **Close when the task is done, or after it fails:** `close`, with both flags.
+   Leave the tab open only while you and the user are still working in it.
+
 ## Start Here
+
+This section adds detail to the recipe above. If the two seem to differ, the
+recipe wins.
 
 **Parallelize immediately when independent work can finish sooner.** Give each
 worker a unique session and its own tab tree, even within the same profile.
 Serialize only dependent actions, writers to the same tab, or changes that could
 race shared account state. Open only tabs needed now—not idle placeholders.
 
-Generate these values once and retain them across tool calls; shell variables
-do not necessarily survive a new tool call. Repeat the exact account and session
-on **every** command, including cleanup:
+Make the session file once (recipe step 1), then in every tool call:
 
 ```bash
+SCRATCH=<same folder>; S=$(cat "$SCRATCH/ab-session")
 # Use an exact enrolled handle (see "Choose The Account"). To use the configured
 # default instead, omit --account consistently on every command.
-: "${browser_account:?Set the requested alias from the local operator mapping}"
-IFS= read -r task_uuid </proc/sys/kernel/random/uuid
-browser_session="browser-task-${task_uuid//-/}"
-agent-browser --account "$browser_account" --session "$browser_session" open URL
-agent-browser --account "$browser_account" --session "$browser_session" snapshot -i --compact
+agent-browser --account <handle> --session "$S" open URL
+agent-browser --account <handle> --session "$S" snapshot -i --compact
 # Act on the intended control's fresh ref; verify the requested visible result.
 # When finished, close—unless this tab is still being used with the user.
-agent-browser --account "$browser_account" --session "$browser_session" close
+agent-browser --account <handle> --session "$S" close
 ```
 
 Ordinary browsing needs no installation audit, connection setup, Chrome launch,
@@ -190,6 +230,16 @@ same tab and preserve it while working together.
   for source/header/status checks; do not start browser tabs for those alone.
 
 ## Failure And State Protection
+
+**If the next command sees about:blank, fix it now. Don't stop to report it.**
+It means the tool didn't recognize your agent process, so each shell got its own tab.
+1. Run `cat /proc/$PPID/comm; readlink /proc/$PPID/exe` to see how your agent appears.
+2. Edit `resolveInvokingOwner` in this repository's `scripts/agent-browser-owner.js`
+   so it recognizes that (it already accepts a `.../<agent>/versions/<ver>` path,
+   the binary name, or the process name).
+3. Add the case to `tests/agent-browser-owner-deleted-exe.test.mjs` and run
+   `npx vitest run tests/agent-browser-owner-deleted-exe.test.mjs`.
+4. Re-check with recipe step 3, then carry on with the task.
 
 For a previously working browser connection that is now lost, use the normal
 close/reopen recovery below first—not toolbar pinning, pairing or a setup audit.
