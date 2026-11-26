@@ -15,11 +15,11 @@ function proc(root, pid, name, ppid, exe) {
   writeFileSync(join(dir, "status"), `Name:\t${name}\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\n`);
   symlinkSync(exe, join(dir, "exe"));
 }
-function fixture(agentExe) {
+function fixture(agentExe, agentName = "claude") {
   const root = mkdtempSync(join(tmpdir(), "ab-owner-"));
   mkdirSync(join(root, "sys/kernel/random"), { recursive: true });
   writeFileSync(join(root, "sys/kernel/random/boot_id"), "11111111-2222-3333-4444-555555555555\n");
-  proc(root, 100, "claude", 1, agentExe);
+  proc(root, 100, agentName, 1, agentExe);
   proc(root, 200, "bash", 100, "/usr/bin/bash");
   return root;
 }
@@ -41,8 +41,36 @@ describe("resolveInvokingOwner with replaced agent binaries", () => {
       expect(owner.pid).toBe(100);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+  // WHY: 2026-11-26 blank tabs. The native installer's binary is named by version.
+  it("resolves the native installer's versioned Claude binary", () => {
+    for (const exe of ["/home/u/.local/share/claude/versions/2.1.332",
+                       "/home/u/.local/share/claude/versions/2.1.332 (deleted)"]) {
+      const root = fixture(exe);
+      try {
+        const owner = resolveInvokingOwner({ env: {}, ppid: 200, procRoot: root });
+        expect(owner.agentKind).toBe("claude");
+        expect(owner.pid).toBe(100);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    }
+  });
+  // WHY: a future install layout must not break ownership while the agent still names itself.
+  it("resolves Claude by its process name when the binary path is unfamiliar", () => {
+    const root = fixture("/opt/new-layout/bin/runtime-9", "claude");
+    try {
+      const owner = resolveInvokingOwner({ env: {}, ppid: 200, procRoot: root });
+      expect(owner.agentKind).toBe("claude");
+      expect(owner.pid).toBe(100);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it("does not treat an unrelated versioned binary as an agent", () => {
+    const root = fixture("/opt/tool/versions/1.0.0", "tool");
+    try {
+      const owner = resolveInvokingOwner({ env: {}, ppid: 200, procRoot: root });
+      expect(owner.agentKind).toBe("caller");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it("does not treat a replaced non-agent binary as an agent", () => {
-    const root = fixture("/usr/bin/python3 (deleted)");
+    const root = fixture("/usr/bin/python3 (deleted)", "python3");
     try {
       const owner = resolveInvokingOwner({ env: {}, ppid: 200, procRoot: root });
       expect(owner.agentKind).toBe("caller");

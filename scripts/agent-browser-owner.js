@@ -44,7 +44,8 @@ function processStat(procRoot, pid) {
       !TICKS.test(fields[19] || "")) throw failure("OWNER_PROC_DATA_INVALID");
   const parentPid = Number(fields[1]);
   if (!Number.isSafeInteger(parentPid)) throw failure("OWNER_PROC_DATA_INVALID");
-  return { pid, parentPid, state: fields[0], startTicks: fields[19] };
+  const name = raw.slice(String(pid).length + 2, end);
+  return { pid, parentPid, state: fields[0], startTicks: fields[19], name };
 }
 
 function processUid(procRoot, pid) {
@@ -116,7 +117,19 @@ export function resolveInvokingOwner({
     // the session within a second of that shell exiting, so the next command sees a new
     // about:blank tab. Observed 2026-09-17 after claude-code 2.1.274 installed mid-session.
     // Removing this strip reintroduces blank tabs across tool calls after any agent update.
-    const kind = basename(exe.replace(/ \(deleted\)$/, "")).toLowerCase().replace(/\.exe$/, "");
+    // WHY: the native Claude Code installer runs ".../claude/versions/2.1.332", so the
+    // basename is a version number, not "claude". Without this, ownership fell to each
+    // tool shell: a separate Bash call, or any pipe/subshell inside one call, got a new
+    // about:blank tab (observed 2026-11-26). Name a versioned binary by its product dir.
+    // WHY: agents change how they are packaged. Accept any one of three signals so
+    // the next install layout or self-update cannot silently break ownership:
+    // the product dir of a versioned binary, the binary name, or the process name
+    // the agent sets for itself (/proc/<pid>/stat comm, "claude" on 2026-11-26).
+    const real = exe.replace(/ \(deleted\)$/, "");
+    const versioned = /\/([^/]+)\/versions\/[^/]+$/.exec(real);
+    const kind = [versioned?.[1], basename(real), stat.name]
+      .map((n) => (n || "").toLowerCase().replace(/\.exe$/, ""))
+      .find((n) => AGENTS.has(n)) || "";
     if (AGENTS.has(kind)) {
       selected = observed;
       agentKind = kind;
